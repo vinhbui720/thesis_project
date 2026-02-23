@@ -1,0 +1,6 @@
+thesis_gui/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.vscode/

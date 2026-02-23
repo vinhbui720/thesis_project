@@ -1,0 +1,9 @@
+default_kinematics_plugins:
+  tesseract_planning/KinematicsPluginFactory:
+    search_paths:
+      - tesseract_kinematics_plugins
+    manipulator:
+      class: KDLFwdKinChain
+      config:
+        base_link: base_link
+        tip_link: tool0

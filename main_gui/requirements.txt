@@ -1,0 +1,28 @@
+# ===============================
+# GUI
+# ===============================
+PyQt6==6.6.1
+PyQt6-Qt6==6.6.1
+PyQt6-sip==13.6.0
+
+# ===============================
+# 3D / Mesh Processing
+# ===============================
+open3d==0.18.0
+numpy>=1.24
+scipy
+trimesh
+pyvista
+pyqtgraph
+
+# ===============================
+# ROS2 Python Interface
+# (Do NOT install rclpy via pip if ROS2 already installed via apt)
+# ===============================
+# rclpy  <-- DO NOT pip install if using system ROS2
+
+# ===============================
+# Utilities
+# ===============================
+pyyaml
+psutil

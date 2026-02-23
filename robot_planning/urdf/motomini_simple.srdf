@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<robot name="motoman_motomini">
+    <!-- GROUPS: Manipulator -->
+    <group name="manipulator">
+        <joint name="joint_1" />
+    </group>
+
+    <!-- GROUPS: All joints -->
+    <group name="all_joints">
+        <joint name="joint_1" />
+    </group>
+
+    <!-- GROUP STATES -->
+    <group_state name="home" group="manipulator">
+        <joint name="joint_1" value="0" />
+    </group_state>
+
+    <!-- GROUPS kinematics plugins -->
+    <kinematics_plugin_config filename="package://robot_planning/urdf/motomini_plugins.yaml" />
+
+    <!-- Contact Managers plugins -->
+    <contact_managers_plugin_config
+        filename="package://robot_planning/urdf/contact_manager_plugins.yaml" />
+
+    <!-- DISABLE COLLISIONS: Adjacent links -->
+    <disable_collisions link1="base_link" link2="link_1" reason="Adjacent" />
+</robot>

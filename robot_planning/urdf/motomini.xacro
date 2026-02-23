@@ -1,0 +1,6 @@
+<?xml version="1.0" ?>
+<!-- FIX: Added xmlns:tesseract and tesseract:make_convex="true" -->
+<robot name="motoman_motomini" xmlns:xacro="http://ros.org/wiki/xacro" xmlns:tesseract="http://tesseract-planning.org/tesseract" tesseract:make_convex="true">
+  <xacro:include filename="$(find robot_planning)/urdf/motomini_macro.xacro" />
+  <xacro:motoman_motomini prefix=""/>
+</robot>

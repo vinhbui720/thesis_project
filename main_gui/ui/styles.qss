@@ -1,0 +1,41 @@
+QMainWindow {
+    background-color: #0f172a;
+}
+
+#header {
+    background-color: #111827;
+    border-bottom: 1px solid #1f2937;
+}
+
+#stepInactive {
+    color: #6b7280;
+    font-size: 15px;
+    font-weight: 500;
+}
+
+#stepActive {
+    color: #38bdf8;
+    font-size: 16px;
+    font-weight: 700;
+    border-bottom: 2px solid #38bdf8;
+}
+
+#logoLabel {
+    color: #38bdf8;
+    font-size: 18px;
+    font-weight: bold;
+}
+
+#projectLabel {
+    color: #e5e7eb;
+    font-size: 14px;
+}
+
+#mainStack {
+    background-color: #0b1220;
+}
+
+#contentLabel {
+    color: #94a3b8;
+    font-size: 28px;
+}

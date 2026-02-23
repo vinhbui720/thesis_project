@@ -1,0 +1,19 @@
+scene_preprocessor:
+  ros__parameters:
+    normal_radius: 0.025
+    plane_axis_x: -0.1
+    plane_axis_y: 0.0
+    plane_axis_z: 1.0
+    plane_eps_angle: 0.26
+    plane_thresh: 0.002
+    sor_mean_k: 34
+    sor_stddev: 2.4
+    use_normals: true
+    use_sor: true
+    voxel_size: 0.004
+    x_max: 0.06
+    x_min: -0.15
+    y_max: 0.07
+    y_min: -0.1
+    z_max: 1.0
+    z_min: 0.2

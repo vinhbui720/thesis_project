@@ -1,0 +1,15 @@
+model_manager:
+  ros__parameters:
+    stl_path: "mesh/puzzel.stl"
+
+    sample_points: 10000
+
+    auto_scale: true
+    scale_threshold: 10.0
+
+    center_model: true
+
+    voxel_percentage: 0.004
+    voxel_size_override: 0.0
+
+    normal_radius_multiplier: 3.0

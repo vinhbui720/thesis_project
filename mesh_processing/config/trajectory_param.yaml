@@ -1,0 +1,4 @@
+trajectory_visualizer:
+  ros__parameters:
+    json_file_path: "./surface_plan.json"
+    publish_rate: 1.0

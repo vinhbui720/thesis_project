@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="motoman_motomini">
+
+    <!-- ========= ARG FIRST ========= -->
+    <xacro:arg name="controllers_file" default="" />
+    <xacro:property name="controllers_file" value="$(arg controllers_file)" />
+
+    <!-- ========= INCLUDE ROBOT ========= -->
+    <xacro:include filename="motoman_motomini.urdf" />
+    <xacro:include filename="motoman_motomini_sensors.urdf.xacro" />
+
+    <!-- ========= WORLD FIX ========= -->
+    <link name="world" />
+
+    <joint name="world_to_workcell" type="fixed">
+        <parent link="world" />
+        <child link="workcell" />
+        <origin xyz="0 0 0.068" rpy="0 0 0" />
+    </joint>
+    <gazebo reference="link_1_s">
+        <turnGravityOff>true</turnGravityOff>
+    </gazebo>
+
+    <gazebo reference="link_2_l">
+        <turnGravityOff>true</turnGravityOff>
+    </gazebo>
+
+    <gazebo reference="link_3_u">
+        <turnGravityOff>true</turnGravityOff>
+    </gazebo>
+
+    <gazebo reference="link_4_r">
+        <turnGravityOff>true</turnGravityOff>
+    </gazebo>
+
+    <gazebo reference="link_5_b">
+        <turnGravityOff>true</turnGravityOff>
+    </gazebo>
+
+    <gazebo reference="link_6_t">
+        <turnGravityOff>true</turnGravityOff>
+    </gazebo>
+    <!-- ================================================== -->
+    <!-- =============== ROS2 CONTROL ===================== -->
+    <!-- ================================================== -->
+
+    <ros2_control name="MotominiSystem" type="system">
+        <hardware>
+            <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+
+            <!-- These control Gazebo internal PID -->
+            <param name="position_proportional_gain">5000.0</param>
+            <param name="position_derivative_gain">50.0</param>
+
+        </hardware>
+
+        <!-- Position control only (simple mode) -->
+
+        <joint name="joint_1_s">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+
+        <joint name="joint_2_l">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+
+        <joint name="joint_3_u">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+
+        <joint name="joint_4_r">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+
+        <joint name="joint_5_b">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+
+        <joint name="joint_6_t">
+            <command_interface name="position" />
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+        </joint>
+
+    </ros2_control>
+
+    <!-- ================================================== -->
+    <!-- ============== GAZEBO SETTINGS =================== -->
+    <!-- ================================================== -->
+
+    <gazebo>
+        <gravity>false</gravity>
+        <plugin
+            filename="libgz_ros2_control-system.so"
+            name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+            <parameters>${controllers_file}</parameters>
+        </plugin>
+    </gazebo>
+
+</robot>
