@@ -6,8 +6,11 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /TF1
+        - /Marker1
+        - /PointCloud23
       Splitter Ratio: 0.5
-    Tree Height: 559
+    Tree Height: 865
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -91,6 +94,11 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        magnetic_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
         tool0:
           Alpha: 1
           Show Axes: false
@@ -123,21 +131,66 @@ Visualization Manager:
       Value: true
       Visual Enabled: true
     - Class: rviz_default_plugins/TF
-      Enabled: false
+      Enabled: true
       Frame Timeout: 15
       Frames:
         All Enabled: true
-      Marker Scale: 1
+        base:
+          Value: true
+        base_link:
+          Value: true
+        link_1_s:
+          Value: true
+        link_2_l:
+          Value: true
+        link_3_u:
+          Value: true
+        link_4_r:
+          Value: true
+        link_5_b:
+          Value: true
+        link_6_t:
+          Value: true
+        magnetic_link:
+          Value: true
+        tool0:
+          Value: true
+        workcell:
+          Value: true
+        world:
+          Value: true
+        world_depth_camera_link:
+          Value: true
+        world_range_link:
+          Value: true
+      Marker Scale: 0.30000001192092896
       Name: TF
       Show Arrows: true
       Show Axes: true
-      Show Names: false
+      Show Names: true
       Tree:
-        {}
+        world:
+          workcell:
+            base_link:
+              base:
+                {}
+              link_1_s:
+                link_2_l:
+                  link_3_u:
+                    link_4_r:
+                      link_5_b:
+                        link_6_t:
+                          tool0:
+                            magnetic_link:
+                              {}
+            world_depth_camera_link:
+              {}
+            world_range_link:
+              {}
       Update Interval: 0
-      Value: false
+      Value: true
     - Class: rviz_default_plugins/Image
-      Enabled: true
+      Enabled: false
       Max Value: 1
       Median window: 5
       Min Value: 0
@@ -149,7 +202,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /camera/color/image_raw
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -218,6 +271,53 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: Marker
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /target_object_marker
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: PointCloud2
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /processed_scene
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -233,25 +333,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.0764448642730713
+      Distance: 0.0021020949352532625
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.7155541181564331
-        Y: -0.276611328125
-        Z: 0.29577574133872986
+        X: 0.5595988035202026
+        Y: -0.30863332748413086
+        Z: 0.5080916285514832
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5749996304512024
+      Pitch: 0.5699996948242188
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 5.715001106262207
+      Yaw: 5.944999694824219
     Saved: ~
 Window Geometry:
   Displays:
@@ -261,7 +361,7 @@ Window Geometry:
   Hide Right Dock: true
   Image:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000200000000000001f40000039efc0200000002fb000000100044006900730070006c006100790073010000003d0000026c000000c900fffffffb0000000a0049006d00610067006501000002af0000012c0000002800ffffff000000010000018e0000039efc0200000001fb0000000a00560069006500770073000000003d0000039e000000a400ffffff000005860000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000200000000000001f40000039efc0200000002fb000000100044006900730070006c006100790073010000003d0000039e000000c900fffffffb0000000a0049006d00610067006500000002af0000012c0000002800ffffff000000010000018e0000039efc0200000001fb0000000a00560069006500770073000000003d0000039e000000a400ffffff000005860000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: true
   Width: 1920

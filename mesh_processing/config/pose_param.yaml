@@ -1,39 +1,14 @@
 pose_estimator:
   ros__parameters:
-    # Radius in meters for computing surface normals. 
-    # Must be larger than your voxel_size (e.g., 2x to 4x voxel_size).
     normal_radius: 0.01
-    
-    # Radius in meters for computing FPFH features.
-    # Must be larger than normal_radius (e.g., 2x to 3x normal_radius).
+  
     feature_radius: 0.025
-    
-    # ==========================================================
-    # --- GLOBAL REGISTRATION (RANSAC) PARAMETERS ---
-    # ==========================================================
-    
-    # Maximum distance (meters) between two matched features to be an inlier.
     ransac_max_corr_dist: 0.02
-    
-    # The minimum percentage of the STL model that MUST match the camera data.
-    # CRITICAL: Since the camera only sees one face of the object, this must be low!
-    # A value of 0.10 means only 10% of the STL needs to be visible to succeed.
     ransac_inlier_fraction: 0.10
-    
-    # Number of random attempts to find the perfect global alignment.
-    # Increasing this gives the algorithm more chances to find a match.
     ransac_max_iterations: 50000
 
-    # ==========================================================
-    # --- LOCAL REGISTRATION (ICP) PARAMETERS ---
-    # ==========================================================
-
-    # Maximum distance in meters to pair points during local ICP.
-    # Points further apart than this will be ignored to prevent bad alignments.
     icp_max_correspondence_dist: 0.015
-    
-    # Maximum number of math iterations the ICP algorithm will run per frame.
+  
     icp_max_iterations: 50
-    
-    # Enable to print fitness scores and publish raw models in the estimated TF frame.
-    debug_mode: false
+  
+    debug_mode: true

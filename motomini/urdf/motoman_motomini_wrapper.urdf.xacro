@@ -1,14 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="motoman_motomini">
+<robot name="motoman_motomini"
+    xmlns:xacro="http://www.ros.org/wiki/xacro"
+    xmlns:tesseract="http://ros.org/wiki/tesseract"
+    tesseract:make_convex="true">
 
     <!-- ========= ARG FIRST ========= -->
     <xacro:arg name="controllers_file" default="" />
     <xacro:property name="controllers_file" value="$(arg controllers_file)" />
-
+    <xacro:arg name="tool_type" default="gripper" />
+    <xacro:property name="tool_type" value="$(arg tool_type)" />
     <!-- ========= INCLUDE ROBOT ========= -->
     <xacro:include filename="motoman_motomini.urdf" />
     <xacro:include filename="motoman_motomini_sensors.urdf.xacro" />
-
+    <xacro:include filename="motoman_motomini_tool.xacro" />
+    <!-- ========= TOOLS ========= -->
+    <xacro:motomini_tool
+        parent_link="tool0"
+        tool_type="${tool_type}" />
     <!-- ========= WORLD FIX ========= -->
     <link name="world" />
 

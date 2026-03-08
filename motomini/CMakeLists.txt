@@ -7,10 +7,12 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 pkg_check_modules(IGNITION REQUIRED ignition-transport11 ignition-msgs8)
 
 add_executable(object_controller src/object_controller.cpp)
-ament_target_dependencies(object_controller rclcpp geometry_msgs std_msgs  visualization_msgs)
+ament_target_dependencies(object_controller rclcpp geometry_msgs std_msgs  visualization_msgs tf2 tf2_geometry_msgs)
 
 add_executable(object_pose src/object_pose.cpp)
 

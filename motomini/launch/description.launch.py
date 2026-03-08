@@ -32,12 +32,18 @@ def generate_launch_description():
     # Launch arguments
     # --------------------------------------------------
     use_sim_time = LaunchConfiguration("use_sim_time")
+    tool_type = LaunchConfiguration("tool_type")
 
     declare_use_sim_time = DeclareLaunchArgument(
         "use_sim_time",
         default_value="false"
     )
 
+    declare_tool_type = DeclareLaunchArgument(
+        "tool_type",
+        default_value="gripper",
+        description="Tool attached to robot"
+    )
     # --------------------------------------------------
     # Generate robot_description from xacro
     # --------------------------------------------------
@@ -45,7 +51,9 @@ def generate_launch_description():
         "xacro ",
         xacro_file,
         " controllers_file:=",
-        controllers_file
+        controllers_file,
+        " tool_type:=",
+        tool_type
     ])
 
     robot_description = {
@@ -67,5 +75,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         declare_use_sim_time,
+        declare_tool_type,
         robot_state_publisher_node
     ])

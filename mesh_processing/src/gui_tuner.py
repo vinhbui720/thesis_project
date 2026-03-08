@@ -117,12 +117,12 @@ tk.Label(scrollable_frame, text="=== Downsampling ===", font=("Arial", 12, "bold
 voxel_slider = make_slider(scrollable_frame, "Voxel Size (m)", "voxel_size", 0.001, 0.05, 0.001)
 
 tk.Label(scrollable_frame, text="=== ROI Filtering ===", font=("Arial", 12, "bold")).pack()
-z_min_slider = make_slider(scrollable_frame, "Z Min", "z_min", 0.0, 2.0, 0.01)
-z_max_slider = make_slider(scrollable_frame, "Z Max", "z_max", 0.0, 3.0, 0.01)
-x_min_slider = make_slider(scrollable_frame, "X Min", "x_min", -1.0, 0.0, 0.01)
-x_max_slider = make_slider(scrollable_frame, "X Max", "x_max", 0.0, 1.0, 0.01)
-y_min_slider = make_slider(scrollable_frame, "Y Min", "y_min", -1.0, 0.0, 0.01)
-y_max_slider = make_slider(scrollable_frame, "Y Max", "y_max", 0.0, 1.0, 0.01)
+z_min_slider = make_slider(scrollable_frame, "Z Min", "z_min", 0.0, 20.0, 0.01)
+z_max_slider = make_slider(scrollable_frame, "Z Max", "z_max", 0.0, 30.0, 0.01)
+x_min_slider = make_slider(scrollable_frame, "X Min", "x_min", -10.0, 0.0, 0.01)
+x_max_slider = make_slider(scrollable_frame, "X Max", "x_max", 0.0, 10.0, 0.01)
+y_min_slider = make_slider(scrollable_frame, "Y Min", "y_min", -10.0, 0.0, 0.01)
+y_max_slider = make_slider(scrollable_frame, "Y Max", "y_max", 0.0, 10.0, 0.01)
 
 tk.Label(scrollable_frame, text="=== Plane Removal ===", font=("Arial", 12, "bold")).pack()
 plane_slider = make_slider(scrollable_frame, "Plane Threshold", "plane_thresh", 0.001, 0.05, 0.001)

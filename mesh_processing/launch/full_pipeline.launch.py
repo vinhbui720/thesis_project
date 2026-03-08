@@ -1,7 +1,13 @@
 import os
 
-from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch import LaunchDescription, LaunchContext
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    RegisterEventHandler,
+)
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 from launch_ros.actions import Node
@@ -12,9 +18,20 @@ def generate_launch_description():
 
     pkg_name = "mesh_processing"
     pkg_share = get_package_share_directory(pkg_name)
-
     realsense_pkg_share = get_package_share_directory("realsense2_camera")
 
+    use_real_camera = LaunchConfiguration("use_real_camera")
+    declare_use_real_camera = DeclareLaunchArgument(
+        "use_real_camera",
+        default_value="false",
+        description="Set to 'true' to use the physical RealSense camera. 'false' uses Gazebo simulation."
+    )
+    use_rviz = LaunchConfiguration("use_rviz")
+    declare_use_rviz = DeclareLaunchArgument(
+        "use_rviz",
+        default_value="true",
+        description="Set to 'true' to launch RViz visualization. 'false' to skip."
+    )
     # ----------------------------
     # Config paths
     # ----------------------------
@@ -37,7 +54,8 @@ def generate_launch_description():
             "align_depth.enable": "true",
             "camera_name": "camera",      
             "camera_namespace": "",  
-        }.items()
+        }.items(),
+        condition=IfCondition(use_real_camera)
     )
 
     # ----------------------------
@@ -71,7 +89,7 @@ def generate_launch_description():
         name="pose_estimator",
         parameters=[
             pose_config, 
-            {"debug_mode": False}         # Forcing debug mode ON directly from launch
+            {"debug_mode": True}         # Forcing debug mode ON directly from launch
         ],
         output="screen"
     )
@@ -95,10 +113,14 @@ def generate_launch_description():
         executable="rviz2",
         name="rviz2",
         arguments=["-d", rviz_config],
-        output="screen"
+        output="screen",
+        condition=IfCondition(use_rviz)
     )
 
     return LaunchDescription([
+        declare_use_real_camera,
+        declare_use_rviz,
+
         realsense_launch,
         model_node,
         preprocessor_node,

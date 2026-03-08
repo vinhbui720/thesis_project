@@ -1,19 +1,28 @@
 scene_preprocessor:
   ros__parameters:
-    normal_radius: 0.025
-    plane_axis_x: -0.1
-    plane_axis_y: 0.0
-    plane_axis_z: 1.0
-    plane_eps_angle: 0.26
-    plane_thresh: 0.002
-    sor_mean_k: 34
-    sor_stddev: 2.4
-    use_normals: true
+    # 1. ROI Bounding Box Parameters (Gazebo Frame)
+    x_min: 0.24
+    x_max: 0.26
+    y_min: -0.10
+    y_max: 0.10
+    z_min: -0.10
+    z_max: 0.10
+
+    # 2. Voxel Size
+    voxel_size: 0.001
+
+    # 3. Statistical Outlier Removal
     use_sor: true
-    voxel_size: 0.004
-    x_max: 0.06
-    x_min: -0.15
-    y_max: 0.07
-    y_min: -0.1
-    z_max: 1.0
-    z_min: 0.2
+    sor_mean_k: 30
+    sor_stddev: 1.0
+
+    # 4. Table Plane Segmentation
+    plane_thresh: 0.001
+    plane_axis_x: 1.0
+    plane_axis_y: 0.0
+    plane_axis_z: 0.0
+    plane_eps_angle: 0.15
+
+    # 5. Normal Estimation
+    use_normals: true
+    normal_radius: 0.02

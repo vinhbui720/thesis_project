@@ -5,20 +5,27 @@
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 
+// Filters
 #include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/passthrough.h>
+#include <pcl/filters/crop_box.h> // 🚀 Replaces PassThrough
 #include <pcl/filters/statistical_outlier_removal.h>
 
+// Segmentation
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/filters/extract_indices.h>
 
+// Features & Utilities
 #include <pcl/features/normal_3d.h>
 #include <pcl/search/kdtree.h>
+#include <pcl/common/io.h> // 🚀 Required for concatenateFields
 
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 
+// Define Point Types
 using PointT = pcl::PointXYZ;
 using CloudT = pcl::PointCloud<PointT>;
+using PointNormalT = pcl::PointNormal;
+using CloudNormalT = pcl::PointCloud<PointNormalT>;
 
 class ScenePreprocessor : public rclcpp::Node
 {
@@ -26,37 +33,45 @@ public:
     ScenePreprocessor() : Node("scene_preprocessor")
     {
         // -----------------------------
-        // Declare parameters
+        // Declare Parameters (Matching Python Script)
         // -----------------------------
-        declare_parameter("voxel_size", 0.005);
-        declare_parameter("z_min", 0.2);
-        declare_parameter("z_max", 1.0);
-        declare_parameter("x_min", -0.5);
-        declare_parameter("x_max", 0.5);
-        declare_parameter("y_min", -0.5);
-        declare_parameter("y_max", 0.5);
-        declare_parameter("plane_thresh", 0.015);
 
-        // 🔥 New parameters
+        // 1. ROI Bounding Box Parameters (Gazebo Frame)
+        declare_parameter("x_min", 0.24);
+        declare_parameter("x_max", 0.26);
+        declare_parameter("y_min", -0.10);
+        declare_parameter("y_max", 0.10);
+        declare_parameter("z_min", -0.10);
+        declare_parameter("z_max", 0.10);
+
+        // 2. Voxel Size
+        declare_parameter("voxel_size", 0.001);
+
+        // 3. Statistical Outlier Removal
         declare_parameter("use_sor", true);
         declare_parameter("sor_mean_k", 30);
         declare_parameter("sor_stddev", 1.0);
 
+        // 4. Table Plane Segmentation
+        declare_parameter("plane_thresh", 0.001);
+        declare_parameter("plane_axis_x", 1.0); // Table normal aligns with X-axis in Gazebo optical frame
+        declare_parameter("plane_axis_y", 0.0);
+        declare_parameter("plane_axis_z", 0.0);
+        declare_parameter("plane_eps_angle", 0.15); // radians (~8.5 degrees tolerance)
+
+        // 5. Normal Estimation
         declare_parameter("use_normals", true);
         declare_parameter("normal_radius", 0.02);
 
-        declare_parameter("plane_axis_x", 0.0);
-        declare_parameter("plane_axis_y", 0.0);
-        declare_parameter("plane_axis_z", 1.0);
-        declare_parameter("plane_eps_angle", 0.15); // radians (~8.5°)
-
+        // Initialize local variables from parameter server
         update_params();
 
+        // Bind parameter callback for live tuning via CLI
         param_callback_handle_ =
             add_on_set_parameters_callback(
                 std::bind(&ScenePreprocessor::parametersCallback, this, std::placeholders::_1));
 
-        // ✅ Correct QoS for RealSense
+        // ✅ Correct QoS for RealSense / Gazebo
         auto qos = rclcpp::QoS(rclcpp::KeepLast(5))
                        .best_effort()
                        .durability_volatile();
@@ -74,8 +89,8 @@ public:
     }
 
 private:
-    // Parameters
-    double voxel_size_, z_min_, z_max_, x_min_, x_max_, y_min_, y_max_;
+    // Local Parameter Storage
+    double voxel_size_, x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
     double plane_thresh_;
     bool use_sor_, use_normals_;
     int sor_mean_k_;
@@ -89,17 +104,12 @@ private:
     // -----------------------------
     // Parameter callback (LIVE tuning)
     // -----------------------------
-    rcl_interfaces::msg::SetParametersResult
-    parametersCallback(const std::vector<rclcpp::Parameter> &params)
+    rcl_interfaces::msg::SetParametersResult parametersCallback(const std::vector<rclcpp::Parameter> &params)
     {
         for (const auto &p : params)
         {
             if (p.get_name() == "voxel_size")
                 voxel_size_ = p.as_double();
-            else if (p.get_name() == "z_min")
-                z_min_ = p.as_double();
-            else if (p.get_name() == "z_max")
-                z_max_ = p.as_double();
             else if (p.get_name() == "x_min")
                 x_min_ = p.as_double();
             else if (p.get_name() == "x_max")
@@ -108,6 +118,10 @@ private:
                 y_min_ = p.as_double();
             else if (p.get_name() == "y_max")
                 y_max_ = p.as_double();
+            else if (p.get_name() == "z_min")
+                z_min_ = p.as_double();
+            else if (p.get_name() == "z_max")
+                z_max_ = p.as_double();
             else if (p.get_name() == "plane_thresh")
                 plane_thresh_ = p.as_double();
             else if (p.get_name() == "use_sor")
@@ -129,7 +143,6 @@ private:
             else if (p.get_name() == "plane_eps_angle")
                 plane_eps_angle_ = p.as_double();
         }
-
         rcl_interfaces::msg::SetParametersResult result;
         result.successful = true;
         return result;
@@ -138,21 +151,18 @@ private:
     void update_params()
     {
         voxel_size_ = get_parameter("voxel_size").as_double();
-        z_min_ = get_parameter("z_min").as_double();
-        z_max_ = get_parameter("z_max").as_double();
         x_min_ = get_parameter("x_min").as_double();
         x_max_ = get_parameter("x_max").as_double();
         y_min_ = get_parameter("y_min").as_double();
         y_max_ = get_parameter("y_max").as_double();
+        z_min_ = get_parameter("z_min").as_double();
+        z_max_ = get_parameter("z_max").as_double();
         plane_thresh_ = get_parameter("plane_thresh").as_double();
-
         use_sor_ = get_parameter("use_sor").as_bool();
         sor_mean_k_ = get_parameter("sor_mean_k").as_int();
         sor_stddev_ = get_parameter("sor_stddev").as_double();
-
         use_normals_ = get_parameter("use_normals").as_bool();
         normal_radius_ = get_parameter("normal_radius").as_double();
-
         axis_x_ = get_parameter("plane_axis_x").as_double();
         axis_y_ = get_parameter("plane_axis_y").as_double();
         axis_z_ = get_parameter("plane_axis_z").as_double();
@@ -170,7 +180,17 @@ private:
         if (cloud->empty())
             return;
 
-        // 1️⃣ Voxel
+        // 1️⃣ CropBox (MUST BE FIRST TO PREVENT MEMORY OVERFLOW)
+        pcl::CropBox<PointT> crop;
+        crop.setInputCloud(cloud);
+        crop.setMin(Eigen::Vector4f(x_min_, y_min_, z_min_, 1.0f));
+        crop.setMax(Eigen::Vector4f(x_max_, y_max_, z_max_, 1.0f));
+        crop.filter(*cloud);
+
+        if (cloud->empty())
+            return;
+
+        // 2️⃣ Voxel Downsampling (Safe now that the cloud is cropped)
         pcl::VoxelGrid<PointT> voxel;
         voxel.setInputCloud(cloud);
         voxel.setLeafSize(voxel_size_, voxel_size_, voxel_size_);
@@ -179,27 +199,7 @@ private:
         if (cloud->empty())
             return;
 
-        // 2️⃣ ROI filtering
-        pcl::PassThrough<PointT> pass;
-        pass.setInputCloud(cloud);
-        pass.setFilterFieldName("z");
-        pass.setFilterLimits(z_min_, z_max_);
-        pass.filter(*cloud);
-
-        pass.setInputCloud(cloud);
-        pass.setFilterFieldName("x");
-        pass.setFilterLimits(x_min_, x_max_);
-        pass.filter(*cloud);
-
-        pass.setInputCloud(cloud);
-        pass.setFilterFieldName("y");
-        pass.setFilterLimits(y_min_, y_max_);
-        pass.filter(*cloud);
-
-        if (cloud->empty())
-            return;
-
-        // 3️⃣ SOR
+        // 3️⃣ Statistical Outlier Removal (SOR)
         if (use_sor_)
         {
             pcl::StatisticalOutlierRemoval<PointT> sor;
@@ -212,7 +212,7 @@ private:
         if (cloud->empty())
             return;
 
-        // 4️⃣ Perpendicular Plane RANSAC
+        // 4️⃣ RANSAC Plane Segmentation (Delete the Table)
         pcl::SACSegmentation<PointT> seg;
         pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
         pcl::ModelCoefficients::Ptr coeffs(new pcl::ModelCoefficients);
@@ -220,28 +220,30 @@ private:
         seg.setOptimizeCoefficients(true);
         seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
         seg.setMethodType(pcl::SAC_RANSAC);
-        seg.setMaxIterations(100);
+        seg.setMaxIterations(1000); // Matched to Python
         seg.setDistanceThreshold(plane_thresh_);
-
         seg.setAxis(Eigen::Vector3f(axis_x_, axis_y_, axis_z_));
         seg.setEpsAngle(plane_eps_angle_);
 
         seg.setInputCloud(cloud);
         seg.segment(*inliers, *coeffs);
 
+        // If a table is found, remove it
         if (!inliers->indices.empty())
         {
             pcl::ExtractIndices<PointT> extract;
             extract.setInputCloud(cloud);
             extract.setIndices(inliers);
-            extract.setNegative(true);
+            extract.setNegative(true); // Keep everything EXCEPT the table
             extract.filter(*cloud);
         }
 
         if (cloud->empty())
             return;
 
-        // 5️⃣ Normals (optional)
+        // 5️⃣ Normals & Publishing
+        sensor_msgs::msg::PointCloud2 output;
+
         if (use_normals_)
         {
             pcl::NormalEstimation<PointT, pcl::Normal> ne;
@@ -251,12 +253,23 @@ private:
             ne.setInputCloud(cloud);
             ne.setSearchMethod(tree);
             ne.setRadiusSearch(normal_radius_);
+
+            // Orient all normal vectors toward the camera lens (0,0,0)
+            ne.setViewPoint(0.0, 0.0, 0.0);
             ne.compute(*normals);
+
+            // 🚀 CRITICAL FIX: Merge the XYZ coordinates and the Normal vectors together
+            CloudNormalT::Ptr cloud_with_normals(new CloudNormalT);
+            pcl::concatenateFields(*cloud, *normals, *cloud_with_normals);
+
+            pcl::toROSMsg(*cloud_with_normals, output);
+        }
+        else
+        {
+            pcl::toROSMsg(*cloud, output);
         }
 
-        // Publish
-        sensor_msgs::msg::PointCloud2 output;
-        pcl::toROSMsg(*cloud, output);
+        // Attach the original timestamp and frame ID
         output.header = msg->header;
         publisher_->publish(output);
     }

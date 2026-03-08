@@ -35,20 +35,27 @@ class MotoMiniPlanningNode : public rclcpp::Node
 public:
     MotoMiniPlanningNode() : Node("motomini_planning_node")
     {
+
         // --- PARAMETERS ---
-        this->declare_parameter("urdf_path", "package://robot_model/urdf/motoman_motomini.urdf");
-        this->declare_parameter("srdf_path", "package://robot_model/urdf/motoman_motomini.srdf");
+        // this->declare_parameter("urdf_path", "package://robot_planning/urdf/motoman_motomini.urdf");
+        // this->declare_parameter("srdf_path", "package://robot_planning/urdf/motoman_motomini.srdf");
+        this->declare_parameter<std::string>("robot_description", "package://robot_planning/urdf/motoman_motomini.urdf");
+        this->declare_parameter<std::string>("robot_description_semantic", "package://robot_planning/urdf/motoman_motomini.srdf");
+
+        this->get_parameter("robot_description", urdf_xml_);
+        this->get_parameter("robot_description_semantic", srdf_xml_);
 
         // --- INITIALIZE TESSERACT ENVIRONMENT ---
         if (!initializeEnvironment())
         {
-            RCLCPP_ERROR(this->get_logger(), "Failed to initialize Tesseract Environment. Shutting down.");
-            rclcpp::shutdown();
-            return;
+            RCLCPP_FATAL(this->get_logger(), "Failed to initialize Tesseract Environment.");
+            // rclcpp::shutdown();
+            // return;
+            throw std::runtime_error("Tesseract init failed");
         }
 
         // --- INITIALIZE PLANNER ---
-        planner_ = std::make_shared<MotoMiniPlanning>(env_, nullptr, true, true);
+        planner_ = std::make_shared<MotoMiniPlanning>(env_, nullptr, false, true);
 
         // --- SUBSCRIBERS ---
 
@@ -78,6 +85,8 @@ public:
     }
 
 private:
+    std::string urdf_xml_;
+    std::string srdf_xml_;
     // --- MEMBERS ---
     std::shared_ptr<tesseract_environment::Environment> env_;
     std::shared_ptr<MotoMiniPlanning> planner_;
@@ -96,32 +105,53 @@ private:
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_trajectory_;
 
     // --- INITIALIZATION HELPER ---
+    // bool initializeEnvironment()
+    // {
+
+    //     auto locator = std::make_shared<tesseract_common::GeneralResourceLocator>();
+
+    //     std::string urdf_str = this->get_parameter("urdf_path").as_string();
+    //     std::string srdf_str = this->get_parameter("srdf_path").as_string();
+
+    //     auto urdf_res = locator->locateResource(urdf_str);
+    //     auto srdf_res = locator->locateResource(srdf_str);
+
+    //     if (!urdf_res || !srdf_res)
+    //     {
+    //         RCLCPP_ERROR(this->get_logger(), "Could not locate URDF or SRDF resource.");
+    //         return false;
+    //     }
+
+    //     std::filesystem::path urdf_path = urdf_res->getFilePath();
+    //     std::filesystem::path srdf_path = srdf_res->getFilePath();
+
+    //     env_ = std::make_shared<tesseract_environment::Environment>();
+    //     if (!env_->init(urdf_path, srdf_path, locator))
+    //         return false;
+
+    //     return true;
+    // }
     bool initializeEnvironment()
     {
-        auto locator = std::make_shared<tesseract_common::GeneralResourceLocator>();
-
-        std::string urdf_str = this->get_parameter("urdf_path").as_string();
-        std::string srdf_str = this->get_parameter("srdf_path").as_string();
-
-        auto urdf_res = locator->locateResource(urdf_str);
-        auto srdf_res = locator->locateResource(srdf_str);
-
-        if (!urdf_res || !srdf_res)
+        if (urdf_xml_.empty() || srdf_xml_.empty())
         {
-            RCLCPP_ERROR(this->get_logger(), "Could not locate URDF or SRDF resource.");
+            RCLCPP_ERROR(this->get_logger(), "URDF or SRDF parameter is empty.");
             return false;
         }
 
-        std::filesystem::path urdf_path = urdf_res->getFilePath();
-        std::filesystem::path srdf_path = srdf_res->getFilePath();
+        auto locator = std::make_shared<tesseract_common::GeneralResourceLocator>();
 
         env_ = std::make_shared<tesseract_environment::Environment>();
-        if (!env_->init(urdf_path, srdf_path, locator))
-            return false;
 
+        if (!env_->init(urdf_xml_, srdf_xml_, locator))
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to initialize Tesseract environment.");
+            return false;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Tesseract environment initialized successfully.");
         return true;
     }
-
     // --- CALLBACKS ---
 
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)

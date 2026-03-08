@@ -2,8 +2,13 @@
 #include <geometry_msgs/msg/pose.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/bool.hpp>
+
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
 #include <cstdlib>
 #include <string>
+#include <cmath>
 
 class ObjectController : public rclcpp::Node
 {
@@ -22,12 +27,22 @@ public:
             "/object/set_gravity", 10,
             std::bind(&ObjectController::gravity_callback, this, std::placeholders::_1));
 
-        current_pose_.position.x = 0.5;
-        current_pose_.position.y = 0.0;
-        current_pose_.position.z = 0.5;
-        current_pose_.orientation.w = 1.0;
+        // Default position
+        // Default position
+        current_pose_.position.x = -0.21;
+        current_pose_.position.y = -0.21;
+        current_pose_.position.z = 1.06;
 
-        RCLCPP_INFO(this->get_logger(), "Object Controller Ready (Control Only)");
+        // Convert Euler → Quaternion
+        tf2::Quaternion q;
+        q.setRPY(1.57, 0.0, 0.0); // roll=1.57, pitch=0, yaw=0
+        q.normalize();
+
+        current_pose_.orientation = tf2::toMsg(q);
+
+        respawn_object();
+
+        RCLCPP_INFO(this->get_logger(), "Object Controller Ready (Euler Control Enabled)");
     }
 
 private:
@@ -78,6 +93,8 @@ private:
 
     void pose_callback(const geometry_msgs::msg::Pose::SharedPtr msg)
     {
+        current_pose_ = *msg;
+
         std::string req =
             "'name: \"target_object\", "
             "position: {x: " +
@@ -99,7 +116,6 @@ private:
 
         system(cmd.c_str());
     }
-
     rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr pose_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mesh_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr gravity_sub_;

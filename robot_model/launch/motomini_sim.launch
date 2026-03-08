@@ -1,0 +1,14 @@
+<launch>
+    <include file="$(find motoman_motomini_support)/launch/load_motomini.launch" />
+
+    <rosparam command="load"
+        file="$(find motoman_motomini_support)/config/joint_names_motomini.yaml" />
+
+    <node pkg="industrial_robot_simulator" type="industrial_robot_simulator"
+        name="industrial_robot_simulator" />
+
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher" />
+
+    <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find industrial_robot_client)/config/robot_state_visualize.rviz" required="true" />
+</launch>

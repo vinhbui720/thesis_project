@@ -1,102 +1,102 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://ros.org/wiki/xacro">
   <xacro:macro name="motoman_motomini" params="prefix">
-    <material name="yaskawa_blue">
-      <color rgba="0.12941 0.14902 0.74902 1" />
-    </material>
-    <material name="yaskawa_silver">
-      <color rgba="0.75294 0.75294 0.75294 1" />
-    </material>
+    <xacro:macro name="material_yaskawa_blue">
+      <material name="${prefix}yaskawa_blue">
+        <color rgba="0.12941 0.12941 0.69020 1.0" />
+      </material>
+    </xacro:macro>
+
     <!-- link list -->
-    <!-- <link name="world" /> -->
     <link name="${prefix}base_link">
       <visual>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/visual/base_link.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/visual/base_link.stl" />
         </geometry>
-        <material name="yaskawa_blue" />
+        <xacro:material_yaskawa_blue />
       </visual>
       <collision>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/collision/base_link.stl" />
+          <mesh
+            filename="package://robot_model/meshes/motomini/collision/base_link.stl" />
         </geometry>
       </collision>
     </link>
     <link name="${prefix}link_1_s">
       <visual>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/visual/link_1_s.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/visual/link_1_s.stl" />
         </geometry>
-        <material name="yaskawa_blue" />
+        <xacro:material_yaskawa_blue />
       </visual>
       <collision>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/collision/link_1_s.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/collision/link_1_s.stl" />
         </geometry>
       </collision>
     </link>
     <link name="${prefix}link_2_l">
       <visual>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/visual/link_2_l.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/visual/link_2_l.stl" />
         </geometry>
-        <material name="yaskawa_blue" />
+        <xacro:material_yaskawa_blue />
       </visual>
       <collision>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/collision/link_2_l.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/collision/link_2_l.stl" />
         </geometry>
       </collision>
     </link>
     <link name="${prefix}link_3_u">
       <visual>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/visual/link_3_u.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/visual/link_3_u.stl" />
         </geometry>
-        <material name="yaskawa_blue" />
+        <xacro:material_yaskawa_blue />
       </visual>
       <collision>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/collision/link_3_u.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/collision/link_3_u.stl" />
         </geometry>
       </collision>
     </link>
     <link name="${prefix}link_4_r">
       <visual>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/visual/link_4_r.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/visual/link_4_r.stl" />
         </geometry>
-        <material name="yaskawa_blue" />
+        <xacro:material_yaskawa_blue />
       </visual>
       <collision>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/collision/link_4_r.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/collision/link_4_r.stl" />
         </geometry>
       </collision>
     </link>
     <link name="${prefix}link_5_b">
       <visual>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/visual/link_5_b.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/visual/link_5_b.stl" />
         </geometry>
-        <material name="yaskawa_blue" />
+        <xacro:material_yaskawa_blue />
       </visual>
       <collision>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/collision/link_5_b.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/collision/link_5_b.stl" />
         </geometry>
       </collision>
     </link>
     <link name="${prefix}link_6_t">
       <visual>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/visual/link_6_t.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/visual/link_6_t.stl" />
         </geometry>
-        <material name="yaskawa_blue" />
+        <xacro:material_yaskawa_blue />
       </visual>
       <collision>
         <geometry>
-          <mesh filename="package://robot_planning/meshes/motomini/collision/link_6_t.stl" />
+          <mesh filename="package://robot_model/meshes/motomini/collision/link_6_t.stl" />
         </geometry>
       </collision>
     </link>
@@ -104,11 +104,6 @@
     <!-- end of link list -->
 
     <!-- joint list -->
-    <!-- <joint name="world_base_link" type="fixed">
-      <parent link="world" />
-      <child link="${prefix}base_link" />
-      <origin xyz="0 0 0" rpy="0 0 0" />
-    </joint> -->
     <joint name="${prefix}joint_1_s" type="revolute">
       <parent link="${prefix}base_link" />
       <child link="${prefix}link_1_s" />

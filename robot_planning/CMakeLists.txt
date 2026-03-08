@@ -10,8 +10,6 @@ project(robot_planning)
 # 1. FIND DEPENDENCIES
 # --------------------
 find_package(ament_cmake REQUIRED)
-find_package(tesseract_environment REQUIRED)
-find_package(tesseract_command_language REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(std_msgs REQUIRED)       
@@ -21,13 +19,13 @@ find_package(control_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(trajectory_msgs REQUIRED)
-find_package(tesseract_task_composer REQUIRED)
-# find_package(tesseract_rosutils REQUIRED) # Commented out to fix build error
-find_package(tesseract_common REQUIRED)
-find_package(tesseract_visualization REQUIRED)
-# find_package(tesseract_msgs) # Commented out to fix build error
 find_package(trajopt_sqp REQUIRED)
 find_package(trajopt_ifopt REQUIRED)
+find_package(tesseract_environment REQUIRED)
+find_package(tesseract_command_language REQUIRED)
+find_package(tesseract_task_composer REQUIRED)
+find_package(tesseract_common REQUIRED)
+find_package(tesseract_visualization REQUIRED)
 find_package(
   tesseract_motion_planners REQUIRED
   COMPONENTS core simple
@@ -45,6 +43,10 @@ find_package(
              io
              segmentation
              surface)
+find_package(
+  tesseract_time_parameterization REQUIRED COMPONENTS core isp)
+
+
 
 # 2. CONSOLE BRIDGE CONFIGURATION
 # -------------------------------
@@ -83,6 +85,10 @@ target_link_libraries(
   trajopt::trajopt_ifopt
   tesseract::tesseract_task_composer
   tesseract::tesseract_task_composer_planning_nodes
+
+  tesseract::tesseract_time_parameterization_core
+  tesseract::tesseract_time_parameterization_isp
+
   console_bridge::console_bridge
   ${PCL_LIBRARIES})
 
@@ -181,6 +187,8 @@ install(
   PATTERN ".svn" EXCLUDE
 )
 install(DIRECTORY
+  urdf
+  meshes
   launch
   config
   DESTINATION share/${PROJECT_NAME}

@@ -1,0 +1,13 @@
+<robot name="my_workcell" xmlns:xacro="http://ros.org/wiki/xacro">
+
+    <link name="world" />
+
+    <xacro:include filename="motomini_no_world.xacro" />
+
+    <joint name="world_to_base" type="fixed">
+        <parent link="world" />
+        <child link="base_link" />
+        <origin xyz="0 0 0" rpy="0 0 0" />
+    </joint>
+
+</robot>

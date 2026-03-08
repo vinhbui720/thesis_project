@@ -7,14 +7,14 @@
       <!--visual_world_/Body.-->
       <origin rpy="0 0 0" xyz="0.0 0.0 0.0" />
       <geometry>
-        <mesh filename="package://motomini/meshes/motomini_ws_body_n6cmsa.dae" />
+        <mesh filename="package://motomini/meshes/workcell.stl" scale="0.001 0.001 0.001"/>
       </geometry>
     </visual>
     <collision>
       <!--col__world__col_Body__BoundBox/col_Body__BoundBox.-->
       <origin rpy="0 0 0" xyz="0.0 0.0 0.0" />
       <geometry>
-        <mesh filename="package://motomini/meshes/motomini_ws_body_n6cmsa.dae" />
+        <mesh filename="package://motomini/meshes/workcell.stl" scale="0.001 0.001 0.001"/>
       </geometry>
     </collision>
 

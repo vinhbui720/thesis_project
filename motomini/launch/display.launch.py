@@ -1,5 +1,5 @@
 from pathlib import Path
-
+from launch_ros.actions import Node
 import launch
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch.conditions import IfCondition, UnlessCondition
@@ -8,8 +8,6 @@ import launch_ros
 from launch_ros.substitutions import FindPackageShare
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-
-
 def generate_launch_description():
 
     pkg_share = Path(
@@ -23,7 +21,8 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     sim_mode = LaunchConfiguration('sim_mode')
-
+    tool_type = LaunchConfiguration('tool_type')
+    
     # ----------------------------------
     # Robot State Publisher (always needed)
     # ----------------------------------
@@ -35,9 +34,11 @@ def generate_launch_description():
                 'description.launch.py',
             ]),
         ]),
-        launch_arguments=dict(use_sim_time=use_sim_time).items(),
+        launch_arguments=dict(
+            use_sim_time=use_sim_time,
+            tool_type=tool_type
+        ).items(),
     )
-
     # ----------------------------------
     # Joint State Publisher (ONLY if not sim mode)
     # ----------------------------------
@@ -71,8 +72,12 @@ def generate_launch_description():
             default_value='false',
             description='Enable simulation mode (disables joint_state_publisher_gui)'
         ),
-
+        DeclareLaunchArgument(
+            name='tool_type',
+            default_value='magnetic',
+            description='Tool attached to robot'
+        ),
         robot_state_publisher_node,
-        joint_state_publisher_gui_node,
+        # joint_state_publisher_gui_node,
         rviz_node,
     ])

@@ -1,0 +1,133 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- TOOL MACRO -->
+  <xacro:macro name="motomini_tool" params="parent_link tool_type">
+
+    <!-- ============================= -->
+    <!-- ========== GRIPPER ========== -->
+    <!-- ============================= -->
+    <xacro:if value="${tool_type == 'gripper'}">
+
+      <link name="gripper_link">
+        <visual>
+          <geometry>
+            <box size="0.04 0.04 0.1" />
+          </geometry>
+        </visual>
+        <collision>
+          <geometry>
+            <box size="0.04 0.04 0.1" />
+          </geometry>
+        </collision>
+        <inertial>
+          <mass value="0.3" />
+          <inertia ixx="0.001" iyy="0.001" izz="0.001"
+            ixy="0" ixz="0" iyz="0" />
+        </inertial>
+      </link>
+
+      <joint name="tool_joint" type="fixed">
+        <parent link="${parent_link}" />
+        <child link="gripper_link" />
+        <origin xyz="0 0 0.08" rpy="0 0 0" />
+      </joint>
+
+    </xacro:if>
+
+
+    <!-- ============================= -->
+    <!-- =========== CAMERA ========== -->
+    <!-- ============================= -->
+    <xacro:if value="${tool_type == 'camera'}">
+
+      <link name="camera_link">
+        <visual>
+          <geometry>
+            <cylinder radius="0.02" length="0.05" />
+          </geometry>
+        </visual>
+      </link>
+
+      <joint name="tool_joint" type="fixed">
+        <parent link="${parent_link}" />
+        <child link="camera_link" />
+        <origin xyz="0 0 0.06" rpy="0 0 0" />
+      </joint>
+
+
+    </xacro:if>
+
+
+    <xacro:if value="${tool_type == 'magnetic'}">
+
+      <link name="magnetic_link">
+        <visual>
+          <!--visual_world_/Body.-->
+          <origin rpy="0 0 0" xyz="0.0 0.0 -0.045" />
+          <geometry>
+            <mesh filename="package://motomini/meshes/tool-magnetic.dae" />
+          </geometry>
+        </visual>
+        <collision>
+          <!--col__world__col_Body__BoundBox/col_Body__BoundBox.-->
+          <origin rpy="0 0 0" xyz="0.0 0.0 -0.045" />
+          <geometry>
+            <mesh filename="package://motomini/meshes/tool-magnetic.dae" />
+          </geometry>
+        </collision>
+
+        <inertial>
+          <mass value="1.0" />
+          <origin xyz="0 0 0" rpy="0 0 0" />
+          <inertia ixx="0.01" ixy="0" ixz="0"
+            iyy="0.01" iyz="0"
+            izz="0.01" />
+        </inertial>
+      </link>
+
+      <joint name="tool_joint" type="fixed">
+        <parent link="${parent_link}" />
+        <child link="magnetic_link" />
+        <origin xyz="0 0 0.045" rpy="0 0 0" />
+      </joint>
+
+
+    </xacro:if>
+
+    <xacro:if value="${tool_type == 'calib'}">
+
+      <link name="calib_link">
+        <visual>
+          <!--visual_world_/Body.-->
+          <origin rpy="0 0.0 0" xyz="0.0 0.0 0.012" />
+          <geometry>
+            <mesh filename="package://motomini/meshes/calib_tool2.stl" scale="0.001 0.001 0.001" />
+          </geometry>
+        </visual>
+        <collision>
+          <!--col__world__col_Body__BoundBox/col_Body__BoundBox.-->
+          <origin rpy="0 0 0" xyz="0.0 0.0 0.012" />
+          <geometry>
+            <mesh filename="package://motomini/meshes/calib_tool2.stl" scale="0.001 0.001 0.001" />
+          </geometry>
+        </collision>
+
+        <inertial>
+          <mass value="1.0" />
+          <origin xyz="0 0 0" rpy="0 0 0" />
+          <inertia ixx="0.01" ixy="0" ixz="0"
+            iyy="0.01" iyz="0"
+            izz="0.01" />
+        </inertial>
+      </link>
+
+      <joint name="tool_joint" type="fixed">
+        <parent link="${parent_link}" />
+        <child link="calib_link" />
+        <origin xyz="0.0145 0.0 0.0455" rpy="-1.57 0 1.57" />
+      </joint>
+    </xacro:if>
+  </xacro:macro>
+
+</robot>
