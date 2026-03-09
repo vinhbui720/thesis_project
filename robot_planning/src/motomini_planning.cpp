@@ -38,6 +38,8 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_osqp_solver_profile.h>
 #include <tesseract_motion_planners/simple/profile/simple_planner_lvs_move_profile.h>
 #include <tesseract_motion_planners/simple/profile/simple_planner_profile.h>
+#include <tesseract_motion_planners/ompl/profile/ompl_real_vector_move_profile.h>
+#include <tesseract_motion_planners/ompl/ompl_planner_configurator.h>
 #include <tesseract_motion_planners/core/utils.h>
 
 // Command Language
@@ -126,7 +128,7 @@ namespace Vinhtesseract_examples
             locator->locateResource("package://tesseract_task_composer/config/task_composer_plugins.yaml")->getFilePath());
         TaskComposerPluginFactory factory(config_path, *env_->getResourceLocator());
 
-        CONSOLE_BRIDGE_logInform("Generating & Subdividing Seed...");
+        CONSOLE_BRIDGE_logInform("Generating Native Sparse Seed...");
 
         CompositeInstruction sparse_program("DEFAULT", tesseract_common::ManipulatorInfo(MANIPULATOR_GROUP, LINK_BASE, LINK_TIP));
         StateWaypoint start_wp(joint_names, start_pos);
@@ -142,17 +144,17 @@ namespace Vinhtesseract_examples
         auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
         auto simple_move_profile = std::make_shared<tesseract_planning::SimplePlannerLVSMoveProfile>();
 
-        profiles->addProfile(
-            "SimplePlannerTask",
-            "FREESPACE",
-            simple_move_profile);
+        profiles->addProfile("SimplePlannerTask", "FREESPACE", simple_move_profile);
 
         // 2. Add the Composite Profile (NO template brackets!)
         auto simple_composite_profile = std::make_shared<tesseract_planning::SimplePlannerCompositeProfile>();
-        profiles->addProfile(
-            "SimplePlannerTask",
-            "DEFAULT",
-            simple_composite_profile);
+        profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_composite_profile);
+
+        auto ompl_profile = std::make_shared<tesseract_planning::OMPLRealVectorMoveProfile>();
+        ompl_profile->solver_config.planners.clear();
+        auto rrt_planner = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
+        ompl_profile->solver_config.planners.push_back(rrt_planner);
+        profiles->addProfile("OMPLTask", "FREESPACE", ompl_profile);
 
         if (ifopt_)
         {
@@ -200,8 +202,9 @@ namespace Vinhtesseract_examples
         auto post_check = std::make_shared<ContactCheckProfile>();
         profiles->addProfile("DiscreteContactCheckTask", "DEFAULT", post_check);
 
-        std::string task_name = (ifopt_) ? "TrajOptIfoptPipeline" : "TrajOptPipeline";
-        CONSOLE_BRIDGE_logInform("Executing %s with Dense Seed...", task_name.c_str());
+        // std::string task_name = (ifopt_) ? "OMPLTrajOptIfoptPipeline" : "OMPLTrajOptPipeline";
+        std::string task_name = "FreespacePipeline";
+        CONSOLE_BRIDGE_logInform("Executing %s (Global -> Local Pipeline)...", task_name.c_str());
 
         TaskComposerNode::UPtr task = factory.createTaskComposerNode(task_name);
         const std::string output_key = task->getOutputKeys().get("program");
