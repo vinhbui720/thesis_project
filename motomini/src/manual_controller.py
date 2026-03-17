@@ -1,293 +1,512 @@
+#!/usr/bin/env python3
+
 import sys
+import math
+import threading
+
 import rclpy
-import numpy as np
-
 from rclpy.node import Node
+from rclpy.time import Time
+from rclpy.duration import Duration
 
-from geometry_msgs.msg import PoseArray, Pose
+from geometry_msgs.msg import PoseArray, Pose, PoseStamped
 from std_msgs.msg import Bool, String
-from tf2_msgs.msg import TFMessage
+
+from tf2_ros import Buffer, TransformListener
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
 import transforms3d.euler as euler
 
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QGridLayout,
-    QPushButton, QLabel, QLineEdit, QListWidget
-)
-
-from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
 
 
-class PlanningGUI(Node):
+# =====================================================
+# ROS SIGNALS
+# =====================================================
 
-    def __init__(self):
+class RosSignals(QObject):
 
-        super().__init__("planning_gui")
+    status_updated = pyqtSignal(str)
+    pose_updated = pyqtSignal(float,float,float,float,float,float)
 
-        # publishers
-        self.pub_targets = self.create_publisher(PoseArray, "/target_poses", 10)
-        self.pub_start = self.create_publisher(Bool, "/start", 10)
-        self.pub_clear = self.create_publisher(Bool, "/clear_targets", 10)
 
-        # subscribers
-        self.sub_status = self.create_subscription(
+# =====================================================
+# MASTER ROS NODE
+# =====================================================
+
+class MasterDebugNode(Node):
+
+    def __init__(self, signals):
+
+        super().__init__("master_debug_gui")
+
+        self.signals = signals
+
+        # ---------- Planning publishers ----------
+
+        self.pub_targets = self.create_publisher(PoseArray,"/target_poses",10)
+        self.pub_start = self.create_publisher(Bool,"/start",10)
+        self.pub_clear = self.create_publisher(Bool,"/clear_targets",10)
+
+        # ---------- Object test publishers ----------
+
+        self.pub_object_pose = self.create_publisher(PoseStamped,"/target_object_pose",10)
+        self.pub_attach = self.create_publisher(Bool,"/object_attach_signal",10)
+
+        # ---------- Subscribers ----------
+
+        self.create_subscription(
             String,
             "/optimization_status",
             self.status_callback,
             10
         )
 
-        self.sub_tf = self.create_subscription(
-            TFMessage,
-            "/tf",
-            self.tf_callback,
-            50
+        # ---------- TF ----------
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer,self)
+
+        self.timer = self.create_timer(
+            0.1,
+            self.lookup_robot_pose
         )
 
-        # robot state
-        self.current_pose = None
-        self.status_text = "Waiting..."
+    # ------------------------------------------------
 
-    def status_callback(self, msg):
-        self.status_text = msg.data
+    def status_callback(self,msg):
 
-    def tf_callback(self, msg):
+        self.signals.status_updated.emit(msg.data)
 
-        for t in msg.transforms:
+    # ------------------------------------------------
 
-            if t.child_frame_id == "tool0":
+    def lookup_robot_pose(self):
 
-                p = t.transform.translation
-                q = t.transform.rotation
+        try:
 
-                quat = [q.w, q.x, q.y, q.z]
+            trans = self.tf_buffer.lookup_transform(
+                "world",
+                "tool0",
+                Time(),
+                timeout=Duration(seconds=0.1)
+            )
 
-                rpy = euler.quat2euler(quat)
+            t = trans.transform.translation
+            r = trans.transform.rotation
 
-                self.current_pose = (
-                    p.x, p.y, p.z,
-                    rpy[0], rpy[1], rpy[2]
-                )
+            quat = [r.w,r.x,r.y,r.z]
+
+            roll,pitch,yaw = euler.quat2euler(quat)
+
+            self.signals.pose_updated.emit(
+                t.x,t.y,t.z,roll,pitch,yaw
+            )
+
+        except (LookupException,ConnectivityException,ExtrapolationException):
+            pass
 
 
-class GUI(QWidget):
+# =====================================================
+# TAB 1 — PLANNING
+# =====================================================
 
-    def __init__(self, node):
+class PlanningTab(QWidget):
+
+    def __init__(self,node,signals):
 
         super().__init__()
 
-        self.node = node
-        self.pose_list = []
+        self.node=node
+        self.buffer=[]
 
-        layout = QVBoxLayout()
+        signals.status_updated.connect(self.update_status)
+        signals.pose_updated.connect(self.update_pose)
 
-        # ------------------------
-        # STATUS
-        # ------------------------
+        layout=QVBoxLayout()
 
-        self.status_label = QLabel("Status: Idle")
+        self.status_label=QLabel("Status: Idle")
+        self.indicator=QLabel("● Idle")
+
+        self.progress=QProgressBar()
+
+        self.robot_pose=QLabel("Robot Pose: waiting TF")
+
         layout.addWidget(self.status_label)
+        layout.addWidget(self.indicator)
+        layout.addWidget(self.robot_pose)
+        layout.addWidget(self.progress)
 
-        # ------------------------
-        # CURRENT ROBOT POSE
-        # ------------------------
+        # pose inputs
 
-        self.robot_pose_label = QLabel("Robot Pose: unknown")
-        layout.addWidget(self.robot_pose_label)
+        grid=QGridLayout()
 
-        # ------------------------
-        # INPUT FIELDS
-        # ------------------------
+        self.spin={}
 
-        grid = QGridLayout()
+        fields=[
+            ("X","x",-5,5,0.05),
+            ("Y","y",-5,5,0),
+            ("Z","z",-5,5,0.4),
+            ("Roll","r",-180,180,180),
+            ("Pitch","p",-180,180,0),
+            ("Yaw","yaw",-180,180,0)
+        ]
 
-        labels = ["X", "Y", "Z", "Roll", "Pitch", "Yaw"]
+        row=0
 
-        self.inputs = {}
+        for label,key,mn,mx,val in fields:
 
-        for i, name in enumerate(labels):
+            grid.addWidget(QLabel(label),row,0)
 
-            label = QLabel(name)
-            field = QLineEdit("0.0")
+            sb=QDoubleSpinBox()
+            sb.setRange(mn,mx)
+            sb.setValue(val)
 
-            self.inputs[name] = field
+            self.spin[key]=sb
 
-            grid.addWidget(label, i, 0)
-            grid.addWidget(field, i, 1)
+            grid.addWidget(sb,row,1)
+
+            row+=1
 
         layout.addLayout(grid)
 
-        # ------------------------
-        # BUTTONS
-        # ------------------------
+        # buttons
 
-        btn_add = QPushButton("Add Pose")
-        btn_send = QPushButton("Send To Planner")
-        btn_start = QPushButton("Start Planning")
-        btn_clear = QPushButton("Clear Buffer")
+        btn_layout=QHBoxLayout()
 
-        layout.addWidget(btn_add)
-        layout.addWidget(btn_send)
-        layout.addWidget(btn_start)
-        layout.addWidget(btn_clear)
+        add=QPushButton("Add")
+        send=QPushButton("Send")
+        start=QPushButton("Start")
+        clear=QPushButton("Clear")
 
-        btn_add.clicked.connect(self.add_pose)
-        btn_send.clicked.connect(self.send_poses)
-        btn_start.clicked.connect(self.start_planning)
-        btn_clear.clicked.connect(self.clear_buffer)
+        add.clicked.connect(self.add_pose)
+        send.clicked.connect(self.send)
+        start.clicked.connect(self.start)
+        clear.clicked.connect(self.clear)
 
-        # ------------------------
-        # POSE LIST
-        # ------------------------
+        btn_layout.addWidget(add)
+        btn_layout.addWidget(send)
+        btn_layout.addWidget(start)
+        btn_layout.addWidget(clear)
 
-        self.pose_widget = QListWidget()
-        layout.addWidget(self.pose_widget)
+        layout.addLayout(btn_layout)
+
+        self.list=QListWidget()
+
+        layout.addWidget(self.list)
 
         self.setLayout(layout)
 
-        self.setWindowTitle("MotoMini Planning GUI")
-        self.resize(420, 520)
+    # ------------------------------------------------
 
-    # ------------------------
-    # READ INPUT
-    # ------------------------
+    def update_status(self,text):
 
-    def read_pose(self):
+        self.status_label.setText(text)
 
-        x = float(self.inputs["X"].text())
-        y = float(self.inputs["Y"].text())
-        z = float(self.inputs["Z"].text())
+        t=text.lower()
 
-        r = float(self.inputs["Roll"].text())
-        p = float(self.inputs["Pitch"].text())
-        yaw = float(self.inputs["Yaw"].text())
+        if "accumulating" in t:
+            self.indicator.setText("● Accumulating")
+            self.progress.setValue(20)
 
-        pose = Pose()
+        elif "planning" in t:
+            self.indicator.setText("● Planning")
+            self.progress.setValue(40)
 
-        pose.position.x = x
-        pose.position.y = y
-        pose.position.z = z
+        elif "executing" in t:
+            self.indicator.setText("● Executing")
+            self.progress.setValue(70)
 
-        q = euler.euler2quat(r, p, yaw)
+        elif "success" in t:
+            self.indicator.setText("● Success")
+            self.progress.setValue(100)
 
-        pose.orientation.w = q[0]
-        pose.orientation.x = q[1]
-        pose.orientation.y = q[2]
-        pose.orientation.z = q[3]
+        elif "fail" in t:
+            self.indicator.setText("● Failed")
+            self.progress.setValue(0)
 
-        return pose, (x, y, z, r, p, yaw)
+    # ------------------------------------------------
 
-    # ------------------------
-    # ADD POSE
-    # ------------------------
+    def update_pose(self,x,y,z,r,p,yaw):
+
+        self.robot_pose.setText(
+            f"XYZ {x:.3f} {y:.3f} {z:.3f}"
+        )
+
+    # ------------------------------------------------
 
     def add_pose(self):
 
-        pose, values = self.read_pose()
+        x=self.spin["x"].value()
+        y=self.spin["y"].value()
+        z=self.spin["z"].value()
 
-        self.pose_list.append(pose)
+        r=math.radians(self.spin["r"].value())
+        p=math.radians(self.spin["p"].value())
+        yaw=math.radians(self.spin["yaw"].value())
 
-        x, y, z, r, p, yaw = values
+        q=euler.euler2quat(r,p,yaw)
 
-        text = (
-            f"X:{x:.3f} Y:{y:.3f} Z:{z:.3f} | "
-            f"R:{r:.2f} P:{p:.2f} Y:{yaw:.2f}"
-        )
+        pose=Pose()
 
-        self.pose_widget.addItem(text)
+        pose.position.x=x
+        pose.position.y=y
+        pose.position.z=z
 
-    # ------------------------
-    # SEND POSES
-    # ------------------------
+        pose.orientation.w=q[0]
+        pose.orientation.x=q[1]
+        pose.orientation.y=q[2]
+        pose.orientation.z=q[3]
 
-    def send_poses(self):
+        self.buffer.append(pose)
 
-        if len(self.pose_list) == 0:
-            return
+        self.list.addItem(f"{x},{y},{z}")
 
-        msg = PoseArray()
+    # ------------------------------------------------
 
-        msg.header.frame_id = "world"
-        msg.poses = self.pose_list
+    def send(self):
+
+        msg=PoseArray()
+        msg.header.frame_id="world"
+        msg.header.stamp=self.node.get_clock().now().to_msg()
+        msg.poses=self.buffer
 
         self.node.pub_targets.publish(msg)
 
-    # ------------------------
-    # START
-    # ------------------------
+        self.buffer=[]
+        self.list.clear()
 
-    def start_planning(self):
+    # ------------------------------------------------
 
-        msg = Bool()
-        msg.data = True
+    def start(self):
+
+        msg=Bool()
+        msg.data=True
 
         self.node.pub_start.publish(msg)
 
-    # ------------------------
-    # CLEAR
-    # ------------------------
+    # ------------------------------------------------
 
-    def clear_buffer(self):
+    def clear(self):
 
-        msg = Bool()
-        msg.data = True
+        msg=Bool()
+        msg.data=True
 
         self.node.pub_clear.publish(msg)
 
-        self.pose_widget.clear()
-        self.pose_list = []
+        self.buffer=[]
+        self.list.clear()
 
-    # ------------------------
-    # GUI UPDATE
-    # ------------------------
 
-    def update_gui(self):
+# =====================================================
+# TAB 2 — OBJECT TESTER
+# =====================================================
 
-        self.status_label.setText("Status: " + self.node.status_text)
+class ObjectTesterTab(QWidget):
 
-        pose = self.node.current_pose
+    def __init__(self,node):
 
-        if pose is not None:
+        super().__init__()
 
-            x, y, z, r, p, yaw = pose
+        self.node=node
 
-            text = (
-                f"Robot Pose | "
-                f"X:{x:.3f} Y:{y:.3f} Z:{z:.3f} | "
-                f"R:{r:.2f} P:{p:.2f} Y:{yaw:.2f}"
+        layout=QVBoxLayout()
+
+        self.sliders={}
+
+        params=[
+            ("X",-2,2,0.5),
+            ("Y",-2,2,0),
+            ("Z",-2,2,0.1),
+            ("Roll",-180,180,0),
+            ("Pitch",-180,180,0),
+            ("Yaw",-180,180,0)
+        ]
+
+        for name,mn,mx,val in params:
+
+            lab=QLabel(name)
+
+            slider=QSlider(Qt.Horizontal)
+            slider.setRange(int(mn*100),int(mx*100))
+            slider.setValue(int(val*100))
+
+            slider.valueChanged.connect(self.publish_pose)
+
+            layout.addWidget(lab)
+            layout.addWidget(slider)
+
+            self.sliders[name]=slider
+
+        btn_attach=QPushButton("Attach")
+        btn_detach=QPushButton("Detach")
+
+        btn_attach.clicked.connect(lambda:self.attach(True))
+        btn_detach.clicked.connect(lambda:self.attach(False))
+
+        layout.addWidget(btn_attach)
+        layout.addWidget(btn_detach)
+
+        self.setLayout(layout)
+
+    def publish_pose(self):
+
+        x=self.sliders["X"].value()/100
+        y=self.sliders["Y"].value()/100
+        z=self.sliders["Z"].value()/100
+
+        r=math.radians(self.sliders["Roll"].value()/100)
+        p=math.radians(self.sliders["Pitch"].value()/100)
+        yaw=math.radians(self.sliders["Yaw"].value()/100)
+
+        q=euler.euler2quat(r,p,yaw)
+
+        msg=PoseStamped()
+
+        msg.header.frame_id="world"
+        msg.header.stamp=self.node.get_clock().now().to_msg()
+
+        msg.pose.position.x=x
+        msg.pose.position.y=y
+        msg.pose.position.z=z
+
+        msg.pose.orientation.w=q[0]
+        msg.pose.orientation.x=q[1]
+        msg.pose.orientation.y=q[2]
+        msg.pose.orientation.z=q[3]
+
+        self.node.pub_object_pose.publish(msg)
+
+    def attach(self,state):
+
+        msg=Bool()
+        msg.data=state
+
+        self.node.pub_attach.publish(msg)
+
+
+# =====================================================
+# TAB 3 — TF VIEWER
+# =====================================================
+
+class TfViewerTab(QWidget):
+
+    def __init__(self,node):
+
+        super().__init__()
+
+        self.node=node
+
+        layout=QVBoxLayout()
+
+        self.tree=QTextEdit()
+        layout.addWidget(self.tree)
+
+        btn=QPushButton("Refresh TF Tree")
+        btn.clicked.connect(self.refresh)
+        layout.addWidget(btn)
+
+        self.target=QLineEdit()
+        self.source=QLineEdit()
+
+        layout.addWidget(QLabel("Target frame"))
+        layout.addWidget(self.target)
+
+        layout.addWidget(QLabel("Source frame"))
+        layout.addWidget(self.source)
+
+        btn2=QPushButton("Get Transform")
+        btn2.clicked.connect(self.get_tf)
+
+        layout.addWidget(btn2)
+
+        self.result=QTextEdit()
+
+        layout.addWidget(self.result)
+
+        self.setLayout(layout)
+
+    def refresh(self):
+
+        data=self.node.tf_buffer.all_frames_as_yaml()
+
+        self.tree.setText(data)
+
+    def get_tf(self):
+
+        target=self.target.text()
+        source=self.source.text()
+
+        try:
+
+            trans=self.node.tf_buffer.lookup_transform(
+                target,
+                source,
+                Time()
             )
 
-            self.robot_pose_label.setText(text)
+            t=trans.transform.translation
+            r=trans.transform.rotation
 
+            txt=f"{source} -> {target}\n"
+            txt+=f"x {t.x} y {t.y} z {t.z}\n"
+            txt+=f"qx {r.x} qy {r.y} qz {r.z} qw {r.w}"
+
+            self.result.setText(txt)
+
+        except Exception as e:
+
+            self.result.setText(str(e))
+
+
+# =====================================================
+# MAIN GUI
+# =====================================================
+
+class MasterGUI(QMainWindow):
+
+    def __init__(self,node,signals):
+
+        super().__init__()
+
+        self.setWindowTitle("MotoMini Master Debug GUI")
+
+        tabs=QTabWidget()
+
+        tabs.addTab(PlanningTab(node,signals),"Planning Control")
+        tabs.addTab(ObjectTesterTab(node),"Object TF Tester")
+        tabs.addTab(TfViewerTab(node),"TF Viewer")
+
+        self.setCentralWidget(tabs)
+
+
+# =====================================================
+# MAIN
+# =====================================================
 
 def main():
 
     rclpy.init()
 
-    node = PlanningGUI()
+    app=QApplication(sys.argv)
 
-    app = QApplication(sys.argv)
+    signals=RosSignals()
 
-    gui = GUI(node)
+    node=MasterDebugNode(signals)
+
+    gui=MasterGUI(node,signals)
     gui.show()
 
-    # ROS thread
-    import threading
-
     def spin():
+
         rclpy.spin(node)
 
-    thread = threading.Thread(target=spin)
-    thread.daemon = True
+    thread=threading.Thread(target=spin,daemon=True)
     thread.start()
 
-    # GUI update timer
-    timer = QTimer()
-    timer.timeout.connect(gui.update_gui)
-    timer.start(100)
-
-    sys.exit(app.exec())
+    sys.exit(app.exec_())
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
+
     main()

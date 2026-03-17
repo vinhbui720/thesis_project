@@ -4,7 +4,8 @@
   <name>motomini</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
-  <maintainer email="TODO@todo.com">TODO</maintainer>
+  <maintainer
+    email="TODO@todo.com">TODO</maintainer>
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -17,7 +18,10 @@
   <depend>visualization_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_geometry_msgs</depend>
-
+  <depend>tf2_ros</depend>
+  <depend>std_srvs</depend>
+  <depend>yaml-cpp </depend>
+  <depend>ament_index_cpp</depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

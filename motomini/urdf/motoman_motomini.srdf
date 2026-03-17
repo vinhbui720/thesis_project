@@ -67,6 +67,8 @@ are defined
     <disable_collisions link1="link_5_b" link2="link_6_t" reason="Adjacent" />
     <disable_collisions link1="workcell" link2="link_1_s" reason="Workcell Mount" />
     <disable_collisions link1="workcell" link2="link_2_l" reason="Workcell Mount" />
+    <disable_collisions link1="workcell" link2="magnetic_link" reason="Workcell Mount" />
     <disable_collisions link1="workcell" link2="base_link" reason="Mounted" />
     <disable_collisions link1="workcell" link2="link_1_s" reason="Mounted" />
+
 </robot>

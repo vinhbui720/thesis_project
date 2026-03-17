@@ -1,0 +1,9 @@
+# Goal
+bool execute
+---
+# Result
+bool success
+---
+# Feedback
+string current_status
+float64 max_joint_error

@@ -18,6 +18,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(trajopt_sqp REQUIRED)
 find_package(trajopt_ifopt REQUIRED)
@@ -175,6 +176,20 @@ target_link_libraries(test_header_build
     tesseract::tesseract_environment
     tesseract::tesseract_visualization
 )
+add_executable(online_collision_debugger src/collision_debugger_node.cpp)
+
+# Link the required Tesseract components
+target_link_libraries(online_collision_debugger
+  tesseract::tesseract_environment
+  tesseract::tesseract_collision_core
+)
+
+# Add ROS 2 dependencies
+ament_target_dependencies(online_collision_debugger
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+)
 
 # 6. INSTALLATION SETUP
 # ---------------------
@@ -202,6 +217,7 @@ install(TARGETS
   # tesseract_bridge
   test_header_build
   hardware_bridge_node
+  online_collision_debugger
   DESTINATION lib/${PROJECT_NAME}
 )
 

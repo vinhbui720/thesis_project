@@ -33,8 +33,13 @@ namespace Vinhtesseract_examples
     public:
         MotoMiniPlanning(std::shared_ptr<tesseract_environment::Environment> env,
                          std::shared_ptr<tesseract_visualization::Visualization> plotter = nullptr,
+                         std::string manipulator_group = "manipulator",
+                         std::string base_link = "world",
+                         std::string ee_link = "tool0",
                          bool debug = false,
-                         bool ifopt = false);
+                         bool ifopt = false,
+                         bool use_omp = false,
+                         bool online_mode = false);
 
         ~MotoMiniPlanning() override = default;
         MotoMiniPlanning(const MotoMiniPlanning &) = default;
@@ -50,8 +55,13 @@ namespace Vinhtesseract_examples
         std::shared_ptr<tesseract_common::JointTrajectory> getTrajectory() const;
 
     private:
+        std::string manipulator_group_;
+        std::string base_link_;
+        std::string ee_link_;
+        bool online_mode_;
         bool debug_;
         bool ifopt_;
+        bool use_ompl_;
         std::vector<Eigen::Isometry3d> target_poses_;
 
         // CHANGE: Use a shared_ptr to avoid "incomplete type" errors

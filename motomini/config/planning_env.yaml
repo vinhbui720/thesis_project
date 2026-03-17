@@ -1,0 +1,92 @@
+environment:
+
+  home_pose:
+    xyz: [0.30, 0.0, 0.40] # Replace with your robot's actual home X, Y, Z
+    rpy: [0.0, 3.14159, 0.0] # Replace with your robot's actual home Roll, Pitch, Yaw
+  
+  world_frame: world
+
+  frames:
+
+    # -------------------------------------------------
+    # Example 1: OVERRIDE an existing URDF frame
+    # -------------------------------------------------
+    world_depth_camera_link:
+
+      parent: workcell
+      type: override_urdf
+
+      pose:
+        xyz: [0.225, -0.225, 0.245]
+        rpy: [0.0, 3.14159, 3.14159]
+
+      sensor:
+        type: realsense_d435
+
+        pointcloud:
+          voxel_size: 0.003
+          max_range: 1.2
+          min_range: 0.1
+
+
+    # -------------------------------------------------
+    # Example 2: ADD new frame to TF tree
+    # -------------------------------------------------
+    working_tip:
+
+      parent: world
+      type: new_frame
+
+      pose:
+        xyz: [0.40, 0.15, 0.05]
+        rpy: [0.0, 0.0, 1.57]
+
+      grasp:
+        approach_distance: 0.10
+        lift_height: 0.15
+        gripper_width: 0.03
+
+
+  # workspace:
+
+  #   table_height: 0.75
+  #   safety_margin: 0.02
+
+  #   bins:
+
+  #     bin_A:
+  #       pose:
+  #         parent: world
+  #         xyz: [0.6, 0.25, 0.0]
+  #         rpy: [0, 0, 0]
+
+  #     bin_B:
+  #       pose:
+  #         parent: world
+  #         xyz: [0.6, -0.25, 0.0]
+  #         rpy: [0, 0, 0]
+
+
+  # perception:
+
+  #   icp:
+
+  #     voxel_size: 0.005
+  #     max_corr_distance: 0.02
+  #     fitness_threshold: 0.75
+
+  #   plane_segmentation:
+
+  #     distance_threshold: 0.003
+  #     ransac_iterations: 1500
+
+
+  # planning:
+
+  #   manipulator_group: manipulator
+  #   base_link: world
+
+  #   trajectory:
+
+  #     max_velocity_scaling: 0.6
+  #     max_acceleration_scaling: 0.6

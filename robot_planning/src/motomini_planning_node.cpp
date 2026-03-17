@@ -1,7 +1,7 @@
 /**
  * @file motomini_planning_node.cpp
  * @brief ROS 2 Node to wrap the MotoMiniPlanning logic (Advanced Version)
- * @details Features: Accumulates poses, supports buffer clearing, optimized logging.
+ * @details Features: Accumulates poses, supports buffer clearing, optimized logging, closed-loop execution monitoring.
  * @author Bùi Quang Vinh
  */
 
@@ -27,6 +27,9 @@
 // 4. Utils
 #include <Eigen/Geometry>
 #include <vector>
+#include <algorithm>
+#include <chrono>
+#include <cmath> // Added for std::abs()
 
 using namespace Vinhtesseract_examples;
 
@@ -37,11 +40,14 @@ public:
     {
 
         // --- PARAMETERS ---
-        // this->declare_parameter("urdf_path", "package://robot_planning/urdf/motoman_motomini.urdf");
-        // this->declare_parameter("srdf_path", "package://robot_planning/urdf/motoman_motomini.srdf");
         this->declare_parameter<std::string>("robot_description", "package://robot_planning/urdf/motoman_motomini.urdf");
         this->declare_parameter<std::string>("robot_description_semantic", "package://robot_planning/urdf/motoman_motomini.srdf");
-
+        this->declare_parameter<std::string>("manipulator_group", "manipulator");
+        this->declare_parameter<std::string>("base_link", "world");
+        this->declare_parameter<std::string>("ee_link", "tool0");
+        std::string manipulator_group = this->get_parameter("manipulator_group").as_string();
+        std::string base_link = this->get_parameter("base_link").as_string();
+        std::string ee_link = this->get_parameter("ee_link").as_string();
         this->get_parameter("robot_description", urdf_xml_);
         this->get_parameter("robot_description_semantic", srdf_xml_);
 
@@ -49,13 +55,19 @@ public:
         if (!initializeEnvironment())
         {
             RCLCPP_FATAL(this->get_logger(), "Failed to initialize Tesseract Environment.");
-            // rclcpp::shutdown();
-            // return;
             throw std::runtime_error("Tesseract init failed");
         }
 
         // --- INITIALIZE PLANNER ---
-        planner_ = std::make_shared<MotoMiniPlanning>(env_, nullptr, false, true);
+        planner_ = std::make_shared<MotoMiniPlanning>(
+            env_,
+            nullptr,
+            manipulator_group,
+            base_link,
+            ee_link,
+            false,
+            true,
+            false);
 
         // --- SUBSCRIBERS ---
 
@@ -80,6 +92,11 @@ public:
         pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
         pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
 
+        // Timer for closed-loop execution monitoring (10 Hz)
+        monitor_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100),
+            std::bind(&MotoMiniPlanningNode::monitorExecution, this));
+
         RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready (Advanced).");
         RCLCPP_INFO(this->get_logger(), "Topics: /joint_states, /target_poses (accumulates), /clear_targets, /start");
     }
@@ -87,13 +104,14 @@ public:
 private:
     std::string urdf_xml_;
     std::string srdf_xml_;
+
     // --- MEMBERS ---
     std::shared_ptr<tesseract_environment::Environment> env_;
     std::shared_ptr<MotoMiniPlanning> planner_;
 
     // Data Cache
     sensor_msgs::msg::JointState::SharedPtr last_joint_state_;
-    std::vector<geometry_msgs::msg::Pose> accumulated_targets_; // OPTIMIZATION: Vector to store all poses
+    std::vector<geometry_msgs::msg::Pose> accumulated_targets_;
 
     // ROS Interfaces
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_joint_states_;
@@ -104,33 +122,17 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_trajectory_;
 
-    // --- INITIALIZATION HELPER ---
-    // bool initializeEnvironment()
-    // {
+    // --- EXECUTION MONITORING ---
+    rclcpp::TimerBase::SharedPtr monitor_timer_;
+    bool is_executing_ = false;
+    std::vector<double> final_joint_target_;
+    std::vector<std::string> target_joint_names_;
+    rclcpp::Time execution_start_time_;
+    double expected_execution_duration_ = 0.0;
 
-    //     auto locator = std::make_shared<tesseract_common::GeneralResourceLocator>();
+    const double JOINT_TOLERANCE = 0.05; // radians (approx 2.8 degrees tolerance)
+    const double TIMEOUT_BUFFER = 5.0;   // seconds
 
-    //     std::string urdf_str = this->get_parameter("urdf_path").as_string();
-    //     std::string srdf_str = this->get_parameter("srdf_path").as_string();
-
-    //     auto urdf_res = locator->locateResource(urdf_str);
-    //     auto srdf_res = locator->locateResource(srdf_str);
-
-    //     if (!urdf_res || !srdf_res)
-    //     {
-    //         RCLCPP_ERROR(this->get_logger(), "Could not locate URDF or SRDF resource.");
-    //         return false;
-    //     }
-
-    //     std::filesystem::path urdf_path = urdf_res->getFilePath();
-    //     std::filesystem::path srdf_path = srdf_res->getFilePath();
-
-    //     env_ = std::make_shared<tesseract_environment::Environment>();
-    //     if (!env_->init(urdf_path, srdf_path, locator))
-    //         return false;
-
-    //     return true;
-    // }
     bool initializeEnvironment()
     {
         if (urdf_xml_.empty() || srdf_xml_.empty())
@@ -182,6 +184,7 @@ private:
         if (msg->data)
         {
             accumulated_targets_.clear();
+            is_executing_ = false; // Cancel execution monitoring if cleared manually
             RCLCPP_INFO(this->get_logger(), "Target buffer cleared.");
             publishStatus("Buffer Cleared");
         }
@@ -191,6 +194,12 @@ private:
     {
         if (!msg->data)
             return;
+
+        if (is_executing_)
+        {
+            RCLCPP_WARN(this->get_logger(), "Already executing a trajectory. Ignoring start signal.");
+            return;
+        }
 
         RCLCPP_INFO(this->get_logger(), "Start signal received!");
 
@@ -239,18 +248,77 @@ private:
         // 5. Result
         if (success)
         {
-            publishStatus("Success");
             auto traj_ptr = planner_->getTrajectory();
-            if (traj_ptr)
+            if (traj_ptr && !traj_ptr->empty())
             {
+                publishStatus("Optimization Success. Executing...");
+
+                // Publish physical path command to the robot
                 publishTrajectory(*traj_ptr, joint_names);
 
-                RCLCPP_INFO(this->get_logger(), "Planning Done. Buffer still holds %zu poses. Send /clear_targets to reset.", accumulated_targets_.size());
+                // Setup variables for Closed-Loop Monitoring
+                target_joint_names_ = joint_names;
+
+                // Convert Eigen::VectorXd to std::vector<double>
+                Eigen::VectorXd eigen_final_pos = traj_ptr->back().position;
+                final_joint_target_.assign(eigen_final_pos.data(), eigen_final_pos.data() + eigen_final_pos.size());
+
+                expected_execution_duration_ = traj_ptr->back().time;
+                execution_start_time_ = this->now();
+                is_executing_ = true;
+
+                RCLCPP_INFO(this->get_logger(), "Trajectory sent. Expected duration: %.2f seconds. Monitoring joints...", expected_execution_duration_);
+            }
+            else
+            {
+                publishStatus("Failed: Trajectory Empty");
             }
         }
         else
         {
             publishStatus("Failed: Optimization Error");
+        }
+    }
+
+    void monitorExecution()
+    {
+        if (!is_executing_ || !last_joint_state_)
+            return;
+
+        // 1. Check Timeout Condition
+        double elapsed = (this->now() - execution_start_time_).seconds();
+        if (elapsed > (expected_execution_duration_ + TIMEOUT_BUFFER))
+        {
+            is_executing_ = false;
+            publishStatus("Failed: Execution Timeout");
+            RCLCPP_ERROR(this->get_logger(), "Robot did not reach target within expected time + buffer.");
+            return;
+        }
+
+        // 2. Check Joint Errors (Compare current to target)
+        double max_error = 0.0;
+        for (size_t i = 0; i < target_joint_names_.size(); ++i)
+        {
+            // Find index of the joint in the last_joint_state_ message safely
+            auto it = std::find(last_joint_state_->name.begin(), last_joint_state_->name.end(), target_joint_names_[i]);
+            if (it != last_joint_state_->name.end())
+            {
+                size_t idx = std::distance(last_joint_state_->name.begin(), it);
+                double current_pos = last_joint_state_->position[idx];
+                double error = std::abs(current_pos - final_joint_target_[i]);
+                if (error > max_error)
+                {
+                    max_error = error;
+                }
+            }
+        }
+
+        // 3. Verify if within tolerance threshold
+        if (max_error < JOINT_TOLERANCE)
+        {
+            is_executing_ = false;
+            publishStatus("Success"); // This finally releases your main_command_node to do the next task!
+            RCLCPP_INFO(this->get_logger(), "Robot successfully reached physical target! (Max Error: %.4f rad)", max_error);
         }
     }
 

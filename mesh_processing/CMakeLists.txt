@@ -120,12 +120,20 @@ install(TARGETS
 )
 
 install(DIRECTORY
+  bags
   config
   mesh
   launch
+  data
   DESTINATION share/${PROJECT_NAME}
 )
-
+install(PROGRAMS
+  src/icp.py
+  src/process.py
+  src/trajectory.py
+  src/picking_pose.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights

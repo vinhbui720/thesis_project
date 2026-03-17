@@ -67,7 +67,14 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <tesseract_time_parameterization/isp/iterative_spline_parameterization.h>
 // #include <tesseract_time_parameterization/isp/iterative_spline_parameterization_profile.h>
 #include <tesseract_time_parameterization/core/utils.h>
+
+// --- ONLINE SQP SOLVER HEADERS ---
 #include <tesseract_common/profile_dictionary.h>
+#include <trajopt_sqp/qp_problem.h>
+#include <trajopt_sqp/trajopt_qp_problem.h>
+#include <trajopt_sqp/trust_region_sqp_solver.h>
+#include <trajopt_sqp/osqp_eigen_solver.h>
+#include <trajopt_ifopt/variable_sets/joint_position_variable.h>
 
 using namespace tesseract_environment;
 using namespace tesseract_kinematics;
@@ -78,19 +85,23 @@ using namespace tesseract_planning;
 using tesseract_common::ManipulatorInfo;
 
 // --- CONFIGURATION ---
-const std::string MANIPULATOR_GROUP = "manipulator";
-const std::string LINK_BASE = "world";
-const std::string LINK_TIP = "tool0";
 static const std::string TRAJOPT_DEFAULT_NAMESPACE = "TrajOptMotionPlannerTask";
 static const std::string TRAJOPT_IFOPT_DEFAULT_NAMESPACE = "TrajOptIfoptMotionPlannerTask";
 
 namespace Vinhtesseract_examples
 {
-    MotoMiniPlanning::MotoMiniPlanning(std::shared_ptr<tesseract_environment::Environment> env,
-                                       std::shared_ptr<tesseract_visualization::Visualization> plotter,
-                                       bool debug,
-                                       bool ifopt)
-        : Example(std::move(env), std::move(plotter)), debug_(debug), ifopt_(ifopt)
+    MotoMiniPlanning::MotoMiniPlanning(
+        std::shared_ptr<tesseract_environment::Environment> env,
+        std::shared_ptr<tesseract_visualization::Visualization> plotter,
+        std::string manipulator_group,
+        std::string base_link,
+        std::string ee_link,
+        bool debug,
+        bool ifopt,
+        bool use_ompl,
+        bool online_mode)
+        : Example(std::move(env), std::move(plotter)), manipulator_group_(std::move(manipulator_group)),
+          base_link_(std::move(base_link)), ee_link_(std::move(ee_link)), debug_(debug), ifopt_(ifopt), use_ompl_(use_ompl), online_mode_(online_mode)
     {
         last_trajectory_ = nullptr;
     }
@@ -130,7 +141,7 @@ namespace Vinhtesseract_examples
 
         CONSOLE_BRIDGE_logInform("Generating Native Sparse Seed...");
 
-        CompositeInstruction sparse_program("DEFAULT", tesseract_common::ManipulatorInfo(MANIPULATOR_GROUP, LINK_BASE, LINK_TIP));
+        CompositeInstruction sparse_program("DEFAULT", tesseract_common::ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
         StateWaypoint start_wp(joint_names, start_pos);
         MoveInstruction start_instr(start_wp, MoveInstructionType::FREESPACE, "FREESPACE");
         sparse_program.push_back(start_instr);
@@ -144,17 +155,19 @@ namespace Vinhtesseract_examples
         auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
         auto simple_move_profile = std::make_shared<tesseract_planning::SimplePlannerLVSMoveProfile>();
 
-        profiles->addProfile("SimplePlannerTask", "FREESPACE", simple_move_profile);
+        profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_move_profile);
+        if (use_ompl_)
+        {
+            // 2. Add the Composite Profile (NO template brackets!)
+            auto simple_composite_profile = std::make_shared<tesseract_planning::SimplePlannerCompositeProfile>();
+            profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_composite_profile);
 
-        // 2. Add the Composite Profile (NO template brackets!)
-        auto simple_composite_profile = std::make_shared<tesseract_planning::SimplePlannerCompositeProfile>();
-        profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_composite_profile);
-
-        auto ompl_profile = std::make_shared<tesseract_planning::OMPLRealVectorMoveProfile>();
-        ompl_profile->solver_config.planners.clear();
-        auto rrt_planner = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
-        ompl_profile->solver_config.planners.push_back(rrt_planner);
-        profiles->addProfile("OMPLTask", "FREESPACE", ompl_profile);
+            auto ompl_profile = std::make_shared<tesseract_planning::OMPLRealVectorMoveProfile>();
+            ompl_profile->solver_config.planners.clear();
+            auto rrt_planner = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
+            ompl_profile->solver_config.planners.push_back(rrt_planner);
+            profiles->addProfile("OMPLTask", "FREESPACE", ompl_profile);
+        }
 
         if (ifopt_)
         {
@@ -163,9 +176,9 @@ namespace Vinhtesseract_examples
             trajopt_ifopt_move->cartesian_constraint_config.coeff = Eigen::VectorXd::Constant(6, 1, 1.0);
 
             auto trajopt_ifopt_composite = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
-            trajopt_ifopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(0.001, 20);
+            trajopt_ifopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(1.0e-10, 20);
             trajopt_ifopt_composite->collision_cost_config.enabled = true;
-            trajopt_ifopt_composite->collision_constraint_config.enabled = false;
+            trajopt_ifopt_composite->collision_constraint_config.enabled = true;
 
             trajopt_ifopt_composite->smooth_velocities = false;
             trajopt_ifopt_composite->velocity_coeff = Eigen::VectorXd::Ones(1);
@@ -202,8 +215,17 @@ namespace Vinhtesseract_examples
         auto post_check = std::make_shared<ContactCheckProfile>();
         profiles->addProfile("DiscreteContactCheckTask", "DEFAULT", post_check);
 
-        // std::string task_name = (ifopt_) ? "OMPLTrajOptIfoptPipeline" : "OMPLTrajOptPipeline";
-        std::string task_name = "FreespacePipeline";
+        std::string task_name;
+        if (use_ompl_)
+        {
+            // Global -> Local pipeline (Uses OMPL to find a seed, then optimizes)
+            task_name = "FreespacePipeline";
+        }
+        else
+        {
+            // Local optimization only (Skips OMPL, uses linear interpolation as seed)
+            task_name = ifopt_ ? "TrajOptIfoptPipeline" : "TrajOptPipeline";
+        }
         CONSOLE_BRIDGE_logInform("Executing %s (Global -> Local Pipeline)...", task_name.c_str());
 
         TaskComposerNode::UPtr task = factory.createTaskComposerNode(task_name);
@@ -259,6 +281,58 @@ namespace Vinhtesseract_examples
         if (plotter_ != nullptr && plotter_->isConnected())
         {
             plotter_->plotTrajectory(trajectory, *env_->getStateSolver());
+        }
+
+        // ==========================================
+        // ONLINE PLANNING MODE TRANSITION
+        // ==========================================
+        if (!online_mode_)
+        {
+            CONSOLE_BRIDGE_logInform("Static planning complete. Exiting.");
+            return true; // Behavior remains exactly as it was before
+        }
+
+        CONSOLE_BRIDGE_logInform("Transitioning to Online Real-Time Mode...");
+
+        // 1. Initialize the Non-Linear Problem (NLP)
+        auto nlp = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
+
+        // 2. Feed `trajectory` (from your TaskComposer) into the NLP as variables
+        // (You will need to loop through the trajectory points and add them as JointPosition variables)
+
+        // 3. Setup the OSQP Solver
+        auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
+        trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
+
+        // Trust region limits how far the robot can diverge from the seed path per tick
+        double box_size = 0.05;
+        solver.params.initial_trust_box_size = box_size;
+        solver.init(nlp);
+
+        // 4. The Real-Time Execution Loop
+        bool is_executing = true;
+        while (is_executing)
+        {
+            // A. Read actual hardware joint states here (e.g., from a ROS subscriber cache)
+            // std::vector<double> current_actual_joints = ...
+
+            // B. Update the mathematical environment to see moving obstacles
+            // env_->setState(joint_names, current_actual_joints);
+
+            // C. Step the solver (Calculates Delta Theta)
+            solver.stepSQPSolver();
+
+            // D. Extract the safe, collision-free joint targets for the next millisecond
+            Eigen::VectorXd safe_next_step = solver.getResults().best_var_vals;
+
+            // E. Send `safe_next_step` to your MotoMini hardware controller!
+            // ...
+
+            // F. Reset the trust box for the next loop iteration
+            solver.setBoxSize(box_size);
+
+            // Add an exit condition (e.g., if distance to target is < 0.01)
+            // if (reached_target) is_executing = false;
         }
 
         return true;

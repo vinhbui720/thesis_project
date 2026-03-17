@@ -1,0 +1,17 @@
+{
+    "voxel_size": 0.002,
+    "nb_neighbors": 42,
+    "std_ratio": 2.4,
+    "plane_dist": 0.002,
+    "plane_iter": 800,
+    "normal_radius": 0.08,
+    "frame_count": 10,
+    "roi_min_x": -0.3000000000000001,
+    "roi_min_y": -0.10000000000000007,
+    "roi_min_z": -0.19,
+    "roi_max_x": 0.22000000000000006,
+    "roi_max_y": 0.17,
+    "roi_max_z": 0.35,
+    "enable_registration": false,
+    "reg_voxel_size": 0.005
+}

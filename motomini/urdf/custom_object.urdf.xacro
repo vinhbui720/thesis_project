@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="target_object">
 
-    <xacro:arg name="mesh_path" default="package://motomini/meshes/puzzel.stl" />
+    <xacro:arg name="mesh_path" default="package://motomini/meshes/puzzel_mount.stl" />
     <xacro:arg name="gravity_off" default="true" />
-    <xacro:arg name="mesh_scale" default="0.001" />
+    <xacro:arg name="mesh_scale" default="1.0" />
 
     <link name="object_link">
         <visual>

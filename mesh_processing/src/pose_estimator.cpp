@@ -37,7 +37,7 @@ public:
         this->declare_parameter("feature_radius", 0.05);
         this->declare_parameter("icp_max_iterations", 50);
         this->declare_parameter("icp_max_correspondence_dist", 0.05);
-        this->declare_parameter("debug_mode", false);
+        this->declare_parameter("debug_mode", true);
 
         // --- NEW: Pose Locking Parameters to filter noise ---
         this->declare_parameter("lock_translation_threshold", 0.003); // 3 mm
