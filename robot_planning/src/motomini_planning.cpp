@@ -75,6 +75,8 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <trajopt_sqp/trust_region_sqp_solver.h>
 #include <trajopt_sqp/osqp_eigen_solver.h>
 #include <trajopt_ifopt/variable_sets/joint_position_variable.h>
+#include <trajopt_ifopt/constraints/collision/discrete_collision_constraint.h>
+#include <trajopt_ifopt/constraints/collision/discrete_collision_evaluators.h>
 
 using namespace tesseract_environment;
 using namespace tesseract_kinematics;
@@ -115,7 +117,19 @@ namespace Vinhtesseract_examples
     {
         return last_trajectory_;
     }
-
+    void MotoMiniPlanning::setCommandCallback(CommandCallback cb)
+    {
+        command_cb_ = std::move(cb);
+    }
+    void MotoMiniPlanning::updateEnvironmentState(const std::vector<std::string> &joint_names, const Eigen::VectorXd &joint_pos)
+    {
+        std::unique_lock<std::shared_mutex> lock(env_mutex_);
+        env_->setState(joint_names, joint_pos);
+    }
+    void MotoMiniPlanning::setToolpathCallback(ToolpathCallback cb)
+    {
+        toolpath_cb_ = std::move(cb);
+    }
     bool MotoMiniPlanning::run()
     {
         if (debug_)
@@ -278,62 +292,133 @@ namespace Vinhtesseract_examples
 
         last_trajectory_ = std::make_shared<tesseract_common::JointTrajectory>(trajectory);
 
-        if (plotter_ != nullptr && plotter_->isConnected())
+        if (debug_ && plotter_ != nullptr && plotter_->isConnected())
         {
             plotter_->plotTrajectory(trajectory, *env_->getStateSolver());
         }
 
+        if (toolpath_cb_)
+        {
+            tesseract_kinematics::KinematicGroup::ConstPtr manip = env_->getKinematicGroup(manipulator_group_);
+            std::vector<Eigen::Vector3d> ee_path;
+            ee_path.reserve(trajectory.size());
+
+            for (const auto &state : trajectory)
+            {
+                Eigen::Isometry3d tf = manip->calcFwdKin(state.position).at(this->ee_link_);
+                ee_path.push_back(tf.translation());
+            }
+            toolpath_cb_(ee_path);
+        }
         // ==========================================
         // ONLINE PLANNING MODE TRANSITION
         // ==========================================
         if (!online_mode_)
         {
-            CONSOLE_BRIDGE_logInform("Static planning complete. Exiting.");
-            return true; // Behavior remains exactly as it was before
+            CONSOLE_BRIDGE_logInform("Static planning complete. Exiting run().");
+            return true;
         }
 
-        CONSOLE_BRIDGE_logInform("Transitioning to Online Real-Time Mode...");
+        CONSOLE_BRIDGE_logInform("Launching Online Real-Time Thread...");
 
-        // 1. Initialize the Non-Linear Problem (NLP)
-        auto nlp = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
+        is_executing_online_ = true;
 
-        // 2. Feed `trajectory` (from your TaskComposer) into the NLP as variables
-        // (You will need to loop through the trajectory points and add them as JointPosition variables)
+        // Launch the isolated control loop thread
+        online_thread_ = std::thread([this, joint_names, trajectory]()
+                                     {
+            
+            CONSOLE_BRIDGE_logInform("Online Thread Started. Building NLP...");
 
-        // 3. Setup the OSQP Solver
-        auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
-        trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
+            auto nlp = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
+            // tesseract_kinematics::KinematicGroup::ConstPtr manip = env_->getKinematicGroup(manipulator_group_);
+            // Eigen::MatrixX2d joint_limits = manip->getLimits().joint_limits;
+            tesseract_kinematics::KinematicGroup::ConstPtr manip;
+            Eigen::MatrixX2d joint_limits;
+            { // Thread-safe read of the environment
+                std::shared_lock<std::shared_mutex> lock(this->env_mutex_);
+                manip = env_->getKinematicGroup(manipulator_group_);
+                joint_limits = manip->getLimits().joint_limits;
+            }
+            std::vector<trajopt_ifopt::JointPosition::ConstPtr> vars;
 
-        // Trust region limits how far the robot can diverge from the seed path per tick
-        double box_size = 0.05;
-        solver.params.initial_trust_box_size = box_size;
-        solver.init(nlp);
+            for (size_t i = 0; i < trajectory.size(); ++i)
+            {
+                auto var = std::make_shared<trajopt_ifopt::JointPosition>(
+                    trajectory[i].position, joint_names, "Joint_Position_" + std::to_string(i));
+                var->SetBounds(joint_limits);
+                vars.push_back(var);
+                nlp->addVariableSet(var);
+            }
 
-        // 4. The Real-Time Execution Loop
-        bool is_executing = true;
-        while (is_executing)
-        {
-            // A. Read actual hardware joint states here (e.g., from a ROS subscriber cache)
-            // std::vector<double> current_actual_joints = ...
+            trajopt_common::TrajOptCollisionConfig collision_config(0.05, 10.0);
+            collision_config.collision_check_config.type = tesseract_collision::CollisionEvaluatorType::DISCRETE;
+            auto collision_cache = std::make_shared<trajopt_ifopt::CollisionCache>(trajectory.size());
 
-            // B. Update the mathematical environment to see moving obstacles
-            // env_->setState(joint_names, current_actual_joints);
+            for (size_t i = 1; i < trajectory.size(); i++)
+            {
+                auto collision_evaluator = std::make_shared<trajopt_ifopt::SingleTimestepCollisionEvaluator>(
+                    collision_cache, manip, env_, collision_config, true);
+                auto collision_constraint = std::make_shared<trajopt_ifopt::DiscreteCollisionConstraint>(
+                    collision_evaluator, vars[i], collision_config.max_num_cnt, false, "Collision_" + std::to_string(i));
+                nlp->addConstraintSet(collision_constraint);
+            }
 
-            // C. Step the solver (Calculates Delta Theta)
-            solver.stepSQPSolver();
+            nlp->setup();
+            auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
+            trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
+            double box_size = 0.05;
+            solver.params.initial_trust_box_size = box_size;
+            solver.init(nlp);
 
-            // D. Extract the safe, collision-free joint targets for the next millisecond
-            Eigen::VectorXd safe_next_step = solver.getResults().best_var_vals;
+            CONSOLE_BRIDGE_logInform("NLP Built. Entering 100Hz Control Loop.");
+            using namespace std::chrono;
+            const auto target_dt = milliseconds(10); 
+            auto next_loop_time = steady_clock::now() + target_dt;
 
-            // E. Send `safe_next_step` to your MotoMini hardware controller!
-            // ...
+            int num_joints = manip->numJoints(); 
+            int num_steps = trajectory.size();
+            int plot_throttle_counter = 0;
+            while (this->is_executing_online_)
+            {
+                { // Lock the environment just long enough for the solver to read it
+                    std::shared_lock<std::shared_mutex> lock(this->env_mutex_);
+                    solver.stepSQPSolver();
+                }
 
-            // F. Reset the trust box for the next loop iteration
-            solver.setBoxSize(box_size);
+                Eigen::VectorXd safe_trajectory_vector = solver.getResults().best_var_vals;
+                Eigen::VectorXd safe_next_step = safe_trajectory_vector.segment(0, 6);
 
-            // Add an exit condition (e.g., if distance to target is < 0.01)
-            // if (reached_target) is_executing = false;
-        }
+                if (this->command_cb_) {
+                    this->command_cb_(safe_next_step);
+                }
+                if (plot_throttle_counter++ % 10 == 0 && this->toolpath_cb_) 
+                {
+                    std::vector<Eigen::Vector3d> ee_path;
+                    ee_path.reserve(num_steps); 
+
+                    // Map the 1D vector back into an N x J matrix
+                    Eigen::Map<const tesseract_common::TrajArray> traj_matrix(
+                        safe_trajectory_vector.data(), num_steps, num_joints);
+
+                    // Calculate FK for every waypoint in the live trajectory
+                    for (int i = 0; i < num_steps; ++i) {
+                        Eigen::Isometry3d tf = manip->calcFwdKin(traj_matrix.row(i)).at(this->ee_link_);
+                        ee_path.push_back(tf.translation());
+                    }
+
+                    this->toolpath_cb_(ee_path);
+                }
+                // 4. Reset the trust box
+                solver.setBoxSize(box_size);
+
+                // 5. Enforce loop timing (100Hz)
+                std::this_thread::sleep_until(next_loop_time);
+                next_loop_time += target_dt;
+            }
+            CONSOLE_BRIDGE_logInform("Online Thread Safely Terminated."); });
+
+        // Detach so run() returns immediately to the ROS 2 node
+        online_thread_.detach();
 
         return true;
     }

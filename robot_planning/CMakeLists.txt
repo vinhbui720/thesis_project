@@ -139,6 +139,7 @@ ament_target_dependencies(motomini_planning_node
   sensor_msgs
   geometry_msgs
   trajectory_msgs
+  visualization_msgs
 )
 
 # C. Bridge Nodes

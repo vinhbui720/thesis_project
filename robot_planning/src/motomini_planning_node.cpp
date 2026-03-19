@@ -19,7 +19,8 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
-
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 // 3. Tesseract Includes
 #include <tesseract_common/resource_locator.h>
 #include <tesseract_environment/environment.h>
@@ -29,8 +30,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
-#include <cmath> // Added for std::abs()
-
+#include <cmath>
 using namespace Vinhtesseract_examples;
 
 class MotoMiniPlanningNode : public rclcpp::Node
@@ -45,6 +45,12 @@ public:
         this->declare_parameter<std::string>("manipulator_group", "manipulator");
         this->declare_parameter<std::string>("base_link", "world");
         this->declare_parameter<std::string>("ee_link", "tool0");
+        this->declare_parameter<bool>("online_mode", false);
+        this->declare_parameter<bool>("debug", false);
+        this->declare_parameter<bool>("use_ompl", false);
+        bool online_mode = this->get_parameter("online_mode").as_bool();
+        bool debug = this->get_parameter("debug").as_bool();
+        bool use_ompl = this->get_parameter("use_ompl").as_bool();
         std::string manipulator_group = this->get_parameter("manipulator_group").as_string();
         std::string base_link = this->get_parameter("base_link").as_string();
         std::string ee_link = this->get_parameter("ee_link").as_string();
@@ -65,9 +71,10 @@ public:
             manipulator_group,
             base_link,
             ee_link,
-            false,
+            debug,
             true,
-            false);
+            use_ompl,
+            online_mode);
 
         // --- SUBSCRIBERS ---
 
@@ -91,7 +98,55 @@ public:
         // --- PUBLISHERS ---
         pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
         pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
+        pub_online_cmd_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/motomini/online_joint_command", 100);
+        pub_ee_path_ = this->create_publisher<visualization_msgs::msg::Marker>("/motomini/ee_dynamic_path", 10);
+        planner_->setCommandCallback(
+            [this](const Eigen::VectorXd &cmd)
+            {
+                std_msgs::msg::Float64MultiArray msg;
+                msg.data.resize(cmd.size());
+                for (int i = 0; i < cmd.size(); ++i)
+                {
+                    msg.data[i] = cmd[i];
+                }
+                pub_online_cmd_->publish(msg);
+            });
+        planner_->setToolpathCallback(
+            [this, base_link](const std::vector<Eigen::Vector3d> &path)
+            {
+                if (path.empty())
+                    return;
 
+                visualization_msgs::msg::Marker marker;
+                marker.header.frame_id = base_link; // Matches the robot's base frame
+                marker.header.stamp = this->now();
+                marker.ns = "online_planner_path";
+                marker.id = 0;
+                marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+                marker.action = visualization_msgs::msg::Marker::ADD;
+
+                // Line thickness
+                marker.scale.x = 0.005;
+
+                // Bright Green Color
+                marker.color.r = 0.0;
+                marker.color.g = 1.0;
+                marker.color.b = 0.0;
+                marker.color.a = 1.0;
+
+                // Convert 3D Eigen vectors to ROS geometry points
+                for (const auto &pt : path)
+                {
+                    geometry_msgs::msg::Point p;
+                    p.x = pt.x();
+                    p.y = pt.y();
+                    p.z = pt.z();
+                    marker.points.push_back(p);
+                }
+
+                pub_ee_path_->publish(marker);
+            });
         // Timer for closed-loop execution monitoring (10 Hz)
         monitor_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
@@ -121,7 +176,8 @@ private:
 
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_trajectory_;
-
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_online_cmd_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_ee_path_; // NEW
     // --- EXECUTION MONITORING ---
     rclcpp::TimerBase::SharedPtr monitor_timer_;
     bool is_executing_ = false;
@@ -156,11 +212,6 @@ private:
     }
     // --- CALLBACKS ---
 
-    void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
-    {
-        last_joint_state_ = msg;
-    }
-
     void targetPosesCallback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
     {
         if (msg->poses.empty())
@@ -185,6 +236,7 @@ private:
         {
             accumulated_targets_.clear();
             is_executing_ = false; // Cancel execution monitoring if cleared manually
+            planner_->stopOnlinePlanner();
             RCLCPP_INFO(this->get_logger(), "Target buffer cleared.");
             publishStatus("Buffer Cleared");
         }
@@ -226,7 +278,7 @@ private:
         {
             joint_pos[i] = last_joint_state_->position[i];
         }
-        env_->setState(joint_names, joint_pos);
+        planner_->updateEnvironmentState(joint_names, joint_pos);
 
         // 3. Convert Poses (Using accumulated list)
         std::vector<Eigen::Isometry3d> eigen_poses;
@@ -266,8 +318,17 @@ private:
                 expected_execution_duration_ = traj_ptr->back().time;
                 execution_start_time_ = this->now();
                 is_executing_ = true;
-
-                RCLCPP_INFO(this->get_logger(), "Trajectory sent. Expected duration: %.2f seconds. Monitoring joints...", expected_execution_duration_);
+                bool online_mode = this->get_parameter("online_mode").as_bool();
+                if (online_mode)
+                {
+                    publishStatus("Optimization Success. Executing ONLINE...");
+                    RCLCPP_INFO(this->get_logger(), "Online Thread launched. Monitoring joints...");
+                }
+                else
+                {
+                    publishStatus("Optimization Success. Executing STATIC...");
+                    RCLCPP_INFO(this->get_logger(), "Trajectory sent to controllers. Monitoring joints...");
+                }
             }
             else
             {
@@ -290,6 +351,7 @@ private:
         if (elapsed > (expected_execution_duration_ + TIMEOUT_BUFFER))
         {
             is_executing_ = false;
+            planner_->stopOnlinePlanner();
             publishStatus("Failed: Execution Timeout");
             RCLCPP_ERROR(this->get_logger(), "Robot did not reach target within expected time + buffer.");
             return;
@@ -317,6 +379,7 @@ private:
         if (max_error < JOINT_TOLERANCE)
         {
             is_executing_ = false;
+            planner_->stopOnlinePlanner();
             publishStatus("Success"); // This finally releases your main_command_node to do the next task!
             RCLCPP_INFO(this->get_logger(), "Robot successfully reached physical target! (Max Error: %.4f rad)", max_error);
         }
@@ -354,6 +417,24 @@ private:
 
         pub_trajectory_->publish(ros_msg);
         RCLCPP_INFO(this->get_logger(), "Trajectory published with %zu points.", ros_msg.points.size());
+    }
+    void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
+    {
+        last_joint_state_ = msg;
+
+        // NEW: Thread-safe environment update for the online solver
+        bool online_mode = this->get_parameter("online_mode").as_bool();
+        if (is_executing_ && online_mode)
+        {
+            std::vector<std::string> joint_names = msg->name;
+            Eigen::VectorXd joint_pos(msg->position.size());
+            for (size_t i = 0; i < msg->position.size(); ++i)
+            {
+                joint_pos[i] = msg->position[i];
+            }
+            // Safely push new real-world data to the solver's environment
+            planner_->updateEnvironmentState(joint_names, joint_pos);
+        }
     }
 };
 

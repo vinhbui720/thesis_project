@@ -55,7 +55,11 @@ def generate_launch_description():
                 "manipulator_group": "manipulator",
                 "base_link": "world",
                 "ee_link": concrete_ee_link,
-                "tool_type": tool_type
+                "tool_type": tool_type,
+                "online_mode": True,
+                "debug":True,
+                "use_ompl": False,
+
             }],
             output="screen"
         ),
