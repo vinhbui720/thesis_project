@@ -1,0 +1,1 @@
+/home/vinbui/vinh_ws/src/thesis_project/build/robot_planning/ament_cmake_core/robot_planningConfig.cmake

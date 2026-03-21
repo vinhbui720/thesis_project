@@ -73,6 +73,7 @@ ament_target_dependencies(command_node
 install(TARGETS object_controller object_pose object_tf_broadcaster env_tf_broadcaster command_node DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS
   src/manual_controller.py
+  src/2axis_controller.py
   DESTINATION lib/${PROJECT_NAME}
 )
 if(BUILD_TESTING)

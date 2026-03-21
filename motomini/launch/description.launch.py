@@ -19,7 +19,7 @@ def generate_launch_description():
     xacro_file = os.path.join(
         pkg_share,
         "urdf",
-        "motoman_motomini_wrapper.urdf.xacro"
+        "motoman_motomini_wrapper_realbot.urdf.xacro"
     )
 
     controllers_file = os.path.join(

@@ -1,83 +1,94 @@
-from pathlib import Path
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
-import launch
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch.conditions import IfCondition, UnlessCondition
-
-import launch_ros
 from launch_ros.substitutions import FindPackageShare
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.parameter_descriptions import ParameterValue
+from launch.conditions import UnlessCondition
+
+
 def generate_launch_description():
 
-    pkg_share = Path(
-        launch_ros.substitutions.FindPackageShare(
-            package='motomini'
-        ).find('motomini')
-    )
-
-    default_model_path = pkg_share / 'urdf/motoman_motomini_wrapper.urdf.xacro'
-    default_rviz_config_path = pkg_share / 'rviz/robot_description.rviz'
-
+    # =========================
+    # Launch arguments
+    # =========================
     use_sim_time = LaunchConfiguration('use_sim_time')
-    sim_mode = LaunchConfiguration('sim_mode')
     tool_type = LaunchConfiguration('tool_type')
-    
-    # ----------------------------------
-    # Robot State Publisher (always needed)
-    # ----------------------------------
-    robot_state_publisher_node = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            PathJoinSubstitution([
-                FindPackageShare('motomini'),
-                'launch',
-                'description.launch.py',
+
+    pkg_share = FindPackageShare('motomini')
+
+    # =========================
+    # Robot Description (IMPORTANT)
+    # =========================
+    robot_description = {
+        "robot_description": ParameterValue(
+            Command([
+                "xacro ",
+                PathJoinSubstitution([
+                    pkg_share,
+                    "urdf",
+                    "motoman_motomini_wrapper_realbot.urdf.xacro"
+                ]),
+                " tool_type:=", tool_type
             ]),
-        ]),
-        launch_arguments=dict(
-            use_sim_time=use_sim_time,
-            tool_type=tool_type
-        ).items(),
-    )
-    # ----------------------------------
-    # Joint State Publisher (ONLY if not sim mode)
-    # ----------------------------------
-    joint_state_publisher_gui_node = launch_ros.actions.Node(
-        package='joint_state_publisher_gui',
-        executable='joint_state_publisher_gui',
-        condition=UnlessCondition(sim_mode),
-        parameters=[{'use_sim_time': use_sim_time}],
+            value_type=str
+        )
+    }
+
+    # =========================
+    # Robot State Publisher
+    # =========================
+    rsp_node = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        parameters=[robot_description, {"use_sim_time": use_sim_time}],
+        output="screen"
     )
 
-    # ----------------------------------
+    # =========================
+    # Joint State Publisher GUI (SLIDER)
+    # =========================
+    jsp_gui_node = Node(
+        package="joint_state_publisher_gui",
+        executable="joint_state_publisher_gui",
+        parameters=[{"use_sim_time": use_sim_time}],
+        output="screen"
+    )
+
+    # =========================
     # RViz
-    # ----------------------------------
-    rviz_node = launch_ros.actions.Node(
-        package='rviz2',
-        executable='rviz2',
-        output='screen',
-        arguments=['-d', str(default_rviz_config_path)],
-        parameters=[{'use_sim_time': use_sim_time}],
+    # =========================
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        arguments=[
+            "-d",
+            PathJoinSubstitution([
+                pkg_share,
+                "config",
+                "motomini.rviz"   # adjust if needed
+            ])
+        ],
+        parameters=[{"use_sim_time": use_sim_time}],
+        output="screen"
     )
 
-    return launch.LaunchDescription([
+    # =========================
+    # Launch
+    # =========================
+    return LaunchDescription([
 
         DeclareLaunchArgument(
-            name='use_sim_time',
-            default_value='false'
+            name="use_sim_time",
+            default_value="false"
         ),
 
         DeclareLaunchArgument(
-            name='sim_mode',
-            default_value='false',
-            description='Enable simulation mode (disables joint_state_publisher_gui)'
+            name="tool_type",
+            default_value="magnetic"
         ),
-        DeclareLaunchArgument(
-            name='tool_type',
-            default_value='magnetic',
-            description='Tool attached to robot'
-        ),
-        robot_state_publisher_node,
-        # joint_state_publisher_gui_node,
+
+        rsp_node,
+        jsp_gui_node,  
         rviz_node,
     ])

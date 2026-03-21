@@ -69,7 +69,6 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <tesseract_time_parameterization/core/utils.h>
 
 // --- ONLINE SQP SOLVER HEADERS ---
-#include <tesseract_common/profile_dictionary.h>
 #include <trajopt_sqp/qp_problem.h>
 #include <trajopt_sqp/trajopt_qp_problem.h>
 #include <trajopt_sqp/trust_region_sqp_solver.h>
@@ -170,16 +169,27 @@ namespace Vinhtesseract_examples
         auto simple_move_profile = std::make_shared<tesseract_planning::SimplePlannerLVSMoveProfile>();
 
         profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_move_profile);
+
         if (use_ompl_)
         {
-            // 2. Add the Composite Profile (NO template brackets!)
-            auto simple_composite_profile = std::make_shared<tesseract_planning::SimplePlannerCompositeProfile>();
+            auto simple_composite_profile =
+                std::make_shared<tesseract_planning::SimplePlannerCompositeProfile>();
             profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_composite_profile);
 
-            auto ompl_profile = std::make_shared<tesseract_planning::OMPLRealVectorMoveProfile>();
+            auto ompl_profile =
+                std::make_shared<tesseract_planning::OMPLRealVectorMoveProfile>();
+
+            ompl_profile->collision_check_config.longest_valid_segment_length = 0.005;
+            ompl_profile->collision_check_config.type =
+                tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
+
             ompl_profile->solver_config.planners.clear();
-            auto rrt_planner = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
-            ompl_profile->solver_config.planners.push_back(rrt_planner);
+
+            auto rrt = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
+            rrt->range = 0.1;
+
+            ompl_profile->solver_config.planners.push_back(rrt);
+
             profiles->addProfile("OMPLTask", "FREESPACE", ompl_profile);
         }
 
@@ -187,22 +197,31 @@ namespace Vinhtesseract_examples
         {
             auto trajopt_ifopt_move = std::make_shared<TrajOptIfoptDefaultMoveProfile>();
             trajopt_ifopt_move->cartesian_constraint_config.enabled = true;
-            trajopt_ifopt_move->cartesian_constraint_config.coeff = Eigen::VectorXd::Constant(6, 1, 1.0);
+            Eigen::VectorXd coeffs(6);
+            coeffs << 100.0, 100.0, 100.0, 10.0, 10.0, 0.0;
+            trajopt_ifopt_move->cartesian_constraint_config.coeff = coeffs;
 
             auto trajopt_ifopt_composite = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
-            trajopt_ifopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(1.0e-10, 20);
+            trajopt_ifopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(0.05, 500);
             trajopt_ifopt_composite->collision_cost_config.enabled = true;
+            trajopt_ifopt_composite->collision_constraint_config = trajopt_common::TrajOptCollisionConfig(0.01, 100);
             trajopt_ifopt_composite->collision_constraint_config.enabled = true;
+            // trajopt_ifopt_composite->collision_cost_config.collision_check_config.type = tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE;
+            trajopt_ifopt_composite->collision_cost_config.collision_check_config.type =
+                tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
 
+            trajopt_ifopt_composite->collision_constraint_config.collision_check_config.type =
+                tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
+            trajopt_ifopt_composite->collision_cost_config.collision_check_config.longest_valid_segment_length = 0.001;
             trajopt_ifopt_composite->smooth_velocities = false;
             trajopt_ifopt_composite->velocity_coeff = Eigen::VectorXd::Ones(1);
-            trajopt_ifopt_composite->smooth_accelerations = true;
+            trajopt_ifopt_composite->smooth_accelerations = false;
             trajopt_ifopt_composite->acceleration_coeff = Eigen::VectorXd::Ones(1);
             trajopt_ifopt_composite->smooth_jerks = true;
-            trajopt_ifopt_composite->jerk_coeff = Eigen::VectorXd::Ones(1);
+            trajopt_ifopt_composite->jerk_coeff = Eigen::VectorXd::Ones(1) * 50.0;
 
             auto trajopt_ifopt_solver = std::make_shared<TrajOptIfoptOSQPSolverProfile>();
-            trajopt_ifopt_solver->opt_params.max_iterations = 100;
+            trajopt_ifopt_solver->opt_params.max_iterations = 300;
 
             profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "FREESPACE", trajopt_ifopt_move);
             profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "DEFAULT", trajopt_ifopt_composite);
@@ -215,8 +234,8 @@ namespace Vinhtesseract_examples
             trajopt_freespace->cartesian_constraint_config.enabled = true;
 
             auto trajopt_composite = std::make_shared<TrajOptDefaultCompositeProfile>();
-            trajopt_composite->collision_constraint_config = trajopt_common::TrajOptCollisionConfig(0.0, 10);
-            trajopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(0.005, 50);
+            trajopt_composite->collision_constraint_config = trajopt_common::TrajOptCollisionConfig(0.01, 10);
+            trajopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(0.02, 50);
 
             auto trajopt_solver = std::make_shared<TrajOptOSQPSolverProfile>();
             trajopt_solver->opt_params.max_iter = 100;
@@ -260,12 +279,12 @@ namespace Vinhtesseract_examples
         if (!future->context->isSuccessful())
         {
             CONSOLE_BRIDGE_logError("Optimization FAILED!");
-            return false;
+            // return false;
         }
 
         CONSOLE_BRIDGE_logInform("Optimization SUCCESS!");
         auto ci = future->context->data_storage->getData(output_key).as<CompositeInstruction>();
-
+        tesseract_planning::formatProgram(ci, *env_);
         std::unique_ptr<tesseract_planning::TimeParameterization> time_parameterization_alg =
             std::make_unique<tesseract_planning::IterativeSplineParameterization>("IterativeSplineParameterization");
 
@@ -386,7 +405,7 @@ namespace Vinhtesseract_examples
                 }
 
                 Eigen::VectorXd safe_trajectory_vector = solver.getResults().best_var_vals;
-                Eigen::VectorXd safe_next_step = safe_trajectory_vector.segment(0, 6);
+                Eigen::VectorXd safe_next_step = safe_trajectory_vector.segment(0, num_joints);
 
                 if (this->command_cb_) {
                     this->command_cb_(safe_next_step);

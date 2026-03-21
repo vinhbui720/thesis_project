@@ -22,8 +22,12 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 // 3. Tesseract Includes
-#include <tesseract_common/resource_locator.h>
+// #include <tesseract_common/resource_locator.h>
 #include <tesseract_environment/environment.h>
+#include <tesseract_rosutils/plotting.h>
+#include <tesseract_monitoring/environment_monitor.h>
+#include <tesseract_scene_graph/graph.h>
+#include <tesseract_rosutils/utils.h>
 
 // 4. Utils
 #include <Eigen/Geometry>
@@ -63,11 +67,10 @@ public:
             RCLCPP_FATAL(this->get_logger(), "Failed to initialize Tesseract Environment.");
             throw std::runtime_error("Tesseract init failed");
         }
-
         // --- INITIALIZE PLANNER ---
         planner_ = std::make_shared<MotoMiniPlanning>(
             env_,
-            nullptr,
+            plotter_,
             manipulator_group,
             base_link,
             ee_link,
@@ -155,6 +158,17 @@ public:
         RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready (Advanced).");
         RCLCPP_INFO(this->get_logger(), "Topics: /joint_states, /target_poses (accumulates), /clear_targets, /start");
     }
+    void postInit()
+    {
+        monitor_ = std::make_shared<tesseract_monitoring::ROSEnvironmentMonitor>(
+            shared_from_this(), env_, "tesseract");
+
+        monitor_->startPublishingEnvironment();
+
+        monitor_->startStateMonitor("/joint_states");
+
+        RCLCPP_INFO(this->get_logger(), "Environment monitor started.");
+    }
 
 private:
     std::string urdf_xml_;
@@ -179,6 +193,8 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_online_cmd_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_ee_path_; // NEW
     // --- EXECUTION MONITORING ---
+    std::shared_ptr<tesseract_monitoring::ROSEnvironmentMonitor> monitor_;
+    std::shared_ptr<tesseract_visualization::Visualization> plotter_;
     rclcpp::TimerBase::SharedPtr monitor_timer_;
     bool is_executing_ = false;
     std::vector<double> final_joint_target_;
@@ -197,7 +213,7 @@ private:
             return false;
         }
 
-        auto locator = std::make_shared<tesseract_common::GeneralResourceLocator>();
+        auto locator = std::make_shared<tesseract_rosutils::ROSResourceLocator>();
 
         env_ = std::make_shared<tesseract_environment::Environment>();
 
@@ -208,8 +224,11 @@ private:
         }
 
         RCLCPP_INFO(this->get_logger(), "Tesseract environment initialized successfully.");
+        plotter_ = std::make_shared<tesseract_rosutils::ROSPlotting>(
+            env_->getSceneGraph()->getRoot());
         return true;
     }
+
     // --- CALLBACKS ---
 
     void targetPosesCallback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
@@ -395,28 +414,41 @@ private:
     void publishTrajectory(const tesseract_common::JointTrajectory &tess_traj,
                            const std::vector<std::string> &joint_names)
     {
+        // 1. Define exactly the 6 joints your controller expects
+        const std::vector<std::string> controlled_joints = {
+            "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+
         trajectory_msgs::msg::JointTrajectory ros_msg;
         ros_msg.header.stamp = this->now();
         ros_msg.header.frame_id = "world";
-        ros_msg.joint_names = joint_names;
+        ros_msg.joint_names = controlled_joints;
 
+        // 2. Map the Tesseract states directly to the controlled joints
         for (const auto &state : tess_traj)
         {
             trajectory_msgs::msg::JointTrajectoryPoint point;
             point.time_from_start = rclcpp::Duration::from_seconds(state.time);
 
-            for (double val : state.position)
-                point.positions.push_back(val);
-            for (double val : state.velocity)
-                point.velocities.push_back(val);
-            for (double val : state.acceleration)
-                point.accelerations.push_back(val);
+            // Tesseract plans for the 6-DOF manipulator group,
+            // so the state vector strictly contains these 6 joints in order.
+            for (size_t i = 0; i < controlled_joints.size(); ++i)
+            {
+                if (i < static_cast<size_t>(state.position.size()))
+                    point.positions.push_back(state.position[i]);
+
+                if (i < static_cast<size_t>(state.velocity.size()))
+                    point.velocities.push_back(state.velocity[i]);
+
+                if (i < static_cast<size_t>(state.acceleration.size()))
+                    point.accelerations.push_back(state.acceleration[i]);
+            }
 
             ros_msg.points.push_back(point);
         }
 
         pub_trajectory_->publish(ros_msg);
-        RCLCPP_INFO(this->get_logger(), "Trajectory published with %zu points.", ros_msg.points.size());
+        RCLCPP_INFO(this->get_logger(), "Filtered trajectory published (%zu points, %zu joints).",
+                    ros_msg.points.size(), ros_msg.joint_names.size());
     }
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
@@ -442,6 +474,7 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<MotoMiniPlanningNode>();
+    node->postInit();
     rclcpp::spin(node);
     rclcpp::shutdown();
     return 0;

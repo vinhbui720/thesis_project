@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="motoman_motomini" xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <xacro:arg name="tool_type" default="magnetic" />
+    <xacro:property name="tool_type" value="$(arg tool_type)" />
+
+    <xacro:property name="actual_tip_link" value="tool0" />
+
+    <xacro:if value="${tool_type == 'gripper'}">
+        <xacro:property name="actual_tip_link" value="gripper_link" />
+    </xacro:if>
+    <xacro:if value="${tool_type == 'camera'}">
+        <xacro:property name="actual_tip_link" value="camera_link" />
+    </xacro:if>
+    <xacro:if value="${tool_type == 'magnetic'}">
+        <xacro:property name="actual_tip_link" value="magnetic_link" />
+    </xacro:if>
+    <xacro:if value="${tool_type == 'calib'}">
+        <xacro:property name="actual_tip_link" value="calib_link" />
+    </xacro:if>
+
+    <group name="manipulator">
+        <chain base_link="base_link" tip_link="${actual_tip_link}" />
+    </group>
+
+    <group_state name="home" group="manipulator">
+        <joint name="joint_1_s" value="0" />
+        <joint name="joint_2_l" value="0" />
+        <joint name="joint_3_u" value="0" />
+        <joint name="joint_4_r" value="0" />
+        <joint name="joint_5_b" value="0" />
+        <joint name="joint_6_t" value="0" />
+    </group_state>
+
+
+    <kinematics_plugin_config
+        filename="package://robot_planning/config/motoman_planning.yaml" />
+    <contact_managers_plugin_config
+        filename="package://tesseract_support/urdf/contact_manager_plugins.yaml" />
+
+
+    <disable_collisions link1="base_link" link2="link_1_s" reason="Adjacent" />
+    <disable_collisions link1="base_link" link2="link_2_l" reason="Never" />
+    <disable_collisions link1="base_link" link2="link_3_u" reason="Never" />
+    <disable_collisions link1="link_1_s" link2="link_2_l" reason="Adjacent" />
+    <disable_collisions link1="link_1_s" link2="link_3_u" reason="Never" />
+    <disable_collisions link1="link_2_l" link2="link_3_u" reason="Adjacent" />
+    <disable_collisions link1="link_2_l" link2="link_4_r" reason="Default" />
+    <disable_collisions link1="link_2_l" link2="link_5_b" reason="Never" />
+    <disable_collisions link1="link_2_l" link2="link_6_t" reason="Never" />
+    <disable_collisions link1="link_3_u" link2="link_4_r" reason="Adjacent" />
+    <disable_collisions link1="link_3_u" link2="link_5_b" reason="Never" />
+    <disable_collisions link1="link_3_u" link2="link_6_t" reason="Never" />
+    <disable_collisions link1="link_4_r" link2="link_5_b" reason="Adjacent" />
+    <disable_collisions link1="link_4_r" link2="link_6_t" reason="Default" />
+    <disable_collisions link1="link_5_b" link2="link_6_t" reason="Adjacent" />
+    <disable_collisions link1="workcell" link2="base_link" reason="Mounted" />
+    <disable_collisions link1="workcell" link2="link_1_s" reason="Mounted" />
+    <disable_collisions link1="workcell" link2="link_2_l" reason="Workcell Mount" />
+
+
+    <!-- <disable_collisions link1="workcell" link2="magnetic_link" reason="Workcell Mount" /> -->
+    <xacro:if value="${tool_type == 'gripper'}">
+        <disable_collisions link1="tool0" link2="gripper_link" reason="Adjacent" />
+        <disable_collisions link1="link_6_t" link2="gripper_link" reason="Never" />
+        <disable_collisions link1="link_5_b" link2="gripper_link" reason="Never" />
+    </xacro:if>
+
+    <xacro:if value="${tool_type == 'camera'}">
+        <disable_collisions link1="tool0" link2="camera_link" reason="Adjacent" />
+        <disable_collisions link1="link_6_t" link2="camera_link" reason="Never" />
+        <disable_collisions link1="link_5_b" link2="camera_link" reason="Never" />
+    </xacro:if>
+
+    <xacro:if value="${tool_type == 'magnetic'}">
+        <disable_collisions link1="tool0" link2="magnetic_link" reason="Adjacent" />
+        <disable_collisions link1="link_6_t" link2="magnetic_link" reason="Never" />
+        <disable_collisions link1="link_5_b" link2="magnetic_link" reason="Never" />
+    </xacro:if>
+
+    <xacro:if value="${tool_type == 'calib'}">
+        <disable_collisions link1="tool0" link2="calib_link" reason="Adjacent" />
+        <disable_collisions link1="link_6_t" link2="calib_link" reason="Never" />
+        <disable_collisions link1="link_5_b" link2="calib_link" reason="Never" />
+    </xacro:if>
+
+</robot>

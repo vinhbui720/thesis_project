@@ -2,25 +2,23 @@ controller_manager:
   ros__parameters:
     update_rate: 50  # Hz
 
-    # Define the controllers we want to load
+    # --- REQUIRED ---
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
-    # 1. Position Trajectory Controller
-    # Use this for /joint_path_command input
-    joint_trajectory_controller:
+    # --- Motomini controller ---
+    motomini_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
-    # 2. Velocity Group Controller
-    velocity_group_controller:
-      type: velocity_controllers/JointGroupVelocityController
+    # --- Gantry controller ---
+    gantry_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
 
-    # 3. Effort Group Controller
-    effort_group_controller:
-      type: effort_controllers/JointGroupEffortController
 
-# Configuration for the Trajectory Controller
-joint_trajectory_controller:
+# ================================
+# Motomini Controller
+# ================================
+motomini_controller:
   ros__parameters:
     joints:
       - joint_1_s
@@ -35,24 +33,17 @@ joint_trajectory_controller:
       - position
       - velocity
 
-# Configuration for Velocity Controller
-velocity_group_controller:
-  ros__parameters:
-    joints:
-      - joint_1_s
-      - joint_2_l
-      - joint_3_u
-      - joint_4_r
-      - joint_5_b
-      - joint_6_t
 
-# Configuration for Effort Controller
-effort_group_controller:
+# ================================
+# Gantry Controller
+# ================================
+gantry_controller:
   ros__parameters:
     joints:
-      - joint_1_s
-      - joint_2_l
-      - joint_3_u
-      - joint_4_r
-      - joint_5_b
-      - joint_6_t
+      - joint_x
+      - joint_z
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity

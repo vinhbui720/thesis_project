@@ -43,7 +43,7 @@ namespace Vinhtesseract_examples
                          std::string ee_link = "tool0",
                          bool debug = false,
                          bool ifopt = false,
-                         bool use_omp = false,
+                         bool use_ompl = false,
                          bool online_mode = false);
 
         ~MotoMiniPlanning() override = default;

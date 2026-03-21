@@ -21,8 +21,9 @@ def generate_launch_description():
     # 3. Dynamic Logic
     # Simplified the PythonExpression by using f-strings for readability
     concrete_ee_link = PythonExpression([
-        "{'magnetic': 'magnetic_link', 'gripper': 'gripper_link', "
-        "'camera': 'camera_link', 'calib': 'calib_link'}['", tool_type, "']"
+        "({'magnetic': 'magnetic_link', 'gripper': 'gripper_link', ",
+        "'camera': 'camera_link', 'calib': 'calib_link'}).get('", 
+        tool_type, "', 'tool0')"
     ])
 
     # 4. Robot Descriptions (Combined into reusable dicts)
@@ -32,9 +33,11 @@ def generate_launch_description():
                  " tool_type:=", tool_type]), value_type=str)}
 
     robot_description_semantic = {"robot_description_semantic": ParameterValue(
-        Command(["cat ", PathJoinSubstitution([motomini_share, "urdf", "motoman_motomini.srdf"])]),
-        value_type=str)}
-
+        Command([
+            FindExecutable(name="xacro"), " ", 
+            PathJoinSubstitution([motomini_share, "urdf", "motoman_motomini.srdf.xacro"]),
+            " tool_type:=", tool_type
+        ]),value_type=str)}
 
     object_urdf_path = PathJoinSubstitution([
             motomini_share, "urdf", "custom_object.urdf.xacro"
@@ -56,9 +59,9 @@ def generate_launch_description():
                 "base_link": "world",
                 "ee_link": concrete_ee_link,
                 "tool_type": tool_type,
-                "online_mode": True,
+                "online_mode": False,
                 "debug":True,
-                "use_ompl": False,
+                "use_ompl": True,
 
             }],
             output="screen"
@@ -94,8 +97,12 @@ def generate_launch_description():
         ),
 
         # RViz
-        Node(package="rviz2", executable="rviz2", arguments=["-d", PathJoinSubstitution([motomini_share, "config", "motomini.rviz"])]),
-
+        Node(
+            package="rviz2", 
+            executable="rviz2", 
+            arguments=["-d", PathJoinSubstitution([motomini_share, "config", "motomini.rviz"])],
+            parameters=common_params # <-- THIS IS THE CRITICAL ADDITION
+        ),
         # Collision Debugger
         Node(package="robot_planning", executable="online_collision_debugger", parameters=common_params, condition=IfCondition(debug)),
 
@@ -121,20 +128,75 @@ def generate_launch_description():
         )
     ]
 
-    # 6. Controller Manager & Spawners (Conditional)
-    controller_config = PathJoinSubstitution([motomini_share, "config", "motoman_controllers.yaml"])
-    
+   # 6. Controller Manager & Spawners (Conditional)
+    controller_config = PathJoinSubstitution([
+        motomini_share, "config", "motoman_controllers.yaml"
+    ])
+
     control_nodes = [
+
+        # -------------------------------
+        # ros2_control node (NO remapping here)
+        # -------------------------------
         Node(
             package="controller_manager",
             executable="ros2_control_node",
             parameters=[robot_description, controller_config],
             condition=UnlessCondition(real_robot),
-            remappings=[("/joint_trajectory_controller/joint_trajectory", "/joint_path_command")]
+            output="screen"
         ),
-        # Spawners
-        *[Node(package="controller_manager", executable="spawner", arguments=[s], condition=UnlessCondition(real_robot)) 
-          for s in ["joint_state_broadcaster", "joint_trajectory_controller"]]
+
+        # -------------------------------
+        # Delay to ensure controller manager is ready
+        # -------------------------------
+        ExecuteProcess(
+            cmd=["sleep", "2"],
+            shell=True,
+            condition=UnlessCondition(real_robot)
+        ),
+
+        # -------------------------------
+        # Spawn controllers
+        # -------------------------------
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=["joint_state_broadcaster"],
+            condition=UnlessCondition(real_robot),
+            output="screen"
+        ),
+
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=["motomini_controller"],
+            condition=UnlessCondition(real_robot),
+            output="screen"
+        ),
+
+        # OPTIONAL (only if you really need gantry)
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=["gantry_controller"],
+            condition=UnlessCondition(real_robot),
+            output="screen"
+        ),
+
+        # -------------------------------
+        # 🔥 CRITICAL: Relay node (planner → controller)
+        # -------------------------------
+        Node(
+            package="topic_tools",
+            executable="relay",
+            name="trajectory_relay",
+            arguments=[
+                "/joint_path_command",
+                "/motomini_controller/joint_trajectory"
+            ],
+            output="screen",
+            condition=UnlessCondition(real_robot)
+        ),
     ]
     # Mesh processing 
     mesh_nodes = [

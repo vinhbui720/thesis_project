@@ -64,14 +64,14 @@
       <link name="magnetic_link">
         <visual>
           <!--visual_world_/Body.-->
-          <origin rpy="0 0 0" xyz="0.0 0.0 -0.045" />
+          <origin rpy="0 0 0" xyz="0.0 0.0 0" />
           <geometry>
             <mesh filename="package://motomini/meshes/tool-magnetic.dae" />
           </geometry>
         </visual>
         <collision>
           <!--col__world__col_Body__BoundBox/col_Body__BoundBox.-->
-          <origin rpy="0 0 0" xyz="0.0 0.0 -0.045" />
+          <origin rpy="0 0 0" xyz="0.0 0.0 0" />
           <geometry>
             <mesh filename="package://motomini/meshes/tool-magnetic.dae" />
           </geometry>
@@ -89,7 +89,7 @@
       <joint name="tool_joint" type="fixed">
         <parent link="${parent_link}" />
         <child link="magnetic_link" />
-        <origin xyz="0 0 0.045" rpy="0 0 0" />
+        <origin xyz="0 0 0.045" rpy="3.1415926535897932384626433 0.0 0.0" />
       </joint>
 
 

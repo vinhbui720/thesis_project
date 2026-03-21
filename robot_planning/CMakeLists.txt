@@ -27,6 +27,9 @@ find_package(tesseract_command_language REQUIRED)
 find_package(tesseract_task_composer REQUIRED)
 find_package(tesseract_common REQUIRED)
 find_package(tesseract_visualization REQUIRED)
+find_package(tesseract_rosutils REQUIRED)
+find_package(tesseract_monitoring REQUIRED)
+find_package(tesseract_scene_graph REQUIRED)
 find_package(
   tesseract_motion_planners REQUIRED
   COMPONENTS core simple
@@ -140,6 +143,12 @@ ament_target_dependencies(motomini_planning_node
   geometry_msgs
   trajectory_msgs
   visualization_msgs
+  tesseract_environment
+  tesseract_common
+  tesseract_visualization
+  tesseract_monitoring  
+  tesseract_rosutils
+  tesseract_scene_graph
 )
 
 # C. Bridge Nodes

@@ -1,0 +1,1 @@
+/home/vinbui/vinh_ws/src/thesis_project/robot_planning/launch/motomini_rviz_only.launch.py

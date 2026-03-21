@@ -1,0 +1,20 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz (Control loop runs at 100 times per second)
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    gantry_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+gantry_controller:
+  ros__parameters:
+    joints:
+      - joint_x
+      - joint_z
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
