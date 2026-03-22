@@ -72,6 +72,9 @@ namespace Vinhtesseract_examples
 
         void setToolpathCallback(ToolpathCallback cb);
 
+        // Lightweight tracking planner (collision check only, no optimization yet)
+        bool runTrackingPlanner(const Eigen::Isometry3d &target_pose);
+
     private:
         std::string manipulator_group_;
         std::string base_link_;

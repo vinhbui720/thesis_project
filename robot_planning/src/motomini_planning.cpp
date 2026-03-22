@@ -502,4 +502,73 @@ namespace Vinhtesseract_examples
 
         return true;
     }
+
+    bool MotoMiniPlanning::runTrackingPlanner(const Eigen::Isometry3d &target_pose)
+    {
+        if (!env_)
+            return false;
+
+        CONSOLE_BRIDGE_logDebug("[Tracking] Running lightweight tracking planner...");
+
+        // Get current joint state from environment
+        std::vector<std::string> joint_names = {"joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+        Eigen::VectorXd start_pos = env_->getCurrentJointValues(joint_names);
+
+        std::shared_ptr<const tesseract_common::ResourceLocator> locator = env_->getResourceLocator();
+        std::filesystem::path config_path(
+            locator->locateResource("package://tesseract_task_composer/config/task_composer_plugins.yaml")->getFilePath());
+        TaskComposerPluginFactory factory(config_path, *env_->getResourceLocator());
+
+        // Build minimal tracking instruction (single target)
+        CompositeInstruction tracking_program("DEFAULT", tesseract_common::ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
+        StateWaypoint start_wp(joint_names, start_pos);
+        MoveInstruction start_instr(start_wp, MoveInstructionType::FREESPACE, "FREESPACE");
+        tracking_program.push_back(start_instr);
+
+        CartesianWaypoint target_wp(target_pose);
+        MoveInstruction target_instr(target_wp, MoveInstructionType::FREESPACE, "FREESPACE");
+        tracking_program.push_back(target_instr);
+
+        // Use SimplePlannerTask for fast linear interpolation (no optimization)
+        auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
+        auto simple_move_profile = std::make_shared<tesseract_planning::SimplePlannerLVSMoveProfile>();
+        profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_move_profile);
+
+        auto data_storage = std::make_unique<tesseract_planning::TaskComposerDataStorage>();
+        data_storage->setData("planning_input", tracking_program);
+        data_storage->setData("environment", std::shared_ptr<const tesseract_environment::Environment>(env_));
+        data_storage->setData("profiles", profiles);
+
+        TaskComposerNode::UPtr task = factory.createTaskComposerNode("SimplePlannerTask");
+        const std::string output_key = task->getOutputKeys().get("program");
+
+        auto executor = factory.createTaskComposerExecutor("TaskflowExecutor");
+        auto context = std::make_shared<tesseract_planning::TaskComposerContext>(task->getName(), std::move(data_storage));
+
+        TaskComposerFuture::UPtr future = executor->run(*task, std::move(context));
+        future->wait();
+
+        if (!future->context->isSuccessful())
+        {
+            CONSOLE_BRIDGE_logWarn("[Tracking] SimplePlanner failed");
+            return false;
+        }
+
+        auto ci = future->context->data_storage->getData(output_key).as<CompositeInstruction>();
+        tesseract_planning::formatProgram(ci, *env_);
+
+        // TODO: Add collision check here (if not implemented yet)
+        // For now, accept trajectory as-is from SimplePlanner
+
+        tesseract_planning::CompositeInstruction nested_program("DEFAULT");
+        nested_program.push_back(ci);
+        std::vector<double> speed_scalings = {1.0};
+        tesseract_planning::rescaleTimings(nested_program, speed_scalings);
+
+        tesseract_common::JointTrajectory trajectory = toJointTrajectory(nested_program);
+        last_trajectory_ = std::make_shared<tesseract_common::JointTrajectory>(trajectory);
+
+        CONSOLE_BRIDGE_logDebug("[Tracking] Trajectory ready (%zu points)", trajectory.size());
+        return true;
+    }
 }

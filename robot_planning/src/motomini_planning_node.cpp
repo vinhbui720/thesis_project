@@ -21,15 +21,19 @@
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
-// #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/exceptions.h>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 // 3. Tesseract Includes
-// #include <tesseract_common/resource_locator.h>
 #include <tesseract_environment/environment.h>
 #include <tesseract_rosutils/plotting.h>
 #include <tesseract_monitoring/environment_monitor.h>
 #include <tesseract_scene_graph/graph.h>
 #include <tesseract_rosutils/utils.h>
+#include <tesseract_kinematics/core/kinematic_group.h>
 
 // 4. Utils
 #include <Eigen/Geometry>
@@ -54,6 +58,10 @@ public:
         this->declare_parameter<bool>("online_mode", false);
         this->declare_parameter<bool>("debug", false);
         this->declare_parameter<bool>("use_ompl", false);
+        this->declare_parameter<bool>("tracking_mode", false);
+        this->declare_parameter<double>("tracking_rate_hz", 5.0);
+        tracking_mode_ = this->get_parameter("tracking_mode").as_bool();
+        tracking_rate_hz_ = this->get_parameter("tracking_rate_hz").as_double();
         bool online_mode = this->get_parameter("online_mode").as_bool();
         bool debug = this->get_parameter("debug").as_bool();
         bool use_ompl = this->get_parameter("use_ompl").as_bool();
@@ -99,6 +107,10 @@ public:
         // 4. Input: /clear_targets (New: Clears the buffer)
         sub_clear_ = this->create_subscription<std_msgs::msg::Bool>(
             "/clear_targets", 10, std::bind(&MotoMiniPlanningNode::clearCallback, this, std::placeholders::_1));
+
+        // 5. Input: /tracking_control (NEW: Controls tracking ON/OFF when tracking_mode=true)
+        sub_tracking_control_ = this->create_subscription<std_msgs::msg::Bool>(
+            "/tracking_control", 10, std::bind(&MotoMiniPlanningNode::trackingControlCallback, this, std::placeholders::_1));
 
         // --- PUBLISHERS ---
         pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
@@ -175,7 +187,25 @@ public:
         monitor_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
             std::bind(&MotoMiniPlanningNode::monitorExecution, this));
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+        if (tracking_mode_)
+        {
+            const double hz = std::max(0.1, tracking_rate_hz_);
+            const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / hz));
+
+            tracking_timer_ = this->create_wall_timer(
+                period,
+                std::bind(&MotoMiniPlanningNode::trackingTick, this));
+
+            RCLCPP_INFO(this->get_logger(),
+                        "Tracking mode enabled: %.2f Hz, world='%s', base='%s', tip='%s'",
+                        hz,
+                        tracking_world_frame_.c_str(),
+                        tracking_gantry_base_frame_.c_str(),
+                        tracking_tip_frame_.c_str());
+        }
         RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready (Advanced).");
         RCLCPP_INFO(this->get_logger(), "Topics: /joint_states, /target_poses (accumulates), /clear_targets, /start");
     }
@@ -187,6 +217,21 @@ public:
         monitor_->startPublishingEnvironment();
 
         monitor_->startStateMonitor("/joint_states");
+
+        // Store initial pose for tracking mode (return-to-start when disabled)
+        std::vector<std::string> joint_names = {"joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+        Eigen::VectorXd initial_joints = env_->getCurrentJointValues(joint_names);
+
+        auto manip = env_->getKinematicGroup("manipulator");
+        if (manip)
+        {
+            auto fk_result = manip->calcFwdKin(initial_joints);
+            if (!fk_result.empty())
+            {
+                initial_robot_pose_ = fk_result.at("tool0");
+                RCLCPP_INFO(this->get_logger(), "Initial pose stored for tracking mode reset");
+            }
+        }
 
         RCLCPP_INFO(this->get_logger(), "Environment monitor started.");
     }
@@ -208,6 +253,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_targets_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_start_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_clear_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_tracking_control_; // NEW: Tracking control
 
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_trajectory_;
@@ -228,6 +274,116 @@ private:
     // --- DEBUG ---
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr wp_tf_timer_;
+    // --- TRACKING ---
+    bool tracking_mode_{false};
+    bool tracking_enabled_{false}; // Controlled by /start topic
+    double tracking_rate_hz_{5.0};
+    std::string tracking_world_frame_{"world"};
+    std::string tracking_gantry_base_frame_{"gantry_base_link"};
+    std::string tracking_tip_frame_{"working_tip"};
+
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    rclcpp::TimerBase::SharedPtr tracking_timer_;
+
+    Eigen::Isometry3d latest_working_tip_world_{Eigen::Isometry3d::Identity()};
+    Eigen::Isometry3d initial_robot_pose_{Eigen::Isometry3d::Identity()}; // Store initial pose
+
+    bool updateWorkingTipPoseFromTfAndJoints()
+    {
+        if (!last_joint_state_)
+            return false;
+
+        // Keep planner environment synced with latest real joints
+        std::vector<std::string> joint_names = last_joint_state_->name;
+        Eigen::VectorXd joint_pos(last_joint_state_->position.size());
+        for (size_t i = 0; i < last_joint_state_->position.size(); ++i)
+            joint_pos[static_cast<Eigen::Index>(i)] = last_joint_state_->position[i];
+
+        planner_->updateEnvironmentState(joint_names, joint_pos);
+
+        try
+        {
+            const auto world_to_base = tf_buffer_->lookupTransform(
+                tracking_world_frame_, tracking_gantry_base_frame_, tf2::TimePointZero);
+
+            const auto base_to_tip = tf_buffer_->lookupTransform(
+                tracking_gantry_base_frame_, tracking_tip_frame_, tf2::TimePointZero);
+
+            const Eigen::Isometry3d T_world_base = tf2::transformToEigen(world_to_base.transform);
+            const Eigen::Isometry3d T_base_tip = tf2::transformToEigen(base_to_tip.transform);
+
+            // Fused working tip pose in world frame
+            latest_working_tip_world_ = T_world_base * T_base_tip;
+            return true;
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                                 "Tracking TF lookup failed: %s", ex.what());
+            return false;
+        }
+    }
+    void trackingTick()
+    {
+        if (!tracking_mode_)
+            return;
+
+        // If tracking disabled, command robot to return to initial pose
+        if (!tracking_enabled_)
+        {
+            if (!last_joint_state_)
+                return;
+
+            std::vector<std::string> joint_names = last_joint_state_->name;
+            Eigen::VectorXd joint_pos(last_joint_state_->position.size());
+            for (size_t i = 0; i < last_joint_state_->position.size(); ++i)
+                joint_pos[static_cast<Eigen::Index>(i)] = last_joint_state_->position[i];
+
+            planner_->updateEnvironmentState(joint_names, joint_pos);
+
+            // Plan to initial pose (use lightweight planner)
+            const bool success = planner_->runTrackingPlanner(initial_robot_pose_);
+            if (!success)
+                return;
+
+            auto traj_ptr = planner_->getTrajectory();
+            if (!traj_ptr || traj_ptr->empty())
+                return;
+
+            publishTrajectory(*traj_ptr, joint_names);
+            publishStatus("Tracking disabled: returning to initial pose");
+            return;
+        }
+
+        // Tracking enabled: continuously re-plan to track moving target
+        if (!updateWorkingTipPoseFromTfAndJoints())
+            return;
+
+        // Call the lightweight tracking planner (collision check only, no optimization yet)
+        const bool success = planner_->runTrackingPlanner(latest_working_tip_world_);
+
+        if (!success)
+        {
+            RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed");
+            return;
+        }
+
+        auto traj_ptr = planner_->getTrajectory();
+        if (!traj_ptr || traj_ptr->empty())
+        {
+            RCLCPP_DEBUG(this->get_logger(), "Tracking: empty trajectory");
+            return;
+        }
+
+        const std::vector<std::string> joint_names = last_joint_state_ ? last_joint_state_->name
+                                                                       : std::vector<std::string>{};
+
+        // Directly publish trajectory without blocking on is_executing_
+        publishTrajectory(*traj_ptr, joint_names);
+
+        RCLCPP_DEBUG(this->get_logger(), "Tracking: new trajectory published");
+    }
 
     bool initializeEnvironment()
     {
@@ -320,6 +476,14 @@ private:
         if (!msg->data)
             return;
 
+        // Normal planner only works when tracking mode is OFF
+        if (tracking_mode_)
+        {
+            RCLCPP_WARN(this->get_logger(), "Tracking mode is active. Use /tracking_control topic instead.");
+            publishStatus("Tracking mode active: use /tracking_control");
+            return;
+        }
+
         if (is_executing_)
         {
             RCLCPP_WARN(this->get_logger(), "Already executing a trajectory. Ignoring start signal.");
@@ -411,6 +575,26 @@ private:
         else
         {
             publishStatus("Failed: Optimization Error");
+        }
+    }
+    void trackingControlCallback(const std_msgs::msg::Bool::SharedPtr msg)
+    {
+        if (!tracking_mode_)
+        {
+            RCLCPP_WARN(this->get_logger(), "Tracking mode is not enabled. This topic has no effect.");
+            return;
+        }
+
+        tracking_enabled_ = msg->data;
+        if (msg->data)
+        {
+            RCLCPP_INFO(this->get_logger(), "Tracking ENABLED");
+            publishStatus("Tracking ENABLED");
+        }
+        else
+        {
+            RCLCPP_INFO(this->get_logger(), "Tracking DISABLED, returning to initial pose");
+            publishStatus("Tracking DISABLED");
         }
     }
 

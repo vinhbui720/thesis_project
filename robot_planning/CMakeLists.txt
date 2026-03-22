@@ -11,6 +11,7 @@ find_package(trajectory_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_eigen REQUIRED)
 
 find_package(trajopt_sqp REQUIRED)
 find_package(trajopt_ifopt REQUIRED)
@@ -87,6 +88,7 @@ ament_target_dependencies(motomini_planning_node
   sensor_msgs
   geometry_msgs
   tf2_ros
+  tf2_eigen
   trajectory_msgs
   visualization_msgs
   tesseract_environment
