@@ -1,27 +1,20 @@
 cmake_minimum_required(VERSION 3.8)
 
-# FIX: Suppress the CMP0074 warning about PCL_ROOT
-if(POLICY CMP0074)
-  cmake_policy(SET CMP0074 NEW)
-endif()
-
 project(robot_planning)
 
-# 1. FIND DEPENDENCIES
-# --------------------
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(rclcpp_action REQUIRED)
-find_package(std_msgs REQUIRED)       
-find_package(geometry_msgs REQUIRED)  
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(control_msgs REQUIRED)
-find_package(Eigen3 REQUIRED)
-find_package(ament_index_cpp REQUIRED)
-find_package(visualization_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(tf2_ros REQUIRED)
+
 find_package(trajopt_sqp REQUIRED)
 find_package(trajopt_ifopt REQUIRED)
+
 find_package(tesseract_environment REQUIRED)
 find_package(tesseract_command_language REQUIRED)
 find_package(tesseract_task_composer REQUIRED)
@@ -30,6 +23,9 @@ find_package(tesseract_visualization REQUIRED)
 find_package(tesseract_rosutils REQUIRED)
 find_package(tesseract_monitoring REQUIRED)
 find_package(tesseract_scene_graph REQUIRED)
+find_package(tesseract_collision REQUIRED COMPONENTS core)
+find_package(tesseract_urdf REQUIRED)
+
 find_package(
   tesseract_motion_planners REQUIRED
   COMPONENTS core simple
@@ -38,22 +34,9 @@ find_package(
     ompl
     trajopt
     trajopt_ifopt)
-find_package(tesseract_collision REQUIRED COMPONENTS core)
-find_package(
-  PCL REQUIRED
-  COMPONENTS core
-             features
-             filters
-             io
-             segmentation
-             surface)
 find_package(
   tesseract_time_parameterization REQUIRED COMPONENTS core isp)
 
-
-
-# 2. CONSOLE BRIDGE CONFIGURATION
-# -------------------------------
 if(NOT TARGET console_bridge::console_bridge)
   add_library(console_bridge::console_bridge INTERFACE IMPORTED)
   set_target_properties(console_bridge::console_bridge PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
@@ -67,15 +50,12 @@ else()
   endif()
 endif()
 
-# Load Tesseract variables
 tesseract_variables()
 
-# 3. BUILD THE MAIN LIBRARY
-# -------------------------
 add_library(
   ${PROJECT_NAME}
-  src/vinh_pick_and_place_example.cpp
-  src/motomini_planning.cpp  # CORRECT: The Logic class (no main function)
+  src/motomini_planning.cpp
+  src/gantry_planning.cpp
 )
 
 target_link_libraries(
@@ -93,54 +73,20 @@ target_link_libraries(
   tesseract::tesseract_time_parameterization_core
   tesseract::tesseract_time_parameterization_isp
 
-  console_bridge::console_bridge
-  ${PCL_LIBRARIES})
+  console_bridge::console_bridge)
 
 target_compile_options(${PROJECT_NAME} PUBLIC ${TESSERACT_COMPILE_OPTIONS})
 target_include_directories(${PROJECT_NAME} PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                                                   "$<INSTALL_INTERFACE:include>")
-target_include_directories(${PROJECT_NAME} SYSTEM PUBLIC ${PCL_INCLUDE_DIRS})
 
-# 4. PCL DEFINITIONS LOOP
-# -----------------------
-foreach(DEF ${PCL_DEFINITIONS})
-  string(STRIP ${DEF} DEF)
-  if(NOT "${DEF}" STREQUAL "")
-    string(SUBSTRING "${DEF}" 0 2 DEF_PREFIX)
-    if("${DEF_PREFIX}" STREQUAL "-m")
-      string(REPLACE " " ";" DEF ${DEF})
-      foreach(OPTION_DEF ${DEF})
-        target_compile_options(${PROJECT_NAME} PUBLIC ${OPTION_DEF})
-      endforeach()
-    else()
-      target_compile_definitions(${PROJECT_NAME} PUBLIC ${DEF})
-    endif()
-  endif()
-endforeach()
-
-# 5. CREATE THE EXECUTABLES
-# -------------------------
-
-# A. Original Example Node
-add_executable(vinh_pick_place_node src/vinh_pick_and_place_example_node.cpp)
-target_link_libraries(vinh_pick_place_node ${PROJECT_NAME} rclcpp::rclcpp)
-target_compile_options(vinh_pick_place_node PRIVATE ${TESSERACT_COMPILE_OPTIONS})
-target_include_directories(vinh_pick_place_node PRIVATE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-                                                        "$<INSTALL_INTERFACE:include>")
-
-# B. MotoMini Planning Node
-# CORRECT: The Node file (has main function and rclcpp includes)
 add_executable(motomini_planning_node src/motomini_planning_node.cpp)
-
-# Link to the library logic
 target_link_libraries(motomini_planning_node ${PROJECT_NAME})
-
-# Add ROS dependencies
 ament_target_dependencies(motomini_planning_node
   rclcpp
   std_msgs
   sensor_msgs
   geometry_msgs
+  tf2_ros
   trajectory_msgs
   visualization_msgs
   tesseract_environment
@@ -151,59 +97,38 @@ ament_target_dependencies(motomini_planning_node
   tesseract_scene_graph
 )
 
-# C. Bridge Nodes
-# add_executable(tesseract_bridge src/tesseract_bridge.cpp)
-# ament_target_dependencies(tesseract_bridge
-#   rclcpp
-#   trajectory_msgs
-#   tesseract_msgs
-# )
-
-add_executable(hardware_bridge_node src/hardware_bridge.cpp)
-ament_target_dependencies(hardware_bridge_node
-  rclcpp
-  rclcpp_action
-  sensor_msgs
-  control_msgs
-  trajectory_msgs
-)
-
-add_executable(trajectory_dispatcher_node src/trajectory_dispatcher_node.cpp)
-ament_target_dependencies(trajectory_dispatcher_node
+add_executable(gantry_planning_node src/gantry_planning_node.cpp)
+target_link_libraries(gantry_planning_node ${PROJECT_NAME})
+ament_target_dependencies(gantry_planning_node
   rclcpp
   std_msgs
   sensor_msgs
-  trajectory_msgs)
+  geometry_msgs
+  trajectory_msgs
+  tesseract_environment
+  tesseract_common
+  tesseract_visualization
+  tesseract_rosutils
+  tesseract_scene_graph
+)
 
-# D. Test Executables
-add_executable(test_header_build src/test_header_build.cpp)
-target_include_directories(test_header_build PUBLIC 
-    include
-    ${Eigen3_INCLUDE_DIRS}
+add_executable(gantry_loop_controller_node src/gantry_loop_controller_node.cpp)
+ament_target_dependencies(gantry_loop_controller_node
+  rclcpp
+  trajectory_msgs
 )
-target_link_libraries(test_header_build
-    tesseract::tesseract_common
-    tesseract::tesseract_environment
-    tesseract::tesseract_visualization
-)
+
 add_executable(online_collision_debugger src/collision_debugger_node.cpp)
-
-# Link the required Tesseract components
 target_link_libraries(online_collision_debugger
   tesseract::tesseract_environment
   tesseract::tesseract_collision_core
 )
-
-# Add ROS 2 dependencies
 ament_target_dependencies(online_collision_debugger
   rclcpp
   sensor_msgs
   visualization_msgs
 )
 
-# 6. INSTALLATION SETUP
-# ---------------------
-# Install headers
 install(
   DIRECTORY include/
   DESTINATION include
@@ -218,15 +143,11 @@ install(DIRECTORY
   config
   DESTINATION share/${PROJECT_NAME}
 )
-# Install the library and the executable
-install(TARGETS 
-  ${PROJECT_NAME} 
-  vinh_pick_place_node
+install(TARGETS
+  ${PROJECT_NAME}
   motomini_planning_node
-  trajectory_dispatcher_node
-  # tesseract_bridge
-  test_header_build
-  hardware_bridge_node
+  gantry_planning_node
+  gantry_loop_controller_node
   online_collision_debugger
   DESTINATION lib/${PROJECT_NAME}
 )

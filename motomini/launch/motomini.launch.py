@@ -17,6 +17,11 @@ def generate_launch_description():
     tool_type = LaunchConfiguration("tool_type")
     real_robot = LaunchConfiguration("real_robot")
     debug = LaunchConfiguration("debug")
+    gantry_mode = LaunchConfiguration("gantry_mode")
+
+    gantry_mode_tesser = IfCondition(PythonExpression(["'", gantry_mode, "' == 'tesser'"]))
+    gantry_mode_loop = IfCondition(PythonExpression(["'", gantry_mode, "' == 'loop'"]))
+    gantry_mode_gui = IfCondition(PythonExpression(["'", gantry_mode, "' == 'gui'"]))
 
     # 3. Dynamic Logic
     # Simplified the PythonExpression by using f-strings for readability
@@ -67,6 +72,43 @@ def generate_launch_description():
             output="screen"
         ),
 
+        Node(
+            package="robot_planning",
+            executable="gantry_planning_node",
+            parameters=[*common_params, {
+                "manipulator_group": "gantry",
+                "base_link": "world",
+                "ee_link": "gantry_tool_link",
+                "debug": debug,
+                "use_obstacles": False,
+            }],
+            condition=gantry_mode_tesser,
+            output="screen"
+        ),
+
+        Node(
+            package="robot_planning",
+            executable="gantry_loop_controller_node",
+            parameters=[{
+                "x_start": 0.0,
+                "x_end": -0.28,
+                "z_start": 0.0,
+                "z_end": -0.06,
+                "steps": 28,
+                "publish_period_sec": 0.3,
+                "motion_time_sec": 0.3,
+            }],
+            condition=gantry_mode_loop,
+            output="screen"
+        ),
+
+        Node(
+            package="motomini",
+            executable="2axis_gui.py",
+            condition=gantry_mode_gui,
+            output="screen"
+        ),
+
         # State Publisher
         Node(
             package="robot_state_publisher",
@@ -96,7 +138,6 @@ def generate_launch_description():
             output="screen"
         ),
 
-        # RViz
         Node(
             package="rviz2", 
             executable="rviz2", 
@@ -197,6 +238,20 @@ def generate_launch_description():
             output="screen",
             condition=UnlessCondition(real_robot)
         ),
+
+        Node(
+            package="topic_tools",
+            executable="relay",
+            name="gantry_trajectory_relay",
+            arguments=[
+                "/gantry/joint_path_command",
+                "/gantry_controller/joint_trajectory"
+            ],
+            output="screen",
+            condition=IfCondition(PythonExpression([
+                "'", real_robot, "' == 'false' and '", gantry_mode, "' == 'tesser'"
+            ]))
+        ),
     ]
     # Mesh processing 
     mesh_nodes = [
@@ -252,7 +307,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("tool_type", default_value="magnetic"),
         DeclareLaunchArgument("real_robot", default_value="false"),
-        DeclareLaunchArgument("debug", default_value="false"),
+        DeclareLaunchArgument("debug", default_value="true"),
+        DeclareLaunchArgument("gantry_mode", default_value="loop"),
         *nodes,
         *control_nodes,
         *mesh_nodes

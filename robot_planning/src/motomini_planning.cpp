@@ -182,13 +182,25 @@ namespace Vinhtesseract_examples
             ompl_profile->collision_check_config.longest_valid_segment_length = 0.005;
             ompl_profile->collision_check_config.type =
                 tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
+            ompl_profile->collision_check_config.contact_request.type =
+                tesseract_collision::ContactTestType::ALL;
 
             ompl_profile->solver_config.planners.clear();
 
-            auto rrt = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
-            rrt->range = 0.1;
+            auto rrt1 = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
+            rrt1->range = 0.05;
 
-            ompl_profile->solver_config.planners.push_back(rrt);
+            auto rrt2 = std::make_shared<tesseract_planning::RRTConnectConfigurator>();
+            rrt2->range = 0.1;
+
+            ompl_profile->solver_config.planners.push_back(rrt1);
+            ompl_profile->solver_config.planners.push_back(rrt2);
+
+            ompl_profile->solver_config.planning_time = 10.0;
+
+            ompl_profile->solver_config.max_solutions = 5;
+
+            ompl_profile->solver_config.simplify = true;
 
             profiles->addProfile("OMPLTask", "FREESPACE", ompl_profile);
         }
@@ -197,31 +209,44 @@ namespace Vinhtesseract_examples
         {
             auto trajopt_ifopt_move = std::make_shared<TrajOptIfoptDefaultMoveProfile>();
             trajopt_ifopt_move->cartesian_constraint_config.enabled = true;
+            trajopt_ifopt_move->cartesian_cost_config.enabled = false; // NEW: explicitly disable cost
+            trajopt_ifopt_move->joint_cost_config.enabled = true;
+            trajopt_ifopt_move->joint_cost_config.coeff = Eigen::VectorXd::Ones(6) * 5.0;
+
             Eigen::VectorXd coeffs(6);
-            coeffs << 100.0, 100.0, 100.0, 10.0, 10.0, 0.0;
+            coeffs << 100.0, 100.0, 100.0, 100.0, 100.0, 100.0;
             trajopt_ifopt_move->cartesian_constraint_config.coeff = coeffs;
 
             auto trajopt_ifopt_composite = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
-            trajopt_ifopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(0.05, 500);
-            trajopt_ifopt_composite->collision_cost_config.enabled = true;
-            trajopt_ifopt_composite->collision_constraint_config = trajopt_common::TrajOptCollisionConfig(0.01, 100);
-            trajopt_ifopt_composite->collision_constraint_config.enabled = true;
-            // trajopt_ifopt_composite->collision_cost_config.collision_check_config.type = tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE;
-            trajopt_ifopt_composite->collision_cost_config.collision_check_config.type =
-                tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
 
+            // FIX: collision CONSTRAINT (hard boundary)
+            trajopt_ifopt_composite->collision_constraint_config = trajopt_common::TrajOptCollisionConfig(0.0, 200);
+            trajopt_ifopt_composite->collision_constraint_config.enabled = true;
             trajopt_ifopt_composite->collision_constraint_config.collision_check_config.type =
-                tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
-            trajopt_ifopt_composite->collision_cost_config.collision_check_config.longest_valid_segment_length = 0.001;
-            trajopt_ifopt_composite->smooth_velocities = false;
-            trajopt_ifopt_composite->velocity_coeff = Eigen::VectorXd::Ones(1);
-            trajopt_ifopt_composite->smooth_accelerations = false;
+                tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE; // LVS_DISCRETE is faster than LVS_CONTINUOUS
+            trajopt_ifopt_composite->collision_constraint_config.collision_check_config.longest_valid_segment_length = 0.05;
+            trajopt_ifopt_composite->collision_constraint_config.collision_margin_buffer = 0.005;
+
+            // FIX: collision COST (was accidentally set to collision_constraint_config before)
+            trajopt_ifopt_composite->collision_cost_config = trajopt_common::TrajOptCollisionConfig(0.005, 500);
+            trajopt_ifopt_composite->collision_cost_config.enabled = true;
+            trajopt_ifopt_composite->collision_cost_config.collision_check_config.type =
+                tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE;
+            trajopt_ifopt_composite->collision_cost_config.collision_check_config.longest_valid_segment_length = 0.05;
+            trajopt_ifopt_composite->collision_cost_config.collision_margin_buffer = 0.01;
+
+            // Smoothing (from pick_and_place_example pattern)
+            trajopt_ifopt_composite->smooth_velocities = true;
+            trajopt_ifopt_composite->velocity_coeff = 0.1 * Eigen::VectorXd::Ones(1); // lower = less velocity priority
+            trajopt_ifopt_composite->smooth_accelerations = true;
             trajopt_ifopt_composite->acceleration_coeff = Eigen::VectorXd::Ones(1);
             trajopt_ifopt_composite->smooth_jerks = true;
-            trajopt_ifopt_composite->jerk_coeff = Eigen::VectorXd::Ones(1) * 50.0;
+            trajopt_ifopt_composite->jerk_coeff = Eigen::VectorXd::Ones(1);
 
             auto trajopt_ifopt_solver = std::make_shared<TrajOptIfoptOSQPSolverProfile>();
-            trajopt_ifopt_solver->opt_params.max_iterations = 300;
+            trajopt_ifopt_solver->opt_params.max_iterations = 200; // reduced from 300 (faster)
+            trajopt_ifopt_solver->opt_params.min_approx_improve = 1e-3;
+            trajopt_ifopt_solver->opt_params.min_trust_box_size = 1e-3;
 
             profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "FREESPACE", trajopt_ifopt_move);
             profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "DEFAULT", trajopt_ifopt_composite);
@@ -290,16 +315,36 @@ namespace Vinhtesseract_examples
 
         // Compute the timestams at 100% maximum speed
         CONSOLE_BRIDGE_logInform("Applying Time Parameterization (ISP)...");
+        for (const auto &instr : ci)
+        {
+            if (instr.isMoveInstruction())
+            {
+                const auto &mi = instr.as<MoveInstructionPoly>();
+                const auto &wp = mi.getWaypoint();
 
+                if (!wp.isStateWaypoint())
+                {
+                    CONSOLE_BRIDGE_logError("❌ Found non-StateWaypoint before ISP!");
+                    return false;
+                }
+            }
+        }
         if (time_parameterization_alg)
         {
-            bool success = time_parameterization_alg->compute(ci, *env_, *profiles);
-            if (!success)
+            try
             {
-                CONSOLE_BRIDGE_logError("Time Parameterization FAILED!");
+                bool success = time_parameterization_alg->compute(ci, *env_, *profiles);
+                if (!success)
+                {
+                    CONSOLE_BRIDGE_logError("Time Parameterization FAILED!");
+                    return false;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                CONSOLE_BRIDGE_logError("ISP crashed: %s", e.what());
                 return false;
             }
-
             CONSOLE_BRIDGE_logInform("Time Parameterization SUCCESS!");
         }
         tesseract_planning::CompositeInstruction nested_program("DEFAULT");
@@ -349,15 +394,15 @@ namespace Vinhtesseract_examples
             CONSOLE_BRIDGE_logInform("Online Thread Started. Building NLP...");
 
             auto nlp = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
-            // tesseract_kinematics::KinematicGroup::ConstPtr manip = env_->getKinematicGroup(manipulator_group_);
-            // Eigen::MatrixX2d joint_limits = manip->getLimits().joint_limits;
             tesseract_kinematics::KinematicGroup::ConstPtr manip;
             Eigen::MatrixX2d joint_limits;
-            { // Thread-safe read of the environment
+            { 
                 std::shared_lock<std::shared_mutex> lock(this->env_mutex_);
                 manip = env_->getKinematicGroup(manipulator_group_);
                 joint_limits = manip->getLimits().joint_limits;
             }
+            int num_joints = manip->numJoints();
+            int num_steps = static_cast<int>(trajectory.size());
             std::vector<trajopt_ifopt::JointPosition::ConstPtr> vars;
 
             for (size_t i = 0; i < trajectory.size(); ++i)
@@ -369,24 +414,26 @@ namespace Vinhtesseract_examples
                 nlp->addVariableSet(var);
             }
 
-            trajopt_common::TrajOptCollisionConfig collision_config(0.05, 10.0);
-            collision_config.collision_check_config.type = tesseract_collision::CollisionEvaluatorType::DISCRETE;
+            trajopt_common::TrajOptCollisionConfig collision_config(0.03, 100.0);
+            collision_config.collision_check_config.type =
+                tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE;
+            collision_config.collision_margin_buffer = 0.01;
             auto collision_cache = std::make_shared<trajopt_ifopt::CollisionCache>(trajectory.size());
-
             for (size_t i = 1; i < trajectory.size(); i++)
             {
                 auto collision_evaluator = std::make_shared<trajopt_ifopt::SingleTimestepCollisionEvaluator>(
                     collision_cache, manip, env_, collision_config, true);
                 auto collision_constraint = std::make_shared<trajopt_ifopt::DiscreteCollisionConstraint>(
-                    collision_evaluator, vars[i], collision_config.max_num_cnt, false, "Collision_" + std::to_string(i));
+                    collision_evaluator, vars[i], collision_config.max_num_cnt, false,
+                    "Collision_" + std::to_string(i));
                 nlp->addConstraintSet(collision_constraint);
             }
 
             nlp->setup();
             auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
             trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
-            double box_size = 0.05;
-            solver.params.initial_trust_box_size = box_size;
+            solver.params.initial_trust_box_size = 0.05;
+            solver.params.min_trust_box_size = 1e-4;   // FIX 3: let trust box shrink naturally
             solver.init(nlp);
 
             CONSOLE_BRIDGE_logInform("NLP Built. Entering 100Hz Control Loop.");
@@ -394,18 +441,30 @@ namespace Vinhtesseract_examples
             const auto target_dt = milliseconds(10); 
             auto next_loop_time = steady_clock::now() + target_dt;
 
-            int num_joints = manip->numJoints(); 
-            int num_steps = trajectory.size();
+            auto execution_start = steady_clock::now();
             int plot_throttle_counter = 0;
+
             while (this->is_executing_online_)
             {
-                { // Lock the environment just long enough for the solver to read it
+                {
                     std::shared_lock<std::shared_mutex> lock(this->env_mutex_);
-                    solver.stepSQPSolver();
+                    solver.stepSQPSolver(); 
                 }
 
                 Eigen::VectorXd safe_trajectory_vector = solver.getResults().best_var_vals;
-                Eigen::VectorXd safe_next_step = safe_trajectory_vector.segment(0, num_joints);
+                 double elapsed = duration<double>(steady_clock::now() - execution_start).count();
+                int current_step = 0;
+                for (int s = 0; s < num_steps; ++s)
+                {
+                    if (trajectory[s].time <= elapsed)
+                        current_step = s;
+                    else
+                        break;
+                }
+                current_step = std::min(current_step, num_steps - 1);
+
+                Eigen::VectorXd safe_next_step = safe_trajectory_vector.segment(
+                    current_step * num_joints, num_joints);
 
                 if (this->command_cb_) {
                     this->command_cb_(safe_next_step);
@@ -413,24 +472,26 @@ namespace Vinhtesseract_examples
                 if (plot_throttle_counter++ % 10 == 0 && this->toolpath_cb_) 
                 {
                     std::vector<Eigen::Vector3d> ee_path;
-                    ee_path.reserve(num_steps); 
+                    ee_path.reserve(num_steps);
 
-                    // Map the 1D vector back into an N x J matrix
                     Eigen::Map<const tesseract_common::TrajArray> traj_matrix(
                         safe_trajectory_vector.data(), num_steps, num_joints);
 
-                    // Calculate FK for every waypoint in the live trajectory
-                    for (int i = 0; i < num_steps; ++i) {
+                    for (int i = 0; i < num_steps; ++i)
+                    {
                         Eigen::Isometry3d tf = manip->calcFwdKin(traj_matrix.row(i)).at(this->ee_link_);
                         ee_path.push_back(tf.translation());
                     }
-
                     this->toolpath_cb_(ee_path);
                 }
-                // 4. Reset the trust box
-                solver.setBoxSize(box_size);
+                
+                if (current_step >= num_steps - 1)
+                {
+                    CONSOLE_BRIDGE_logInform("Online: last step reached, stopping loop.");
+                    this->is_executing_online_ = false;
+                    break;
+                }
 
-                // 5. Enforce loop timing (100Hz)
                 std::this_thread::sleep_until(next_loop_time);
                 next_loop_time += target_dt;
             }

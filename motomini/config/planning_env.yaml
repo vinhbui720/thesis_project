@@ -29,22 +29,6 @@ environment:
           min_range: 0.1
 
 
-    # -------------------------------------------------
-    # Example 2: ADD new frame to TF tree
-    # -------------------------------------------------
-    working_tip:
-
-      parent: world
-      type: new_frame
-
-      pose:
-        xyz: [0.40, 0.15, 0.05]
-        rpy: [0.0, 0.0, 1.57]
-
-      grasp:
-        approach_distance: 0.10
-        lift_height: 0.15
-        gripper_width: 0.03
 
 
   # workspace:

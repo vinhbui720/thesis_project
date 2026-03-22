@@ -21,6 +21,8 @@
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+// #include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_broadcaster.h>
 // 3. Tesseract Includes
 // #include <tesseract_common/resource_locator.h>
 #include <tesseract_environment/environment.h>
@@ -103,7 +105,6 @@ public:
         pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
         pub_online_cmd_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
             "/motomini/online_joint_command", 100);
-        pub_ee_path_ = this->create_publisher<visualization_msgs::msg::Marker>("/motomini/ee_dynamic_path", 10);
         planner_->setCommandCallback(
             [this](const Eigen::VectorXd &cmd)
             {
@@ -115,41 +116,61 @@ public:
                 }
                 pub_online_cmd_->publish(msg);
             });
-        planner_->setToolpathCallback(
-            [this, base_link](const std::vector<Eigen::Vector3d> &path)
-            {
-                if (path.empty())
-                    return;
+        if (debug)
+        {
+            pub_ee_path_ = this->create_publisher<visualization_msgs::msg::Marker>("/motomini/ee_dynamic_path", 10);
+            tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
 
-                visualization_msgs::msg::Marker marker;
-                marker.header.frame_id = base_link; // Matches the robot's base frame
-                marker.header.stamp = this->now();
-                marker.ns = "online_planner_path";
-                marker.id = 0;
-                marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-                marker.action = visualization_msgs::msg::Marker::ADD;
-
-                // Line thickness
-                marker.scale.x = 0.005;
-
-                // Bright Green Color
-                marker.color.r = 0.0;
-                marker.color.g = 1.0;
-                marker.color.b = 0.0;
-                marker.color.a = 1.0;
-
-                // Convert 3D Eigen vectors to ROS geometry points
-                for (const auto &pt : path)
+            // Republish at 5Hz so TF frames stay alive while waypoints exist
+            wp_tf_timer_ = this->create_wall_timer(
+                std::chrono::milliseconds(200),
+                [this]()
                 {
-                    geometry_msgs::msg::Point p;
-                    p.x = pt.x();
-                    p.y = pt.y();
-                    p.z = pt.z();
-                    marker.points.push_back(p);
-                }
+                    if (!accumulated_targets_.empty())
+                        publishWaypointsTFs();
+                });
+            wp_tf_timer_->cancel(); // Start paused, activate on first pose received
 
-                pub_ee_path_->publish(marker);
-            });
+            planner_->setToolpathCallback(
+                [this, base_link](const std::vector<Eigen::Vector3d> &path)
+                {
+                    if (path.empty())
+                        return;
+
+                    visualization_msgs::msg::Marker marker;
+                    marker.header.frame_id = base_link; // Matches the robot's base frame
+                    marker.header.stamp = this->now();
+                    marker.ns = "online_planner_path";
+                    marker.id = 0;
+                    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+                    marker.action = visualization_msgs::msg::Marker::ADD;
+
+                    // Line thickness
+                    marker.scale.x = 0.005;
+
+                    // Bright Green Color
+                    marker.color.r = 0.0;
+                    marker.color.g = 1.0;
+                    marker.color.b = 0.0;
+                    marker.color.a = 1.0;
+
+                    // Convert 3D Eigen vectors to ROS geometry points
+                    for (const auto &pt : path)
+                    {
+                        geometry_msgs::msg::Point p;
+                        p.x = pt.x();
+                        p.y = pt.y();
+                        p.z = pt.z();
+                        marker.points.push_back(p);
+                    }
+
+                    pub_ee_path_->publish(marker);
+                });
+        }
+        else
+        {
+            planner_->setToolpathCallback({});
+        }
         // Timer for closed-loop execution monitoring (10 Hz)
         monitor_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),
@@ -204,6 +225,9 @@ private:
 
     const double JOINT_TOLERANCE = 0.05; // radians (approx 2.8 degrees tolerance)
     const double TIMEOUT_BUFFER = 5.0;   // seconds
+    // --- DEBUG ---
+    std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    rclcpp::TimerBase::SharedPtr wp_tf_timer_;
 
     bool initializeEnvironment()
     {
@@ -236,29 +260,59 @@ private:
         if (msg->poses.empty())
             return;
 
-        // Optimization: Reserve memory if adding a large batch to prevent reallocations
         size_t new_size = accumulated_targets_.size() + msg->poses.size();
         accumulated_targets_.reserve(new_size);
-
-        // Accumulate poses
         accumulated_targets_.insert(accumulated_targets_.end(), msg->poses.begin(), msg->poses.end());
 
         RCLCPP_INFO(this->get_logger(), "Received %zu poses. Total accumulated: %zu",
                     msg->poses.size(), accumulated_targets_.size());
 
         publishStatus("Accumulating Poses: " + std::to_string(accumulated_targets_.size()));
+
+        // Publish waypoints as debug
+        bool debug = this->get_parameter("debug").as_bool();
+        if (debug && tf_broadcaster_ && wp_tf_timer_)
+        {
+            wp_tf_timer_->reset();
+        }
     }
 
     void clearCallback(const std_msgs::msg::Bool::SharedPtr msg)
     {
         if (msg->data)
         {
+            bool debug = this->get_parameter("debug").as_bool();
+            if (debug && wp_tf_timer_)
+            {
+                wp_tf_timer_->cancel();
+            }
             accumulated_targets_.clear();
             is_executing_ = false; // Cancel execution monitoring if cleared manually
             planner_->stopOnlinePlanner();
             RCLCPP_INFO(this->get_logger(), "Target buffer cleared.");
             publishStatus("Buffer Cleared");
         }
+    }
+    void publishWaypointsTFs()
+    {
+        std::string base_link = "world";
+        std::vector<geometry_msgs::msg::TransformStamped> transforms;
+        transforms.reserve(accumulated_targets_.size());
+
+        for (size_t i = 0; i < accumulated_targets_.size(); i++)
+        {
+            const auto &pose = accumulated_targets_[i];
+            geometry_msgs::msg::TransformStamped tf;
+            tf.header.stamp = this->now();
+            tf.header.frame_id = base_link;
+            tf.child_frame_id = "wp_" + std::to_string(i);
+            tf.transform.translation.x = pose.position.x;
+            tf.transform.translation.y = pose.position.y;
+            tf.transform.translation.z = pose.position.z;
+            tf.transform.rotation = pose.orientation;
+            transforms.push_back(tf);
+        }
+        tf_broadcaster_->sendTransform(transforms);
     }
 
     void startCallback(const std_msgs::msg::Bool::SharedPtr msg)

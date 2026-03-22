@@ -2,12 +2,13 @@
 
 import sys
 import math
-import threading
+import signal
 
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.duration import Duration
+from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
 
 from geometry_msgs.msg import PoseArray, Pose, PoseStamped
 from std_msgs.msg import Bool, String
@@ -28,6 +29,7 @@ from PyQt5.QtCore import *
 class RosSignals(QObject):
 
     status_updated = pyqtSignal(str)
+    gantry_status_updated = pyqtSignal(str)
     pose_updated = pyqtSignal(float,float,float,float,float,float)
 
 
@@ -49,6 +51,10 @@ class MasterDebugNode(Node):
         self.pub_start = self.create_publisher(Bool,"/start",10)
         self.pub_clear = self.create_publisher(Bool,"/clear_targets",10)
 
+        self.pub_gantry_targets = self.create_publisher(PoseArray,"/gantry/target_poses",10)
+        self.pub_gantry_start = self.create_publisher(Bool,"/gantry/start",10)
+        self.pub_gantry_clear = self.create_publisher(Bool,"/gantry/clear_targets",10)
+
         # ---------- Object test publishers ----------
 
         self.pub_object_pose = self.create_publisher(PoseStamped,"/target_object_pose",10)
@@ -60,6 +66,13 @@ class MasterDebugNode(Node):
             String,
             "/optimization_status",
             self.status_callback,
+            10
+        )
+
+        self.create_subscription(
+            String,
+            "/gantry/optimization_status",
+            self.gantry_status_callback,
             10
         )
 
@@ -78,6 +91,12 @@ class MasterDebugNode(Node):
     def status_callback(self,msg):
 
         self.signals.status_updated.emit(msg.data)
+
+    # ------------------------------------------------
+
+    def gantry_status_callback(self,msg):
+
+        self.signals.gantry_status_updated.emit(msg.data)
 
     # ------------------------------------------------
 
@@ -118,84 +137,131 @@ class PlanningTab(QWidget):
         super().__init__()
 
         self.node=node
-        self.buffer=[]
+        self.motomini_buffer=[]
+        self.gantry_buffer=[]
 
         signals.status_updated.connect(self.update_status)
+        signals.gantry_status_updated.connect(self.update_gantry_status)
         signals.pose_updated.connect(self.update_pose)
 
         layout=QVBoxLayout()
 
-        self.status_label=QLabel("Status: Idle")
-        self.indicator=QLabel("● Idle")
+        row_layout=QHBoxLayout()
+        row_layout.addWidget(self._build_motomini_box())
+        row_layout.addWidget(self._build_gantry_box())
+        layout.addLayout(row_layout)
 
-        self.progress=QProgressBar()
+        self.setLayout(layout)
 
-        self.robot_pose=QLabel("Robot Pose: waiting TF")
+    # ------------------------------------------------
 
-        layout.addWidget(self.status_label)
-        layout.addWidget(self.indicator)
-        layout.addWidget(self.robot_pose)
-        layout.addWidget(self.progress)
-
-        # pose inputs
+    def _build_pose_inputs(self, defaults):
 
         grid=QGridLayout()
-
-        self.spin={}
+        spin={}
 
         fields=[
-            ("X","x",-5,5,0.18),
-            ("Y","y",-5,5,0.0),
-            ("Z","z",-5,5,0.24),
-            ("Roll","r",-180,180,0),
-            ("Pitch","p",-180,180,0),
-            ("Yaw","yaw",-180,180,0)
+            ("X","x",-5,5,defaults[0]),
+            ("Y","y",-5,5,defaults[1]),
+            ("Z","z",-5,5,defaults[2]),
+            ("Roll","r",-180,180,defaults[3]),
+            ("Pitch","p",-180,180,defaults[4]),
+            ("Yaw","yaw",-180,180,defaults[5])
         ]
 
-        row=0
-
-        for label,key,mn,mx,val in fields:
-
+        for row,(label,key,mn,mx,val) in enumerate(fields):
             grid.addWidget(QLabel(label),row,0)
-
             sb=QDoubleSpinBox()
             sb.setRange(mn,mx)
             sb.setValue(val)
-
-            self.spin[key]=sb
-
+            spin[key]=sb
             grid.addWidget(sb,row,1)
 
-            row+=1
+        return grid,spin
 
-        layout.addLayout(grid)
+    # ------------------------------------------------
 
-        # buttons
+    def _build_motomini_box(self):
+
+        box=QGroupBox("MotoMini")
+        box_layout=QVBoxLayout()
+
+        self.status_label=QLabel("Status: Idle")
+        self.indicator=QLabel("● Idle")
+        self.progress=QProgressBar()
+        self.robot_pose=QLabel("Robot Pose: waiting TF")
+
+        box_layout.addWidget(self.status_label)
+        box_layout.addWidget(self.indicator)
+        box_layout.addWidget(self.robot_pose)
+        box_layout.addWidget(self.progress)
+
+        input_grid,self.motomini_spin=self._build_pose_inputs([0.18,0.0,0.24,0.0,0.0,0.0])
+        box_layout.addLayout(input_grid)
 
         btn_layout=QHBoxLayout()
-
         add=QPushButton("Add")
         send=QPushButton("Send")
         start=QPushButton("Start")
         clear=QPushButton("Clear")
 
-        add.clicked.connect(self.add_pose)
-        send.clicked.connect(self.send)
-        start.clicked.connect(self.start)
-        clear.clicked.connect(self.clear)
+        add.clicked.connect(self.add_motomini_pose)
+        send.clicked.connect(self.send_motomini)
+        start.clicked.connect(self.start_motomini)
+        clear.clicked.connect(self.clear_motomini)
 
         btn_layout.addWidget(add)
         btn_layout.addWidget(send)
         btn_layout.addWidget(start)
         btn_layout.addWidget(clear)
+        box_layout.addLayout(btn_layout)
 
-        layout.addLayout(btn_layout)
+        self.motomini_list=QListWidget()
+        box_layout.addWidget(self.motomini_list)
 
-        self.list=QListWidget()
+        box.setLayout(box_layout)
+        return box
 
-        layout.addWidget(self.list)
+    # ------------------------------------------------
 
-        self.setLayout(layout)
+    def _build_gantry_box(self):
+
+        box=QGroupBox("Gantry")
+        box_layout=QVBoxLayout()
+
+        self.gantry_status_label=QLabel("Status: Idle")
+        self.gantry_indicator=QLabel("● Idle")
+        self.gantry_progress=QProgressBar()
+
+        box_layout.addWidget(self.gantry_status_label)
+        box_layout.addWidget(self.gantry_indicator)
+        box_layout.addWidget(self.gantry_progress)
+
+        input_grid,self.gantry_spin=self._build_pose_inputs([-0.05,-0.30,0.10,0.0,0.0,0.0])
+        box_layout.addLayout(input_grid)
+
+        btn_layout=QHBoxLayout()
+        add=QPushButton("Add")
+        send=QPushButton("Send")
+        start=QPushButton("Start")
+        clear=QPushButton("Clear")
+
+        add.clicked.connect(self.add_gantry_pose)
+        send.clicked.connect(self.send_gantry)
+        start.clicked.connect(self.start_gantry)
+        clear.clicked.connect(self.clear_gantry)
+
+        btn_layout.addWidget(add)
+        btn_layout.addWidget(send)
+        btn_layout.addWidget(start)
+        btn_layout.addWidget(clear)
+        box_layout.addLayout(btn_layout)
+
+        self.gantry_list=QListWidget()
+        box_layout.addWidget(self.gantry_list)
+
+        box.setLayout(box_layout)
+        return box
 
     # ------------------------------------------------
 
@@ -203,27 +269,41 @@ class PlanningTab(QWidget):
 
         self.status_label.setText(text)
 
+        self._set_status_visuals(text,self.indicator,self.progress)
+
+    # ------------------------------------------------
+
+    def update_gantry_status(self,text):
+
+        self.gantry_status_label.setText(text)
+
+        self._set_status_visuals(text,self.gantry_indicator,self.gantry_progress)
+
+    # ------------------------------------------------
+
+    def _set_status_visuals(self,text,indicator,progress):
+
         t=text.lower()
 
         if "accumulating" in t:
-            self.indicator.setText("● Accumulating")
-            self.progress.setValue(20)
+            indicator.setText("● Accumulating")
+            progress.setValue(20)
 
         elif "planning" in t:
-            self.indicator.setText("● Planning")
-            self.progress.setValue(40)
+            indicator.setText("● Planning")
+            progress.setValue(40)
 
         elif "executing" in t:
-            self.indicator.setText("● Executing")
-            self.progress.setValue(70)
+            indicator.setText("● Executing")
+            progress.setValue(70)
 
         elif "success" in t:
-            self.indicator.setText("● Success")
-            self.progress.setValue(100)
+            indicator.setText("● Success")
+            progress.setValue(100)
 
         elif "fail" in t:
-            self.indicator.setText("● Failed")
-            self.progress.setValue(0)
+            indicator.setText("● Failed")
+            progress.setValue(0)
 
     # ------------------------------------------------
 
@@ -235,15 +315,15 @@ class PlanningTab(QWidget):
 
     # ------------------------------------------------
 
-    def add_pose(self):
+    def _make_pose(self, spin_widgets):
 
-        x=self.spin["x"].value()
-        y=self.spin["y"].value()
-        z=self.spin["z"].value()
+        x=spin_widgets["x"].value()
+        y=spin_widgets["y"].value()
+        z=spin_widgets["z"].value()
 
-        r=math.radians(self.spin["r"].value())
-        p=math.radians(self.spin["p"].value())
-        yaw=math.radians(self.spin["yaw"].value())
+        r=math.radians(spin_widgets["r"].value())
+        p=math.radians(spin_widgets["p"].value())
+        yaw=math.radians(spin_widgets["yaw"].value())
 
         q=euler.euler2quat(r,p,yaw)
 
@@ -258,27 +338,65 @@ class PlanningTab(QWidget):
         pose.orientation.y=q[2]
         pose.orientation.z=q[3]
 
-        self.buffer.append(pose)
-
-        self.list.addItem(f"{x},{y},{z}")
+        return pose,x,y,z
 
     # ------------------------------------------------
 
-    def send(self):
+    def add_motomini_pose(self):
+
+        pose,x,y,z=self._make_pose(self.motomini_spin)
+
+        self.motomini_buffer.append(pose)
+
+        self.motomini_list.addItem(f"{x},{y},{z}")
+
+    # ------------------------------------------------
+
+    def add_gantry_pose(self):
+
+        pose,x,y,z=self._make_pose(self.gantry_spin)
+
+        self.gantry_buffer.append(pose)
+
+        self.gantry_list.addItem(f"{x},{y},{z}")
+
+    # ------------------------------------------------
+
+    def send_motomini(self):
+
+        if not self.motomini_buffer:
+            return
 
         msg=PoseArray()
         msg.header.frame_id="world"
         msg.header.stamp=self.node.get_clock().now().to_msg()
-        msg.poses=self.buffer
+        msg.poses=self.motomini_buffer
 
         self.node.pub_targets.publish(msg)
 
-        self.buffer=[]
-        self.list.clear()
+        self.motomini_buffer=[]
+        self.motomini_list.clear()
 
     # ------------------------------------------------
 
-    def start(self):
+    def send_gantry(self):
+
+        if not self.gantry_buffer:
+            return
+
+        msg=PoseArray()
+        msg.header.frame_id="world"
+        msg.header.stamp=self.node.get_clock().now().to_msg()
+        msg.poses=self.gantry_buffer
+
+        self.node.pub_gantry_targets.publish(msg)
+
+        self.gantry_buffer=[]
+        self.gantry_list.clear()
+
+    # ------------------------------------------------
+
+    def start_motomini(self):
 
         msg=Bool()
         msg.data=True
@@ -287,15 +405,36 @@ class PlanningTab(QWidget):
 
     # ------------------------------------------------
 
-    def clear(self):
+    def start_gantry(self):
+
+        msg=Bool()
+        msg.data=True
+
+        self.node.pub_gantry_start.publish(msg)
+
+    # ------------------------------------------------
+
+    def clear_motomini(self):
 
         msg=Bool()
         msg.data=True
 
         self.node.pub_clear.publish(msg)
 
-        self.buffer=[]
-        self.list.clear()
+        self.motomini_buffer=[]
+        self.motomini_list.clear()
+
+    # ------------------------------------------------
+
+    def clear_gantry(self):
+
+        msg=Bool()
+        msg.data=True
+
+        self.node.pub_gantry_clear.publish(msg)
+
+        self.gantry_buffer=[]
+        self.gantry_list.clear()
 
 
 # =====================================================
@@ -479,6 +618,11 @@ class MasterGUI(QMainWindow):
 
         self.setCentralWidget(tabs)
 
+    def closeEvent(self,event):
+
+        QApplication.instance().quit()
+        event.accept()
+
 
 # =====================================================
 # MAIN
@@ -493,16 +637,67 @@ def main():
     signals=RosSignals()
 
     node=MasterDebugNode(signals)
+    executor=SingleThreadedExecutor()
+    executor.add_node(node)
 
     gui=MasterGUI(node,signals)
     gui.show()
 
-    def spin():
+    shutting_down=False
 
-        rclpy.spin(node)
+    def shutdown_once():
+        nonlocal shutting_down
 
-    thread=threading.Thread(target=spin,daemon=True)
-    thread.start()
+        if shutting_down:
+            return
+
+        shutting_down=True
+
+        spin_timer.stop()
+
+        try:
+            executor.remove_node(node)
+        except Exception:
+            pass
+
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+
+    def handle_ros_spin():
+        if shutting_down:
+            return
+
+        try:
+            executor.spin_once(timeout_sec=0.0)
+        except (ExternalShutdownException, KeyboardInterrupt):
+            shutdown_once()
+            QApplication.instance().quit()
+
+    spin_timer=QTimer()
+    spin_timer.timeout.connect(handle_ros_spin)
+    spin_timer.start(10)
+
+    app.aboutToQuit.connect(shutdown_once)
+
+    def _signal_handler(_sig, _frame):
+        shutdown_once()
+        QMetaObject.invokeMethod(app, "quit", Qt.QueuedConnection)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     sys.exit(app.exec_())
 

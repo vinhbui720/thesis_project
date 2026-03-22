@@ -39,7 +39,14 @@
       </geometry>
     </collision>
   </link>
-
+  <link name='working_tip'>
+    <visual>
+      <origin xyz="0.0 0.0 -0.025" rpy="0.0 0.0 3.14" />
+      <geometry>
+        <box size="0.01 0.01 0.05" />
+      </geometry>
+    </visual>
+  </link>
   <!-- Joint 1: Prismatic movement along the X-axis (1 0 0) -->
   <!-- Limits: -0.28 meters (-280mm) to 0.0 meters -->
   <joint name="joint_x" type="prismatic">
@@ -98,7 +105,12 @@
       </geometry>
     </collision>
   </link>
+  <joint name="working_tip_tool" type="fixed">
+    <parent link="gantry_tool_link" />
+    <child link="working_tip" />
+    <origin xyz="0.0 -0.07 0.05" rpy="0.0 0.0 0.0" />
 
+  </joint>
   <!-- Fixed joint attaching the tool to the bottom of the Z-shaft -->
   <joint name="gantry_tool_joint" type="fixed">
     <parent link="z_shaft" />
