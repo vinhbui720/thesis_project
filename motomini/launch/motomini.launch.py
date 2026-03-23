@@ -1,5 +1,3 @@
-import os
-import yaml
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import UnlessCondition, IfCondition
@@ -11,13 +9,16 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     # 1. Path Helpers
     motomini_share = FindPackageShare("motomini")
-    planning_share = FindPackageShare("robot_planning")
 
     # 2. Launch Configurations
     tool_type = LaunchConfiguration("tool_type")
     real_robot = LaunchConfiguration("real_robot")
     debug = LaunchConfiguration("debug")
     gantry_mode = LaunchConfiguration("gantry_mode")
+    online_mode = LaunchConfiguration("online_mode")
+    use_ompl = LaunchConfiguration("use_ompl")
+    tracking_mode = LaunchConfiguration("tracking_mode")
+    tracking_rate_hz = LaunchConfiguration("tracking_rate_hz")
 
     gantry_mode_tesser = IfCondition(PythonExpression(["'", gantry_mode, "' == 'tesser'"]))
     gantry_mode_loop = IfCondition(PythonExpression(["'", gantry_mode, "' == 'loop'"]))
@@ -63,11 +64,11 @@ def generate_launch_description():
                 "manipulator_group": "manipulator",
                 "base_link": "world",
                 "ee_link": concrete_ee_link,
-                "tool_type": tool_type,
-                "online_mode": False,
-                "debug":True,
-                "use_ompl": True,
-                "tracking_mode": False,
+                "online_mode": online_mode,
+                "debug": debug,
+                "use_ompl": use_ompl,
+                "tracking_mode": tracking_mode,
+                "tracking_rate_hz": tracking_rate_hz,
 
             }],
             output="screen"
@@ -310,6 +311,10 @@ def generate_launch_description():
         DeclareLaunchArgument("real_robot", default_value="false"),
         DeclareLaunchArgument("debug", default_value="true"),
         DeclareLaunchArgument("gantry_mode", default_value="loop"),
+        DeclareLaunchArgument("online_mode", default_value="false"),
+        DeclareLaunchArgument("use_ompl", default_value="true"),
+        DeclareLaunchArgument("tracking_mode", default_value="false"),
+        DeclareLaunchArgument("tracking_rate_hz", default_value="5.0"),
         *nodes,
         *control_nodes,
         *mesh_nodes

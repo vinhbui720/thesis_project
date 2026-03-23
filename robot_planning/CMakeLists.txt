@@ -55,7 +55,10 @@ tesseract_variables()
 
 add_library(
   ${PROJECT_NAME}
-  src/motomini_planning.cpp
+  # Planning library — split into 3 logical units for clarity and scalability:
+  src/motomini_planning_base.cpp      # Constructor + shared-state helpers
+  src/motomini_planning_run.cpp       # Full offline TrajOpt/OMPL pipeline (run())
+  src/motomini_planning_tracking.cpp  # Lightweight real-time IK tracking
   src/gantry_planning.cpp
 )
 
@@ -80,7 +83,14 @@ target_compile_options(${PROJECT_NAME} PUBLIC ${TESSERACT_COMPILE_OPTIONS})
 target_include_directories(${PROJECT_NAME} PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                                                   "$<INSTALL_INTERFACE:include>")
 
-add_executable(motomini_planning_node src/motomini_planning_node.cpp)
+# Node executable — split into logical files for easier debugging and extension:
+add_executable(motomini_planning_node
+  src/motomini_node_setup.cpp       # Constructor, postInit, env init
+  src/motomini_node_callbacks.cpp   # ROS subscription callbacks + monitor
+  src/motomini_node_tracking.cpp    # TF lookup + tracking tick
+  src/motomini_node_publish.cpp     # Trajectory & status publishers
+  src/motomini_node_main.cpp        # main()
+)
 target_link_libraries(motomini_planning_node ${PROJECT_NAME})
 ament_target_dependencies(motomini_planning_node
   rclcpp
