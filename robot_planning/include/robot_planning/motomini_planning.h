@@ -91,6 +91,8 @@ namespace Vinhtesseract_examples
         CommandCallback command_cb_;
         mutable std::shared_mutex env_mutex_;
         ToolpathCallback toolpath_cb_;
+        Eigen::VectorXd last_tracking_command_;
+        bool has_last_tracking_command_{false};
     };
 
 } // namespace Vinhtesseract_examples

@@ -38,9 +38,11 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_osqp_solver_profile.h>
 #include <tesseract_motion_planners/simple/profile/simple_planner_lvs_move_profile.h>
 #include <tesseract_motion_planners/simple/profile/simple_planner_profile.h>
+#include <tesseract_motion_planners/simple/simple_motion_planner.h>
 #include <tesseract_motion_planners/ompl/profile/ompl_real_vector_move_profile.h>
 #include <tesseract_motion_planners/ompl/ompl_planner_configurator.h>
 #include <tesseract_motion_planners/core/utils.h>
+#include <tesseract_motion_planners/core/types.h>
 
 // Command Language
 #include <tesseract_command_language/composite_instruction.h>
@@ -510,63 +512,111 @@ namespace Vinhtesseract_examples
 
         CONSOLE_BRIDGE_logDebug("[Tracking] Running lightweight tracking planner...");
 
-        // Get current joint state from environment
-        std::vector<std::string> joint_names = {"joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
-        Eigen::VectorXd start_pos = env_->getCurrentJointValues(joint_names);
+        std::shared_lock<std::shared_mutex> lock(env_mutex_);
 
-        std::shared_ptr<const tesseract_common::ResourceLocator> locator = env_->getResourceLocator();
-        std::filesystem::path config_path(
-            locator->locateResource("package://tesseract_task_composer/config/task_composer_plugins.yaml")->getFilePath());
-        TaskComposerPluginFactory factory(config_path, *env_->getResourceLocator());
+        const std::vector<std::string> joint_names = {"joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+        const Eigen::VectorXd start_pos = env_->getCurrentJointValues(joint_names);
+        const Eigen::VectorXd ik_seed = (has_last_tracking_command_ && last_tracking_command_.size() == start_pos.size())
+                                            ? last_tracking_command_
+                                            : start_pos;
 
-        // Build minimal tracking instruction (single target)
-        CompositeInstruction tracking_program("DEFAULT", tesseract_common::ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
-        StateWaypoint start_wp(joint_names, start_pos);
-        MoveInstruction start_instr(start_wp, MoveInstructionType::FREESPACE, "FREESPACE");
-        tracking_program.push_back(start_instr);
-
-        CartesianWaypoint target_wp(target_pose);
-        MoveInstruction target_instr(target_wp, MoveInstructionType::FREESPACE, "FREESPACE");
-        tracking_program.push_back(target_instr);
-
-        // Use SimplePlannerTask for fast linear interpolation (no optimization)
-        auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
-        auto simple_move_profile = std::make_shared<tesseract_planning::SimplePlannerLVSMoveProfile>();
-        profiles->addProfile("SimplePlannerTask", "DEFAULT", simple_move_profile);
-
-        auto data_storage = std::make_unique<tesseract_planning::TaskComposerDataStorage>();
-        data_storage->setData("planning_input", tracking_program);
-        data_storage->setData("environment", std::shared_ptr<const tesseract_environment::Environment>(env_));
-        data_storage->setData("profiles", profiles);
-
-        TaskComposerNode::UPtr task = factory.createTaskComposerNode("SimplePlannerTask");
-        const std::string output_key = task->getOutputKeys().get("program");
-
-        auto executor = factory.createTaskComposerExecutor("TaskflowExecutor");
-        auto context = std::make_shared<tesseract_planning::TaskComposerContext>(task->getName(), std::move(data_storage));
-
-        TaskComposerFuture::UPtr future = executor->run(*task, std::move(context));
-        future->wait();
-
-        if (!future->context->isSuccessful())
+        tesseract_kinematics::KinematicGroup::ConstPtr manip = env_->getKinematicGroup(manipulator_group_);
+        if (manip == nullptr)
         {
-            CONSOLE_BRIDGE_logWarn("[Tracking] SimplePlanner failed");
+            CONSOLE_BRIDGE_logError("[Tracking] Could not find kinematic group '%s'", manipulator_group_.c_str());
             return false;
         }
 
-        auto ci = future->context->data_storage->getData(output_key).as<CompositeInstruction>();
-        tesseract_planning::formatProgram(ci, *env_);
+        const auto fk_map = manip->calcFwdKin(start_pos);
+        auto fk_it = fk_map.find(ee_link_);
+        if (fk_it == fk_map.end())
+        {
+            CONSOLE_BRIDGE_logError("[Tracking] FK result did not contain ee link '%s'", ee_link_.c_str());
+            return false;
+        }
 
-        // TODO: Add collision check here (if not implemented yet)
-        // For now, accept trajectory as-is from SimplePlanner
+        Eigen::Isometry3d target_pose_adjusted = target_pose;
+        target_pose_adjusted.linear() = fk_it->second.linear();
 
-        tesseract_planning::CompositeInstruction nested_program("DEFAULT");
-        nested_program.push_back(ci);
-        std::vector<double> speed_scalings = {1.0};
-        tesseract_planning::rescaleTimings(nested_program, speed_scalings);
+        const Eigen::MatrixX2d joint_limits = manip->getLimits().joint_limits;
+        tesseract_kinematics::KinGroupIKInput ik_input(target_pose_adjusted, base_link_, ee_link_);
+        tesseract_kinematics::IKSolutions solutions = manip->calcInvKin(ik_input, ik_seed);
+        if (solutions.empty())
+        {
+            CONSOLE_BRIDGE_logWarn("[Tracking] IK failed for XYZ=(%.4f, %.4f, %.4f)",
+                                   target_pose_adjusted.translation().x(),
+                                   target_pose_adjusted.translation().y(),
+                                   target_pose_adjusted.translation().z());
+            return false;
+        }
 
-        tesseract_common::JointTrajectory trajectory = toJointTrajectory(nested_program);
+        Eigen::VectorXd best_solution = solutions.front();
+        double best_dist = std::numeric_limits<double>::max();
+        for (const auto &candidate : solutions)
+        {
+            const double dist = (candidate - ik_seed).squaredNorm();
+            if (dist < best_dist)
+            {
+                best_dist = dist;
+                best_solution = candidate;
+            }
+        }
+
+        for (Eigen::Index i = 0; i < best_solution.size() && i < joint_limits.rows(); ++i)
+        {
+            const double lower = joint_limits(i, 0);
+            const double upper = joint_limits(i, 1);
+            best_solution[i] = std::clamp(best_solution[i], lower, upper);
+        }
+
+        // Stream a short horizon command toward the IK target instead of sending the full motion every tick.
+        // This avoids constantly restarting a long trajectory when tracking updates at 5 Hz.
+        Eigen::VectorXd commanded_solution = best_solution;
+        const double max_joint_step = 0.08;   // rad per tracking tick
+        const double tracking_horizon = 0.18; // seconds
+        for (Eigen::Index i = 0; i < commanded_solution.size(); ++i)
+        {
+            const double delta = best_solution[i] - start_pos[i];
+            commanded_solution[i] = start_pos[i] + std::clamp(delta, -max_joint_step, max_joint_step);
+        }
+
+        CompositeInstruction ci("DEFAULT", tesseract_common::ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
+        ci.push_back(MoveInstruction(StateWaypoint(joint_names, start_pos), MoveInstructionType::FREESPACE, "FREESPACE"));
+        ci.push_back(MoveInstruction(StateWaypoint(joint_names, commanded_solution), MoveInstructionType::FREESPACE, "FREESPACE"));
+
+        tesseract_common::JointTrajectory trajectory = toJointTrajectory(ci);
+        if (trajectory.empty())
+        {
+            CONSOLE_BRIDGE_logWarn("[Tracking] Empty trajectory generated from IK solution");
+            return false;
+        }
+
+        trajectory.front().time = 0.0;
+        for (std::size_t i = 1; i < trajectory.size(); ++i)
+        {
+            trajectory[i].time = trajectory[i - 1].time + tracking_horizon;
+        }
+
+        last_tracking_command_ = commanded_solution;
+        has_last_tracking_command_ = true;
         last_trajectory_ = std::make_shared<tesseract_common::JointTrajectory>(trajectory);
+
+        if (debug_ && plotter_ != nullptr && plotter_->isConnected())
+        {
+            plotter_->plotTrajectory(trajectory, *env_->getStateSolver());
+        }
+
+        if (toolpath_cb_)
+        {
+            std::vector<Eigen::Vector3d> ee_path;
+            ee_path.reserve(trajectory.size());
+            for (const auto &state : trajectory)
+            {
+                Eigen::Isometry3d tf = manip->calcFwdKin(state.position).at(this->ee_link_);
+                ee_path.push_back(tf.translation());
+            }
+            toolpath_cb_(ee_path);
+        }
 
         CONSOLE_BRIDGE_logDebug("[Tracking] Trajectory ready (%zu points)", trajectory.size());
         return true;

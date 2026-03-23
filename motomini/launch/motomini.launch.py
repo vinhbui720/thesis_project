@@ -67,6 +67,7 @@ def generate_launch_description():
                 "online_mode": False,
                 "debug":True,
                 "use_ompl": True,
+                "tracking_mode": False,
 
             }],
             output="screen"

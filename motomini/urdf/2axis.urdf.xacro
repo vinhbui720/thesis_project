@@ -13,12 +13,12 @@
         <color rgba="0.5 0.5 0.5 1" />
       </material>
     </visual>
-    <collision>
+    <!-- <collision>
       <origin xyz="0.14 0 0" rpy="0 0 0" />
       <geometry>
         <box size="0.35 0.1 0.05" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
 
   <!-- ================= LINK 1 (X-Axis Carriage) ================= -->
@@ -32,12 +32,12 @@
         <color rgba="0 0 0.8 1" />
       </material>
     </visual>
-    <collision>
+    <!-- <collision>
       <origin xyz="0 0 0.05" rpy="0 0 0" />
       <geometry>
         <box size="0.08 0.08 0.08" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <link name='working_tip'>
     <visual>
@@ -68,12 +68,12 @@
         <color rgba="0 0.8 0 1" />
       </material>
     </visual>
-    <collision>
+    <!-- <collision>
       <origin xyz="0 0 -0.05" rpy="0 0 0" />
       <geometry>
         <box size="0.04 0.04 0.15" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
 
   <!-- Joint 2: Prismatic movement along the Z-axis (0 0 1) -->
@@ -98,12 +98,12 @@
         <color rgba="1 0 0 1" />
       </material>
     </visual>
-    <collision>
+    <!-- <collision>
       <origin xyz="0 0 -0.05" rpy="0 0 0" />
       <geometry>
         <box size="0.04 0.04 0.15" />
       </geometry>
-    </collision>
+    </collision> -->
   </link>
   <joint name="working_tip_tool" type="fixed">
     <parent link="gantry_tool_link" />

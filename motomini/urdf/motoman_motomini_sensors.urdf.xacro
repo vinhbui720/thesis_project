@@ -21,12 +21,12 @@
                 <box size="0.03 0.03 0.03" />
             </geometry>
         </visual>
-        <collision>
+        <!-- <collision>
             <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
             <geometry>
                 <box size="0.03 0.03 0.03" />
             </geometry>
-        </collision>
+        </collision> -->
         <inertial>
             <mass value="0.05" />
             <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />

@@ -1,0 +1,11 @@
+# Parameters for the modbus_hardware_bridge node
+# Edit these values to match your PLC setup.
+
+modbus_hardware_bridge:
+  ros__parameters:
+    plc_ip:           "192.168.1.1"
+    plc_port:         502
+    plc_unit_id:      1
+    scale_factor:     10000.0   # 10000 PLC units = 1 metre
+    default_velocity: 100       # sent with every position command
+    feedback_rate_hz: 20.0      # how often to read from the PLC (Hz)

@@ -39,6 +39,7 @@
 #include <Eigen/Geometry>
 #include <vector>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 using namespace Vinhtesseract_examples;
@@ -288,6 +289,7 @@ private:
 
     Eigen::Isometry3d latest_working_tip_world_{Eigen::Isometry3d::Identity()};
     Eigen::Isometry3d initial_robot_pose_{Eigen::Isometry3d::Identity()}; // Store initial pose
+    bool tracking_pose_initialized_{false};
 
     bool updateWorkingTipPoseFromTfAndJoints()
     {
@@ -313,8 +315,21 @@ private:
             const Eigen::Isometry3d T_world_base = tf2::transformToEigen(world_to_base.transform);
             const Eigen::Isometry3d T_base_tip = tf2::transformToEigen(base_to_tip.transform);
 
-            // Fused working tip pose in world frame
-            latest_working_tip_world_ = T_world_base * T_base_tip;
+            // Fused working tip pose in world frame. Filter translation to suppress ICP/TF noise.
+            const Eigen::Isometry3d measured_tip_world = T_world_base * T_base_tip;
+            if (!tracking_pose_initialized_)
+            {
+                latest_working_tip_world_ = measured_tip_world;
+                tracking_pose_initialized_ = true;
+            }
+            else
+            {
+                constexpr double tracking_pose_alpha = 0.25;
+                latest_working_tip_world_.translation() =
+                    (1.0 - tracking_pose_alpha) * latest_working_tip_world_.translation() +
+                    tracking_pose_alpha * measured_tip_world.translation();
+                latest_working_tip_world_.linear() = measured_tip_world.linear();
+            }
             return true;
         }
         catch (const tf2::TransformException &ex)
@@ -351,7 +366,7 @@ private:
             if (!traj_ptr || traj_ptr->empty())
                 return;
 
-            publishTrajectory(*traj_ptr, joint_names);
+            publishTrackingTrajectory(*traj_ptr, joint_names);
             publishStatus("Tracking disabled: returning to initial pose");
             return;
         }
@@ -380,7 +395,7 @@ private:
                                                                        : std::vector<std::string>{};
 
         // Directly publish trajectory without blocking on is_executing_
-        publishTrajectory(*traj_ptr, joint_names);
+        publishTrackingTrajectory(*traj_ptr, joint_names);
 
         RCLCPP_DEBUG(this->get_logger(), "Tracking: new trajectory published");
     }
@@ -649,44 +664,106 @@ private:
         pub_status_->publish(msg);
     }
 
+    void publishTrackingTrajectory(const tesseract_common::JointTrajectory &tess_traj,
+                                   const std::vector<std::string> &joint_names)
+    {
+        if (tess_traj.empty())
+            return;
+
+        if (tess_traj.size() == 1)
+        {
+            publishTrajectory(tess_traj, joint_names);
+            return;
+        }
+
+        tesseract_common::JointTrajectory trimmed_traj;
+        trimmed_traj.push_back(tess_traj.back());
+        publishTrajectory(trimmed_traj, joint_names);
+    }
+
     void publishTrajectory(const tesseract_common::JointTrajectory &tess_traj,
                            const std::vector<std::string> &joint_names)
     {
+        if (tess_traj.empty())
+            return;
+
         // 1. Define exactly the 6 joints your controller expects
         const std::vector<std::string> controlled_joints = {
             "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
 
         trajectory_msgs::msg::JointTrajectory ros_msg;
-        ros_msg.header.stamp = this->now();
+        const double min_step_dt = 0.02; // 20 ms minimum spacing between points
+        const double start_delay = 0.10; // execute slightly in the future to avoid "ends in the past"
+        ros_msg.header.stamp = this->now() + rclcpp::Duration::from_seconds(start_delay);
         ros_msg.header.frame_id = "world";
         ros_msg.joint_names = controlled_joints;
 
-        // 2. Map the Tesseract states directly to the controlled joints
-        for (const auto &state : tess_traj)
+        std::array<int, 6> source_indices{};
+        source_indices.fill(-1);
+
+        bool use_name_mapping = !joint_names.empty() &&
+                                (tess_traj.front().position.size() == joint_names.size());
+
+        if (use_name_mapping)
         {
+            for (size_t i = 0; i < controlled_joints.size(); ++i)
+            {
+                auto it = std::find(joint_names.begin(), joint_names.end(), controlled_joints[i]);
+                if (it == joint_names.end())
+                {
+                    use_name_mapping = false;
+                    break;
+                }
+                source_indices[i] = static_cast<int>(std::distance(joint_names.begin(), it));
+            }
+        }
+
+        // 2. Map the Tesseract states directly to the controlled joints
+        double prev_time = 0.0;
+        for (size_t point_idx = 0; point_idx < tess_traj.size(); ++point_idx)
+        {
+            const auto &state = tess_traj[point_idx];
             trajectory_msgs::msg::JointTrajectoryPoint point;
-            point.time_from_start = rclcpp::Duration::from_seconds(state.time);
+
+            double t = state.time;
+            if (point_idx == 0)
+                t = std::max(t, min_step_dt);
+            else
+                t = std::max(t, prev_time + min_step_dt);
+
+            prev_time = t;
+            point.time_from_start = rclcpp::Duration::from_seconds(t);
 
             // Tesseract plans for the 6-DOF manipulator group,
             // so the state vector strictly contains these 6 joints in order.
             for (size_t i = 0; i < controlled_joints.size(); ++i)
             {
-                if (i < static_cast<size_t>(state.position.size()))
-                    point.positions.push_back(state.position[i]);
+                int src_idx = use_name_mapping ? source_indices[i] : static_cast<int>(i);
 
-                if (i < static_cast<size_t>(state.velocity.size()))
-                    point.velocities.push_back(state.velocity[i]);
+                double pos = 0.0;
+                double vel = 0.0;
+                double acc = 0.0;
 
-                if (i < static_cast<size_t>(state.acceleration.size()))
-                    point.accelerations.push_back(state.acceleration[i]);
+                if (src_idx >= 0 && src_idx < state.position.size())
+                    pos = state.position[src_idx];
+
+                if (src_idx >= 0 && src_idx < state.velocity.size())
+                    vel = state.velocity[src_idx];
+
+                if (src_idx >= 0 && src_idx < state.acceleration.size())
+                    acc = state.acceleration[src_idx];
+
+                point.positions.push_back(pos);
+                point.velocities.push_back(vel);
+                point.accelerations.push_back(acc);
             }
 
             ros_msg.points.push_back(point);
         }
 
         pub_trajectory_->publish(ros_msg);
-        RCLCPP_INFO(this->get_logger(), "Filtered trajectory published (%zu points, %zu joints).",
-                    ros_msg.points.size(), ros_msg.joint_names.size());
+        // RCLCPP_INFO(this->get_logger(), "Filtered trajectory published (%zu points, %zu joints).",
+        //             ros_msg.points.size(), ros_msg.joint_names.size());
     }
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
