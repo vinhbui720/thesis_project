@@ -71,4 +71,15 @@ namespace Vinhtesseract_examples
         toolpath_cb_ = std::move(cb);
     }
 
+    void MotoMiniPlanning::configureTracking(bool use_trajopt, bool enable_collision,
+                                             int num_steps, int trajopt_max_iter,
+                                             double max_joint_step)
+    {
+        tracking_use_trajopt_ = use_trajopt;
+        tracking_enable_collision_ = enable_collision;
+        tracking_num_steps_ = num_steps;
+        tracking_trajopt_max_iter_ = trajopt_max_iter;
+        tracking_max_joint_step_ = max_joint_step;
+    }
+
 } // namespace Vinhtesseract_examples

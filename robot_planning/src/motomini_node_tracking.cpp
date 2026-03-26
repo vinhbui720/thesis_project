@@ -1,11 +1,13 @@
 /**
  * @file motomini_node_tracking.cpp
- * @brief MotoMiniPlanningNode — TF-based working-tip pose update and tracking tick.
+ * @brief MotoMiniPlanningNode — high-frequency TF polling thread + planning tick.
  *
- * trackingTick() is called by the tracking timer (default 5 Hz).
- * When tracking is ENABLED  → looks up working_tip in world frame, filters
- *                             translation with an EMA, calls runTrackingPlanner().
- * When tracking is DISABLED → commands the robot back to its initial pose.
+ * Architecture:
+ *   tfPollLoop()   — runs in a dedicated thread at ~200 Hz, continuously caches
+ *                    the working_tip pose from TF.  This decouples TF freshness
+ *                    from the (slower) planning tick rate.
+ *   trackingTick() — called by the tracking timer (default 30 Hz).  Reads the
+ *                    cached pose (lock-free fast), syncs env, calls planner.
  *
  * @author Bùi Quang Vinh
  */
@@ -15,79 +17,121 @@
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2/exceptions.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
 #include <Eigen/Geometry>
+#include <chrono>
+#include <thread>
 
 // ---------------------------------------------------------------------------
-// updateWorkingTipPoseFromTfAndJoints
+// TF polling thread — start / stop
 // ---------------------------------------------------------------------------
-bool MotoMiniPlanningNode::updateWorkingTipPoseFromTfAndJoints()
+void MotoMiniPlanningNode::startTfPolling()
 {
-    if (!last_joint_state_)
-        return false;
+    if (tf_poll_running_)
+        return;
+    tf_poll_running_ = true;
+    tf_poll_thread_ = std::thread(&MotoMiniPlanningNode::tfPollLoop, this);
+    RCLCPP_INFO(this->get_logger(), "TF poll thread started (%.0f Hz)", tf_poll_rate_hz_);
+}
 
-    // Keep planner environment in sync with real joint values
-    const std::vector<std::string> &names = last_joint_state_->name;
-    Eigen::VectorXd joint_pos(static_cast<Eigen::Index>(last_joint_state_->position.size()));
-    for (size_t i = 0; i < last_joint_state_->position.size(); ++i)
-        joint_pos[static_cast<Eigen::Index>(i)] = last_joint_state_->position[i];
-    planner_->updateEnvironmentState(names, joint_pos);
+void MotoMiniPlanningNode::stopTfPolling()
+{
+    tf_poll_running_ = false;
+    if (tf_poll_thread_.joinable())
+        tf_poll_thread_.join();
+}
 
-    try
+// ---------------------------------------------------------------------------
+// getLatestTipPose — thread-safe read of cached pose
+// ---------------------------------------------------------------------------
+Eigen::Isometry3d MotoMiniPlanningNode::getLatestTipPose() const
+{
+    std::lock_guard<std::mutex> lock(tip_pose_mutex_);
+    return latest_working_tip_world_;
+}
+
+// ---------------------------------------------------------------------------
+// tfPollLoop — runs in its own thread, continuously caches the working_tip pose
+// ---------------------------------------------------------------------------
+void MotoMiniPlanningNode::tfPollLoop()
+{
+    const auto period = std::chrono::microseconds(
+        static_cast<int64_t>(1e6 / tf_poll_rate_hz_));
+
+    while (tf_poll_running_ && rclcpp::ok())
     {
-        const auto world_to_base = tf_buffer_->lookupTransform(
-            tracking_world_frame_, tracking_gantry_base_frame_, tf2::TimePointZero);
-        const auto base_to_tip = tf_buffer_->lookupTransform(
-            tracking_gantry_base_frame_, tracking_tip_frame_, tf2::TimePointZero);
-
-        const Eigen::Isometry3d T_world_base = tf2::transformToEigen(world_to_base.transform);
-        const Eigen::Isometry3d T_base_tip = tf2::transformToEigen(base_to_tip.transform);
-        const Eigen::Isometry3d measured = T_world_base * T_base_tip;
-
-        if (!tracking_pose_initialized_)
+        try
         {
-            latest_working_tip_world_ = measured;
-            tracking_pose_initialized_ = true;
+            const auto world_to_base = tf_buffer_->lookupTransform(
+                tracking_world_frame_, tracking_gantry_base_frame_, tf2::TimePointZero);
+            const auto base_to_tip = tf_buffer_->lookupTransform(
+                tracking_gantry_base_frame_, tracking_tip_frame_, tf2::TimePointZero);
+
+            const Eigen::Isometry3d T_world_base = tf2::transformToEigen(world_to_base.transform);
+            const Eigen::Isometry3d T_base_tip = tf2::transformToEigen(base_to_tip.transform);
+            const Eigen::Isometry3d measured = T_world_base * T_base_tip;
+
+            {
+                std::lock_guard<std::mutex> lock(tip_pose_mutex_);
+                if (!tracking_pose_initialized_)
+                {
+                    latest_working_tip_world_ = measured;
+                    tracking_pose_initialized_ = true;
+                }
+                else
+                {
+                    // EMA low-pass filter — alpha closer to 1.0 = faster response
+                    const double alpha = tracking_ema_alpha_;
+                    latest_working_tip_world_.translation() =
+                        (1.0 - alpha) * latest_working_tip_world_.translation() +
+                        alpha * measured.translation();
+                    latest_working_tip_world_.linear() = measured.linear();
+                }
+            }
+
+            // Debug: publish the cached pose as PoseStamped
+            if (pub_tracked_pose_)
+            {
+                geometry_msgs::msg::PoseStamped ps;
+                ps.header.stamp = this->now();
+                ps.header.frame_id = tracking_world_frame_;
+                ps.pose = tf2::toMsg(measured);
+                pub_tracked_pose_->publish(ps);
+            }
         }
-        else
+        catch (const tf2::TransformException &)
         {
-            // EMA low-pass filter on translation — suppresses ICP / TF noise.
-            // Decrease alpha (toward 0) for more smoothing; increase (toward 1) for faster response.
-            constexpr double alpha = 0.25;
-            latest_working_tip_world_.translation() =
-                (1.0 - alpha) * latest_working_tip_world_.translation() +
-                alpha * measured.translation();
-            latest_working_tip_world_.linear() = measured.linear();
+            // TF not ready yet — silently retry next iteration
         }
-        return true;
-    }
-    catch (const tf2::TransformException &ex)
-    {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                             "Tracking TF lookup failed: %s", ex.what());
-        return false;
+
+        std::this_thread::sleep_for(period);
     }
 }
 
 // ---------------------------------------------------------------------------
-// trackingTick
+// trackingTick — called by the tracking timer
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::trackingTick()
 {
     if (!tracking_mode_)
         return;
 
-    // --- Tracking DISABLED: return to initial pose ---
-    if (!tracking_enabled_)
+    // --- Sync planner env with latest joint states ---
+    if (last_joint_state_)
     {
-        if (!last_joint_state_)
-            return;
-
         const std::vector<std::string> &names = last_joint_state_->name;
         Eigen::VectorXd joint_pos(static_cast<Eigen::Index>(last_joint_state_->position.size()));
         for (size_t i = 0; i < last_joint_state_->position.size(); ++i)
             joint_pos[static_cast<Eigen::Index>(i)] = last_joint_state_->position[i];
         planner_->updateEnvironmentState(names, joint_pos);
+    }
+
+    // --- Tracking DISABLED: return to initial pose ---
+    if (!tracking_enabled_)
+    {
+        if (!last_joint_state_)
+            return;
 
         if (!planner_->runTrackingPlanner(initial_robot_pose_))
             return;
@@ -96,16 +140,18 @@ void MotoMiniPlanningNode::trackingTick()
         if (!traj_ptr || traj_ptr->empty())
             return;
 
-        publishTrackingTrajectory(*traj_ptr, names);
+        publishTrackingTrajectory(*traj_ptr, last_joint_state_->name);
         publishStatus("Tracking disabled: returning to initial pose");
         return;
     }
 
-    // --- Tracking ENABLED: follow working_tip ---
-    if (!updateWorkingTipPoseFromTfAndJoints())
+    // --- Tracking ENABLED: follow cached working_tip pose ---
+    if (!tracking_pose_initialized_)
         return;
 
-    if (!planner_->runTrackingPlanner(latest_working_tip_world_))
+    const Eigen::Isometry3d target = getLatestTipPose();
+
+    if (!planner_->runTrackingPlanner(target))
     {
         RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed");
         return;

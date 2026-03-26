@@ -10,6 +10,7 @@
 #define ROBOT_PLANNING_MOTOMINI_PLANNING_H
 
 #include <tesseract_common/macros.h>
+#include <tesseract_kinematics/core/kinematic_group.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <vector>
 #include <memory> // Required for std::shared_ptr
@@ -75,6 +76,11 @@ namespace Vinhtesseract_examples
         // Lightweight tracking planner (collision check only, no optimization yet)
         bool runTrackingPlanner(const Eigen::Isometry3d &target_pose);
 
+        // Configure tracking parameters from ROS node
+        void configureTracking(bool use_trajopt, bool enable_collision,
+                               int num_steps, int trajopt_max_iter,
+                               double max_joint_step);
+
     private:
         std::string manipulator_group_;
         std::string base_link_;
@@ -93,6 +99,19 @@ namespace Vinhtesseract_examples
         ToolpathCallback toolpath_cb_;
         Eigen::VectorXd last_tracking_command_;
         bool has_last_tracking_command_{false};
+        // --- Tracking TrajOpt configuration ---
+        bool tracking_use_trajopt_{true};       // TrajOpt smoothing + optional collision
+        bool tracking_enable_collision_{false}; // collision avoidance (slower)
+        int tracking_num_steps_{5};             // interpolation steps
+        int tracking_trajopt_max_iter_{5};      // max SQP iterations
+        double tracking_max_joint_step_{0.15};  // rad per tick
+
+        // --- Cached objects for fast repeated tracking calls ---
+        tesseract_kinematics::KinematicGroup::ConstPtr tracking_manip_;
+        Eigen::MatrixX2d tracking_joint_limits_;
+        Eigen::MatrixX2d tracking_velocity_limits_;
+        bool tracking_caches_valid_{false};
+        void ensureTrackingCaches();
     };
 
 } // namespace Vinhtesseract_examples

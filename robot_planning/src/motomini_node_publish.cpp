@@ -41,16 +41,39 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
     if (tess_traj.empty())
         return;
 
-    if (tess_traj.size() == 1)
+    const double tracking_period = 1.0 / std::max(0.1, tracking_rate_hz_);
+    const double start_delay = std::clamp(0.1 * tracking_period, 0.005, 0.02);
+    const double min_step_dt = 0.02;
+    const double max_horizon = std::max(min_step_dt, tracking_period - start_delay);
+
+    if (tess_traj.size() <= 1)
     {
-        publishTrajectory(tess_traj, joint_names);
+        publishTrajectory(tess_traj, joint_names, start_delay);
         return;
     }
 
-    // Only publish the forward target (last point)
-    tesseract_common::JointTrajectory trimmed;
-    trimmed.push_back(tess_traj.back());
-    publishTrajectory(trimmed, joint_names);
+    tesseract_common::JointTrajectory forward(tess_traj.begin() + 1, tess_traj.end());
+
+    // Re-base time so the first published point starts at t=0
+    const double t_offset = forward.front().time;
+    for (auto &state : forward)
+        state.time = std::max(0.0, state.time - t_offset);
+
+    const double current_horizon = forward.back().time;
+    if (current_horizon > max_horizon && current_horizon > 1e-6)
+    {
+        const double scale = max_horizon / current_horizon;
+        for (auto &state : forward)
+        {
+            state.time *= scale;
+            for (Eigen::Index i = 0; i < state.velocity.size(); ++i)
+                state.velocity[i] /= scale;
+            for (Eigen::Index i = 0; i < state.acceleration.size(); ++i)
+                state.acceleration[i] /= (scale * scale);
+        }
+    }
+
+    publishTrajectory(forward, joint_names, start_delay);
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +84,8 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::publishTrajectory(
     const tesseract_common::JointTrajectory &tess_traj,
-    const std::vector<std::string> &joint_names)
+    const std::vector<std::string> &joint_names,
+    double start_delay_sec)
 {
     if (tess_traj.empty())
         return;
@@ -71,7 +95,7 @@ void MotoMiniPlanningNode::publishTrajectory(
         "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
 
     const double min_step_dt = 0.02; // 20 ms minimum inter-point spacing
-    const double start_delay = 0.10; // stamp trajectory slightly in the future
+    const double start_delay = std::max(0.0, start_delay_sec);
 
     trajectory_msgs::msg::JointTrajectory ros_msg;
     ros_msg.header.stamp = this->now() + rclcpp::Duration::from_seconds(start_delay);

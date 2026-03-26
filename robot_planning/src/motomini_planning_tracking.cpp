@@ -1,17 +1,17 @@
 /**
  * @file motomini_planning_tracking.cpp
- * @brief MotoMiniPlanning::runTrackingPlanner() — lightweight real-time IK tracking.
+ * @brief MotoMiniPlanning::runTrackingPlanner() — TrajOpt-smoothed tracking with ISP velocities.
  *
- * Called at ~5 Hz from the ROS node.  Each tick:
- *   1. Reads current joint state and the filtered working-tip target pose.
- *   2. Runs FK to keep the current end-effector orientation (position-only tracking).
- *   3. Calls calcInvKin() seeded from the previous command for branch continuity.
- *   4. Clamps per-joint step to avoid large jumps in one tick.
- *   5. Stores a two-point trajectory; the node publishes only the forward target point.
+ * Pipeline per tick:
+ *   1. IK  → target joint position (seeded from last command for branch continuity)
+ *   2. Interpolate N waypoints in joint space
+ *   3. (Optional) TrajOpt-ifopt optimization — smoothing costs + collision constraints
+ *   4. ISP time parameterization → proper velocities/accelerations respecting URDF limits
+ *   5. Store trajectory; node publishes it with full velocity data
  *
- * Tuning knobs (search "TUNE"):
- *   max_joint_step   — maximum per-joint delta per tick (rad)
- *   tracking_horizon — time horizon fed to the controller (s)
+ * Two modes controlled by tracking_use_trajopt_:
+ *   false → steps 1-2-4-5 only (~1 ms per tick, suitable for 50+ Hz)
+ *   true  → full pipeline 1-2-3-4-5 (~5-20 ms per tick, suitable for 20-30 Hz)
  *
  * @author Bùi Quang Vinh
  */
@@ -21,28 +21,44 @@
 #include <tesseract_common/macros.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <console_bridge/console.h>
+#include <trajopt_common/collision_types.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_POP
 
 // Kinematics
 #include <tesseract_kinematics/core/kinematic_group.h>
 #include <tesseract_kinematics/core/types.h>
 
-// Command language (build the two-point trajectory)
+// Command language
 #include <tesseract_command_language/composite_instruction.h>
 #include <tesseract_command_language/state_waypoint.h>
 #include <tesseract_command_language/move_instruction.h>
 #include <tesseract_command_language/utils.h>
 
-// Visualization (debug plotting)
-#include <tesseract_visualization/visualization.h>
-
-// Full type definitions needed in this TU
+// Environment + state
 #include <tesseract_common/joint_state.h>
+#include <tesseract_common/profile_dictionary.h>
 #include <tesseract_state_solver/state_solver.h>
+#include <tesseract_environment/environment.h>
+#include <tesseract_visualization/visualization.h>
+#include <tesseract_motion_planners/core/utils.h>
 
-// STL
-#include <algorithm> // std::clamp
-#include <limits>    // std::numeric_limits
+// ISP time parameterization
+#include <tesseract_time_parameterization/isp/iterative_spline_parameterization.h>
+#include <tesseract_time_parameterization/isp/iterative_spline_parameterization_profiles.h>
+#include <tesseract_time_parameterization/core/utils.h>
+
+// TrajOpt-ifopt (lightweight optimization)
+#include <trajopt_sqp/trajopt_qp_problem.h>
+#include <trajopt_sqp/trust_region_sqp_solver.h>
+#include <trajopt_sqp/osqp_eigen_solver.h>
+#include <trajopt_ifopt/variable_sets/joint_position_variable.h>
+#include <trajopt_ifopt/constraints/joint_velocity_constraint.h>
+#include <trajopt_ifopt/constraints/joint_acceleration_constraint.h>
+#include <trajopt_ifopt/constraints/collision/discrete_collision_constraint.h>
+#include <trajopt_ifopt/constraints/collision/discrete_collision_evaluators.h>
+
+#include <algorithm>
+#include <limits>
 
 using namespace tesseract_kinematics;
 using namespace tesseract_planning;
@@ -50,114 +66,267 @@ using namespace tesseract_planning;
 namespace Vinhtesseract_examples
 {
 
+    // ---------------------------------------------------------------------------
+    // ensureTrackingCaches — one-time init of expensive objects
+    // ---------------------------------------------------------------------------
+    void MotoMiniPlanning::ensureTrackingCaches()
+    {
+        if (tracking_caches_valid_)
+            return;
+
+        tracking_manip_ = env_->getKinematicGroup(manipulator_group_);
+        if (!tracking_manip_)
+        {
+            CONSOLE_BRIDGE_logError("[Tracking] Kinematic group '%s' not found",
+                                    manipulator_group_.c_str());
+            return;
+        }
+
+        const auto &limits = tracking_manip_->getLimits();
+        tracking_joint_limits_ = limits.joint_limits;
+        tracking_velocity_limits_ = limits.velocity_limits;
+        tracking_caches_valid_ = true;
+    }
+
+    // ---------------------------------------------------------------------------
+    // runTrackingPlanner — TrajOpt + ISP tracking pipeline
+    // ---------------------------------------------------------------------------
     bool MotoMiniPlanning::runTrackingPlanner(const Eigen::Isometry3d &target_pose)
     {
         if (!env_)
             return false;
 
-        CONSOLE_BRIDGE_logDebug("[Tracking] Running lightweight tracking planner...");
+        CONSOLE_BRIDGE_logDebug("[Tracking] Starting TrajOpt tracking planner...");
 
         std::shared_lock<std::shared_mutex> lock(env_mutex_);
 
+        // ---- Cache kinematic group + limits (once) ----
+        ensureTrackingCaches();
+        if (!tracking_caches_valid_)
+            return false;
+
         const std::vector<std::string> joint_names = {
-            "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+            "joint_1_s", "joint_2_l", "joint_3_u",
+            "joint_4_r", "joint_5_b", "joint_6_t"};
+        const int n_dof = static_cast<int>(joint_names.size());
         const Eigen::VectorXd start_pos = env_->getCurrentJointValues(joint_names);
 
-        // --- IK seed: prefer last commanded position to avoid branch switching ---
+        // ---- IK seed: prefer last command for branch continuity ----
         const Eigen::VectorXd ik_seed =
             (has_last_tracking_command_ && last_tracking_command_.size() == start_pos.size())
                 ? last_tracking_command_
                 : start_pos;
 
-        KinematicGroup::ConstPtr manip = env_->getKinematicGroup(manipulator_group_);
-        if (!manip)
-        {
-            CONSOLE_BRIDGE_logError("[Tracking] Could not find kinematic group '%s'",
-                                    manipulator_group_.c_str());
-            return false;
-        }
-
-        // --- FK: keep current orientation (position-only tracking) ---
-        const auto fk_map = manip->calcFwdKin(start_pos);
+        // ---- FK: keep current orientation (position-only tracking) ----
+        const auto fk_map = tracking_manip_->calcFwdKin(start_pos);
         auto fk_it = fk_map.find(ee_link_);
         if (fk_it == fk_map.end())
         {
-            CONSOLE_BRIDGE_logError("[Tracking] FK result did not contain ee link '%s'",
-                                    ee_link_.c_str());
+            CONSOLE_BRIDGE_logError("[Tracking] FK did not contain ee link '%s'", ee_link_.c_str());
             return false;
         }
 
-        Eigen::Isometry3d target_pose_adjusted = target_pose;
-        target_pose_adjusted.linear() = fk_it->second.linear();
+        Eigen::Isometry3d target_adjusted = target_pose;
+        target_adjusted.linear() = fk_it->second.linear();
 
-        // --- IK ---
-        const Eigen::MatrixX2d joint_limits = manip->getLimits().joint_limits;
-        KinGroupIKInput ik_input(target_pose_adjusted, base_link_, ee_link_);
-        IKSolutions solutions = manip->calcInvKin(ik_input, ik_seed);
-
+        // ---- Inverse Kinematics ----
+        KinGroupIKInput ik_input(target_adjusted, base_link_, ee_link_);
+        IKSolutions solutions = tracking_manip_->calcInvKin(ik_input, ik_seed);
         if (solutions.empty())
         {
             CONSOLE_BRIDGE_logWarn("[Tracking] IK failed for XYZ=(%.4f, %.4f, %.4f)",
-                                   target_pose_adjusted.translation().x(),
-                                   target_pose_adjusted.translation().y(),
-                                   target_pose_adjusted.translation().z());
+                                   target_adjusted.translation().x(),
+                                   target_adjusted.translation().y(),
+                                   target_adjusted.translation().z());
             return false;
         }
 
-        // --- Pick solution closest to the seed ---
-        Eigen::VectorXd best_solution = solutions.front();
+        // Pick solution closest to seed
+        Eigen::VectorXd best_sol = solutions.front();
         double best_dist = std::numeric_limits<double>::max();
-        for (const auto &candidate : solutions)
+        for (const auto &sol : solutions)
         {
-            const double dist = (candidate - ik_seed).squaredNorm();
-            if (dist < best_dist)
+            const double d = (sol - ik_seed).squaredNorm();
+            if (d < best_dist)
             {
-                best_dist = dist;
-                best_solution = candidate;
+                best_dist = d;
+                best_sol = sol;
             }
         }
 
-        // --- Clamp to joint limits ---
-        for (Eigen::Index i = 0; i < best_solution.size() && i < joint_limits.rows(); ++i)
-            best_solution[i] = std::clamp(best_solution[i], joint_limits(i, 0), joint_limits(i, 1));
+        // Clamp to joint position limits
+        for (Eigen::Index i = 0; i < best_sol.size() && i < tracking_joint_limits_.rows(); ++i)
+            best_sol[i] = std::clamp(best_sol[i],
+                                     tracking_joint_limits_(i, 0),
+                                     tracking_joint_limits_(i, 1));
 
-        // --- TUNE: per-tick step limit and time horizon ---
-        // Increase max_joint_step to move faster; decrease for smoother but slower tracking.
-        const double max_joint_step = 0.08;   // rad per tick
-        const double tracking_horizon = 0.18; // seconds fed to the controller
-
-        Eigen::VectorXd commanded_solution = best_solution;
-        for (Eigen::Index i = 0; i < commanded_solution.size(); ++i)
+        // Per-tick step clamp
+        Eigen::VectorXd target_joints = best_sol;
+        for (Eigen::Index i = 0; i < target_joints.size(); ++i)
         {
-            const double delta = best_solution[i] - start_pos[i];
-            commanded_solution[i] = start_pos[i] + std::clamp(delta, -max_joint_step, max_joint_step);
+            const double delta = best_sol[i] - start_pos[i];
+            target_joints[i] = start_pos[i] +
+                               std::clamp(delta, -tracking_max_joint_step_, tracking_max_joint_step_);
         }
 
-        // --- Build two-point trajectory (node publishes only the forward target) ---
+        // ================================================================
+        //  STEP 2: Interpolate N waypoints in joint space
+        // ================================================================
+        const int N = tracking_num_steps_;
+        std::vector<Eigen::VectorXd> waypoints(N);
+        for (int s = 0; s < N; ++s)
+        {
+            const double alpha = static_cast<double>(s) / (N - 1);
+            waypoints[s] = (1.0 - alpha) * start_pos + alpha * target_joints;
+        }
+
+        // ================================================================
+        //  STEP 3 (optional): TrajOpt-ifopt optimization
+        // ================================================================
+        if (tracking_use_trajopt_ && N >= 3)
+        {
+            auto nlp = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
+
+            // --- Variables ---
+            std::vector<std::shared_ptr<const trajopt_ifopt::JointPosition>> vars;
+            vars.reserve(N);
+            for (int i = 0; i < N; ++i)
+            {
+                auto var = std::make_shared<trajopt_ifopt::JointPosition>(
+                    waypoints[i], joint_names, "JP_" + std::to_string(i));
+
+                if (i == 0)
+                {
+                    // Fix start position (tight bounds ±1e-6)
+                    Eigen::MatrixX2d fixed_bounds(n_dof, 2);
+                    fixed_bounds.col(0) = start_pos.array() - 1e-6;
+                    fixed_bounds.col(1) = start_pos.array() + 1e-6;
+                    var->SetBounds(fixed_bounds);
+                }
+                else if (i == N - 1)
+                {
+                    // Fix end position to IK target (tight bounds ±1e-6)
+                    Eigen::MatrixX2d fixed_bounds(n_dof, 2);
+                    fixed_bounds.col(0) = target_joints.array() - 1e-6;
+                    fixed_bounds.col(1) = target_joints.array() + 1e-6;
+                    var->SetBounds(fixed_bounds);
+                }
+                else
+                {
+                    // Intermediate points: full joint limits
+                    var->SetBounds(tracking_joint_limits_);
+                }
+
+                vars.push_back(var);
+                nlp->addVariableSet(var);
+            }
+
+            // --- Smoothing costs ---
+            // Velocity smoothing: minimize (q_{i+1} - q_i)^2
+            Eigen::VectorXd vel_coeffs = Eigen::VectorXd::Ones(n_dof) * 1.0;
+            auto vel_cost = std::make_shared<trajopt_ifopt::JointVelConstraint>(
+                Eigen::VectorXd::Zero(n_dof), vars, vel_coeffs, "VelSmooth");
+            nlp->addCostSet(vel_cost, trajopt_sqp::CostPenaltyType::SQUARED);
+
+            // Acceleration smoothing: minimize (q_{i+2} - 2*q_{i+1} + q_i)^2
+            Eigen::VectorXd accel_coeffs = Eigen::VectorXd::Ones(n_dof) * 5.0;
+            auto accel_cost = std::make_shared<trajopt_ifopt::JointAccelConstraint>(
+                Eigen::VectorXd::Zero(n_dof), vars, accel_coeffs, "AccelSmooth");
+            nlp->addCostSet(accel_cost, trajopt_sqp::CostPenaltyType::SQUARED);
+
+            // --- Collision constraints (optional, expensive) ---
+            if (tracking_enable_collision_)
+            {
+                trajopt_common::TrajOptCollisionConfig col_cfg(0.01, 50.0);
+                col_cfg.collision_check_config.type =
+                    tesseract_collision::CollisionEvaluatorType::LVS_DISCRETE;
+                col_cfg.collision_margin_buffer = 0.005;
+
+                auto col_cache = std::make_shared<trajopt_ifopt::CollisionCache>(N);
+                for (int i = 1; i < N; ++i)
+                {
+                    auto evaluator =
+                        std::make_shared<trajopt_ifopt::SingleTimestepCollisionEvaluator>(
+                            col_cache, tracking_manip_, env_, col_cfg, true);
+                    auto constraint =
+                        std::make_shared<trajopt_ifopt::DiscreteCollisionConstraint>(
+                            evaluator, vars[i], col_cfg.max_num_cnt, false,
+                            "Col_" + std::to_string(i));
+                    nlp->addConstraintSet(constraint);
+                }
+            }
+
+            // --- Solve (few iterations for speed) ---
+            nlp->setup();
+            auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
+            trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
+            solver.params.initial_trust_box_size = 0.05;
+            solver.params.min_trust_box_size = 1e-4;
+            solver.params.min_approx_improve = 1e-3;
+            solver.params.max_iterations = tracking_trajopt_max_iter_;
+            solver.init(nlp);
+            solver.solve(nlp);
+
+            // Extract optimized positions
+            for (int i = 0; i < N; ++i)
+                waypoints[i] = vars[i]->GetValues();
+        }
+
+        // ================================================================
+        //  STEP 4: ISP time parameterization → velocities + accelerations
+        // ================================================================
         CompositeInstruction ci(
-            "DEFAULT", tesseract_common::ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
-        ci.push_back(MoveInstruction(StateWaypoint(joint_names, start_pos),
-                                     MoveInstructionType::FREESPACE, "FREESPACE"));
-        ci.push_back(MoveInstruction(StateWaypoint(joint_names, commanded_solution),
-                                     MoveInstructionType::FREESPACE, "FREESPACE"));
+            "DEFAULT",
+            tesseract_common::ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
+
+        for (const auto &wp : waypoints)
+        {
+            ci.push_back(MoveInstruction(
+                StateWaypoint(joint_names, wp),
+                MoveInstructionType::FREESPACE, "FREESPACE"));
+        }
+
+        tesseract_planning::formatProgram(ci, *env_);
+
+        // ISP profile: use URDF velocity limits (optionally scaled)
+        auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
+        auto isp_profile =
+            std::make_shared<IterativeSplineParameterizationCompositeProfile>(
+                1.0,  // max_velocity_scaling_factor  (tune: lower = slower/smoother)
+                0.5); // max_acceleration_scaling_factor (conservative for tracking)
+        profiles->addProfile(
+            "IterativeSplineParameterization", "DEFAULT", isp_profile);
+
+        auto isp = std::make_unique<tesseract_planning::IterativeSplineParameterization>(
+            "IterativeSplineParameterization");
+
+        if (!isp->compute(ci, *env_, *profiles))
+        {
+            CONSOLE_BRIDGE_logWarn("[Tracking] ISP failed, using raw trajectory with manual timing");
+            // Fallback: uniform timing, no velocity data
+            tesseract_common::JointTrajectory raw = toJointTrajectory(ci);
+            const double dt = 0.04;
+            for (std::size_t i = 0; i < raw.size(); ++i)
+                raw[i].time = static_cast<double>(i) * dt;
+            last_tracking_command_ = target_joints;
+            has_last_tracking_command_ = true;
+            last_trajectory_ = std::make_shared<tesseract_common::JointTrajectory>(raw);
+            return true;
+        }
 
         tesseract_common::JointTrajectory trajectory = toJointTrajectory(ci);
         if (trajectory.empty())
         {
-            CONSOLE_BRIDGE_logWarn("[Tracking] Empty trajectory generated from IK solution");
+            CONSOLE_BRIDGE_logWarn("[Tracking] Empty trajectory from ISP");
             return false;
         }
 
-        trajectory.front().time = 0.0;
-        for (std::size_t i = 1; i < trajectory.size(); ++i)
-            trajectory[i].time = trajectory[i - 1].time + tracking_horizon;
-
-        // --- Persist state for next tick ---
-        last_tracking_command_ = commanded_solution;
+        // ---- Persist state for next tick ----
+        last_tracking_command_ = target_joints;
         has_last_tracking_command_ = true;
         last_trajectory_ = std::make_shared<tesseract_common::JointTrajectory>(trajectory);
 
-        // --- Debug visualization ---
+        // ---- Debug visualization ----
         if (debug_ && plotter_ && plotter_->isConnected())
             plotter_->plotTrajectory(trajectory, *env_->getStateSolver());
 
@@ -166,14 +335,14 @@ namespace Vinhtesseract_examples
             std::vector<Eigen::Vector3d> ee_path;
             ee_path.reserve(trajectory.size());
             for (const auto &state : trajectory)
-            {
-                Eigen::Isometry3d tf = manip->calcFwdKin(state.position).at(ee_link_);
-                ee_path.push_back(tf.translation());
-            }
+                ee_path.push_back(
+                    tracking_manip_->calcFwdKin(state.position).at(ee_link_).translation());
             toolpath_cb_(ee_path);
         }
 
-        CONSOLE_BRIDGE_logDebug("[Tracking] Trajectory ready (%zu points)", trajectory.size());
+        CONSOLE_BRIDGE_logDebug("[Tracking] Trajectory ready: %zu pts, %.3f s horizon",
+                                trajectory.size(),
+                                trajectory.empty() ? 0.0 : trajectory.back().time);
         return true;
     }
 

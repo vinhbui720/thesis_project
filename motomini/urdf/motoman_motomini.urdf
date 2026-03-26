@@ -191,42 +191,42 @@
     <child link="link_1_s" />
     <origin rpy="0 0 0" xyz="0.0 0.0 0.103" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-2.967" upper="2.967" velocity="0.5" />
+    <limit lower="-2.9670" upper="2.9670" effort="0.12" velocity="5.4977" />
   </joint>
   <joint name="joint_2_l" type="revolute">
     <parent link="link_1_s" />
     <child link="link_2_l" />
     <origin rpy="-1.5707963267948963 0 0" xyz="0.02 0.0 0.0" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-1.4835" upper="1.5707" velocity="0.5" />
+    <limit lower="-1.4835" upper="1.5707" effort="0.12" velocity="5.4977" />
   </joint>
   <joint name="joint_3_u" type="revolute">
     <parent link="link_2_l" />
     <child link="link_3_u" />
     <origin rpy="3.1415926535897927 0 0" xyz="0.0 -0.165 0.0" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-0.8726" upper="1.5707" velocity="0.5" />
+    <limit lower="-0.8726" upper="1.5707" effort="0.12" velocity="7.3304" />
   </joint>
   <joint name="joint_4_r" type="revolute">
     <parent link="link_3_u" />
     <child link="link_4_r" />
     <origin rpy="-1.570796326794897 0 1.5707963267948966" xyz="0.165 0.0 0.0" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-2.4434" upper="2.4434" velocity="0.5" />
+    <limit lower="-2.4434" upper="2.4434" effort="0.07" velocity="10.4719" />
   </joint>
   <joint name="joint_5_b" type="revolute">
     <parent link="link_4_r" />
     <child link="link_5_b" />
     <origin rpy="1.5707963267948966 1.5707963267948966 0" xyz="0.0 0.0 0.0" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-0.5235" upper="3.6651" velocity="0.5" />
+    <limit lower="-0.5235" upper="3.6651" effort="0.07" velocity="10.4719" />
   </joint>
   <joint name="joint_6_t" type="revolute">
     <parent link="link_5_b" />
     <child link="link_6_t" />
     <origin rpy="-1.5707963267948963 0 0" xyz="0.0 0.0 0.0" />
     <axis xyz="0 0 1" />
-    <limit effort="50.0" lower="-6.2831" upper="6.2831" velocity="0.5" />
+    <limit lower="-6.2831" upper="6.2831" effort="0.07" velocity="10.4719" />
   </joint>
   <joint name="joint_6_t-tool0" type="fixed">
     <parent link="link_6_t" />

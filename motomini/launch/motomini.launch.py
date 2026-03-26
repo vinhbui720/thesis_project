@@ -314,7 +314,7 @@ def generate_launch_description():
         DeclareLaunchArgument("online_mode", default_value="false"),
         DeclareLaunchArgument("use_ompl", default_value="true"),
         DeclareLaunchArgument("tracking_mode", default_value="false"),
-        DeclareLaunchArgument("tracking_rate_hz", default_value="5.0"),
+        DeclareLaunchArgument("tracking_rate_hz", default_value="3.0"),
         *nodes,
         *control_nodes,
         *mesh_nodes

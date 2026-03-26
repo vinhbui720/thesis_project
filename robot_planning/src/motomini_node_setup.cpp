@@ -44,10 +44,19 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<bool>("debug", false);
     this->declare_parameter<bool>("use_ompl", false);
     this->declare_parameter<bool>("tracking_mode", false);
-    this->declare_parameter<double>("tracking_rate_hz", 5.0);
+    this->declare_parameter<double>("tracking_rate_hz", 30.0);
+    this->declare_parameter<bool>("tracking_use_trajopt", false);
+    this->declare_parameter<bool>("tracking_enable_collision", false);
+    this->declare_parameter<int>("tracking_num_steps", 5);
+    this->declare_parameter<int>("tracking_trajopt_max_iter", 5);
+    this->declare_parameter<double>("tracking_max_joint_step", 0.15);
+    this->declare_parameter<double>("tf_poll_rate_hz", 200.0);
+    this->declare_parameter<double>("tracking_ema_alpha", 0.6);
 
     tracking_mode_ = this->get_parameter("tracking_mode").as_bool();
     tracking_rate_hz_ = this->get_parameter("tracking_rate_hz").as_double();
+    tf_poll_rate_hz_ = this->get_parameter("tf_poll_rate_hz").as_double();
+    tracking_ema_alpha_ = this->get_parameter("tracking_ema_alpha").as_double();
     bool online_mode = this->get_parameter("online_mode").as_bool();
     bool debug = this->get_parameter("debug").as_bool();
     bool use_ompl = this->get_parameter("use_ompl").as_bool();
@@ -69,7 +78,12 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         env_, plotter_,
         manipulator_group, base_link, ee_link,
         debug, /*ifopt=*/true, use_ompl, online_mode);
-
+    planner_->configureTracking(
+        this->get_parameter("tracking_use_trajopt").as_bool(),
+        this->get_parameter("tracking_enable_collision").as_bool(),
+        this->get_parameter("tracking_num_steps").as_int(),
+        this->get_parameter("tracking_trajopt_max_iter").as_int(),
+        this->get_parameter("tracking_max_joint_step").as_double());
     // ---- Subscribers ----
     sub_joint_states_ = this->create_subscription<sensor_msgs::msg::JointState>(
         "/joint_states", 10,
@@ -94,6 +108,8 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     // ---- Publishers ----
     pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
     pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
+    pub_tracked_pose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+        "/motomini/tracked_tip_pose", 10);
     pub_online_cmd_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
         "/motomini/online_joint_command", 100);
 
@@ -166,7 +182,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // ---- Tracking timer ----
+    // ---- Tracking timer + TF poll thread ----
     if (tracking_mode_)
     {
         const double hz = std::max(0.1, tracking_rate_hz_);
@@ -176,9 +192,14 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
             period,
             std::bind(&MotoMiniPlanningNode::trackingTick, this));
 
+        // Start dedicated TF polling thread (decoupled from planning tick)
+        startTfPolling();
+
         RCLCPP_INFO(this->get_logger(),
-                    "Tracking mode enabled: %.2f Hz, world='%s', base='%s', tip='%s'",
-                    hz,
+                    "Tracking mode enabled: planner=%.0f Hz, TF poll=%.0f Hz, EMA alpha=%.2f",
+                    hz, tf_poll_rate_hz_, tracking_ema_alpha_);
+        RCLCPP_INFO(this->get_logger(),
+                    "  world='%s', base='%s', tip='%s'",
                     tracking_world_frame_.c_str(),
                     tracking_gantry_base_frame_.c_str(),
                     tracking_tip_frame_.c_str());
@@ -187,6 +208,14 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready.");
     RCLCPP_INFO(this->get_logger(),
                 "Topics: /joint_states, /target_poses, /clear_targets, /start, /tracking_control");
+}
+
+// ---------------------------------------------------------------------------
+// Destructor — clean up TF poll thread
+// ---------------------------------------------------------------------------
+MotoMiniPlanningNode::~MotoMiniPlanningNode()
+{
+    stopTfPolling();
 }
 
 // ---------------------------------------------------------------------------

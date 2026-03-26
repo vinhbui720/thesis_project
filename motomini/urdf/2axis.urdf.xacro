@@ -41,11 +41,19 @@
   </link>
   <link name='working_tip'>
     <visual>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 3.14 0.0" />
+      <geometry>
+        <mesh
+          filename="package://motomini/meshes/gantry/gantry-tool.stl"
+          scale="0.001 0.001 0.001" />
+      </geometry>
+    </visual>
+    <!-- <visual>
       <origin xyz="0.0 0.0 -0.025" rpy="0.0 0.0 3.14" />
       <geometry>
         <box size="0.01 0.01 0.05" />
       </geometry>
-    </visual>
+    </visual> -->
   </link>
   <!-- Joint 1: Prismatic movement along the X-axis (1 0 0) -->
   <!-- Limits: -0.28 meters (-280mm) to 0.0 meters -->
@@ -90,9 +98,11 @@
   <!-- A thin cylinder acting as a "line" pointing in the Y direction -->
   <link name="gantry_tool_link">
     <visual>
-      <origin xyz="0 -0.03 0.0" rpy="0 0 0" />
+      <origin xyz="0 -0.07 0.0" rpy="0 0 3.14" />
       <geometry>
-        <box size="0.02 0.1 0.01" />
+        <mesh
+          filename="package://motomini/meshes/gantry/gantry-hand.stl"
+          scale="0.001 0.001 0.001" />
       </geometry>
       <material name="red">
         <color rgba="1 0 0 1" />
@@ -108,7 +118,8 @@
   <joint name="working_tip_tool" type="fixed">
     <parent link="gantry_tool_link" />
     <child link="working_tip" />
-    <origin xyz="0.0 -0.07 0.05" rpy="0.0 0.0 0.0" />
+    <origin xyz="0.0 -0.1451 0.05" rpy="0.0 0.0 3.14" />
+    <!-- <origin xyz="0.0 -0.1451 0.133" rpy="0.0 0.0 3.14" /> -->
 
   </joint>
   <!-- Fixed joint attaching the tool to the bottom of the Z-shaft -->

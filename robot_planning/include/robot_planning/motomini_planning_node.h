@@ -29,6 +29,7 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -47,14 +48,18 @@
 #include <Eigen/Geometry>
 
 // STL
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 class MotoMiniPlanningNode : public rclcpp::Node
 {
 public:
     MotoMiniPlanningNode();
+    ~MotoMiniPlanningNode();
     void postInit();
 
 private:
@@ -84,6 +89,7 @@ private:
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_trajectory_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_online_cmd_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_ee_path_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_tracked_pose_;
 
     // ---- Timers ----
     rclcpp::TimerBase::SharedPtr monitor_timer_;
@@ -113,9 +119,15 @@ private:
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
+    // TF polling thread — fast, continuous pose caching
+    std::thread tf_poll_thread_;
+    std::atomic<bool> tf_poll_running_{false};
+    mutable std::mutex tip_pose_mutex_;
     Eigen::Isometry3d latest_working_tip_world_{Eigen::Isometry3d::Identity()};
     Eigen::Isometry3d initial_robot_pose_{Eigen::Isometry3d::Identity()};
     bool tracking_pose_initialized_{false};
+    double tf_poll_rate_hz_{200.0};
+    double tracking_ema_alpha_{0.6};
 
     // ---- Private Methods ----
 
@@ -123,7 +135,10 @@ private:
     bool initializeEnvironment();
 
     // Tracking (motomini_node_tracking.cpp)
-    bool updateWorkingTipPoseFromTfAndJoints();
+    void tfPollLoop(); // runs in tf_poll_thread_
+    void startTfPolling();
+    void stopTfPolling();
+    Eigen::Isometry3d getLatestTipPose() const;
     void trackingTick();
 
     // Callbacks (motomini_node_callbacks.cpp)
@@ -138,7 +153,8 @@ private:
     // Publish helpers (motomini_node_publish.cpp)
     void publishStatus(const std::string &status);
     void publishTrajectory(const tesseract_common::JointTrajectory &tess_traj,
-                           const std::vector<std::string> &joint_names);
+                           const std::vector<std::string> &joint_names,
+                           double start_delay_sec = 0.10);
     void publishTrackingTrajectory(const tesseract_common::JointTrajectory &tess_traj,
                                    const std::vector<std::string> &joint_names);
 };
