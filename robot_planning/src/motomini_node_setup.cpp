@@ -199,17 +199,18 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // ---- Tracking timer + TF poll thread (always active; mode switched at runtime) ----
+    // ---- Tracking timer + TF poll thread + Joint state poll thread (always active; mode switched at runtime) ----
     {
         const double hz = std::max(0.1, tracking_rate_hz_);
         const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / hz));
         tracking_timer_ = this->create_wall_timer(
             period, std::bind(&MotoMiniPlanningNode::trackingTick, this));
         startTfPolling();
+        startJointStatePolling();
         RCLCPP_INFO(this->get_logger(),
-                    "Tracking ready: %.0f Hz planner, %.0f Hz TF poll, EMA=%.2f — "
+                    "Tracking ready: %.0f Hz planner, %.0f Hz TF poll, %.0f Hz joint poll, EMA=%.2f — "
                     "publish /tracking_control true to activate",
-                    hz, tf_poll_rate_hz_, tracking_ema_alpha_);
+                    hz, tf_poll_rate_hz_, joint_state_poll_rate_hz_, tracking_ema_alpha_);
     }
 
     RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready.");
@@ -218,11 +219,12 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 }
 
 // ---------------------------------------------------------------------------
-// Destructor — clean up TF poll thread
+// Destructor — clean up TF poll thread and joint state poll thread
 // ---------------------------------------------------------------------------
 MotoMiniPlanningNode::~MotoMiniPlanningNode()
 {
     stopTfPolling();
+    stopJointStatePolling();
 }
 
 // ---------------------------------------------------------------------------

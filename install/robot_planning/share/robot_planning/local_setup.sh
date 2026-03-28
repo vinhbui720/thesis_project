@@ -1,1 +1,0 @@
-/home/vinbui/vinh_ws/src/thesis_project/build/robot_planning/ament_cmake_environment_hooks/local_setup.sh

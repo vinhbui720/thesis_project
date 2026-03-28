@@ -29,10 +29,10 @@ void MotoMiniPlanningNode::publishStatus(const std::string &status)
 
 // ---------------------------------------------------------------------------
 // publishTrackingTrajectory
-//   Strips the leading current-state point from a two-point trajectory and
-//   sends only the forward target to the controller.  Sending [current, target]
-//   every tick caused the controller to restart each time from 'current',
-//   producing the back-step / forward-step jerk pattern.
+//   Publishes the full trajectory including the current-state point at t=0.
+//   The motoman controller validates that trajectories start at the current position,
+//   so we must include the first point. The controller will handle motion smoothly
+//   from this baseline.
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::publishTrackingTrajectory(
     const tesseract_common::JointTrajectory &tess_traj,
@@ -44,37 +44,41 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
     const double tracking_period = 1.0 / std::max(0.1, tracking_rate_hz_);
     const double min_step_dt = std::clamp(0.25 * tracking_period, 0.001, 0.02);
     const double start_delay = std::clamp(0.10 * tracking_period, 0.001, 0.005);
-    const double max_horizon = std::max(min_step_dt, 0.95 * tracking_period - start_delay);
+    // Expand horizon for tracking: allow longer trajectory (up to 1 second)
+    const double max_horizon = std::min(1.0, std::max(min_step_dt, 0.95 * tracking_period - start_delay));
 
-    if (tess_traj.size() <= 1)
-    {
-        publishTrajectory(tess_traj, joint_names, start_delay, min_step_dt);
-        return;
-    }
+    // Use full trajectory to give controller more lookahead
+    // This prevents the "too short" trajectory issue
+    tesseract_common::JointTrajectory forward(tess_traj);
 
-    tesseract_common::JointTrajectory forward(tess_traj.begin() + 1, tess_traj.end());
+    // Ensure first point (current state) has zero velocity and acceleration
+    forward.front().velocity.setZero();
+    forward.front().acceleration.setZero();
 
     // Re-base time so the first published point starts at t=0
     const double t_offset = forward.front().time;
     for (auto &state : forward)
         state.time = std::max(0.0, state.time - t_offset);
 
+    // Extend trajectory to use full horizon (don't compress!)
     const double current_horizon = forward.back().time;
-    if (current_horizon > max_horizon && current_horizon > 1e-6)
+    if (current_horizon > 1e-6 && current_horizon < max_horizon * 0.5)
     {
-        const double scale = max_horizon / current_horizon;
+        // Trajectory is too short - expand it by scaling time
+        const double scale = max_horizon * 0.7 / current_horizon;
         for (auto &state : forward)
         {
             state.time *= scale;
+            // Velocity scales inversely with time (distance/time)
             for (Eigen::Index i = 0; i < state.velocity.size(); ++i)
                 state.velocity[i] /= scale;
+            // Acceleration scales inversely with time squared
             for (Eigen::Index i = 0; i < state.acceleration.size(); ++i)
                 state.acceleration[i] /= (scale * scale);
         }
     }
 
     // === ENFORCE VELOCITY LIMITS ===
-    // Get velocity limits from the planner's kinematic group
     const Eigen::MatrixX2d vel_limits = planner_->getTrackingVelocityLimits();
     if (vel_limits.rows() > 0)
     {
@@ -84,10 +88,24 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
             {
                 const double max_vel = vel_limits(i, 1);
                 const double min_vel = vel_limits(i, 0);
-                // Clamp to [-max_abs, +max_abs]
                 const double abs_max = std::max(std::abs(min_vel), std::abs(max_vel));
                 state.velocity[i] = std::clamp(state.velocity[i], -abs_max, abs_max);
             }
+        }
+    }
+
+    // === ACCELERATION CLAMPING (no velocity continuity enforcement) ===
+    // ISP already produces kinematically feasible trajectories with proper velocities.
+    // Just clamp unrealistic accelerations without further degrading velocities.
+    const double max_acceleration = 12.0; // rad/s^2 — allow dynamic tracking
+
+    for (size_t i = 0; i < forward.size(); ++i)
+    {
+        for (Eigen::Index j = 0; j < forward[i].acceleration.size(); ++j)
+        {
+            // Only clamp acceleration, don't reduce velocities
+            forward[i].acceleration[j] = std::clamp(forward[i].acceleration[j],
+                                                    -max_acceleration, max_acceleration);
         }
     }
 

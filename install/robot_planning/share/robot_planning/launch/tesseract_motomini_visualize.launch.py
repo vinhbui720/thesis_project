@@ -1,1 +1,0 @@
-/home/vinbui/vinh_ws/src/thesis_project/robot_planning/launch/tesseract_motomini_visualize.launch.py

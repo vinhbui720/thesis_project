@@ -18,7 +18,8 @@ def generate_launch_description():
     online_mode = LaunchConfiguration("online_mode")
     use_ompl = LaunchConfiguration("use_ompl")
     tracking_rate_hz = LaunchConfiguration("tracking_rate_hz")
-
+    planning_chunk_size = LaunchConfiguration("planning_chunk_size")
+    planning_parallel_chunks = LaunchConfiguration("planning_parallel_chunks")
     gantry_mode_tesser = IfCondition(PythonExpression(["'", gantry_mode, "' == 'tesser'"]))
     gantry_mode_loop = IfCondition(PythonExpression(["'", gantry_mode, "' == 'loop'"]))
     gantry_mode_gui = IfCondition(PythonExpression(["'", gantry_mode, "' == 'gui'"]))
@@ -67,6 +68,8 @@ def generate_launch_description():
                 "debug": debug,
                 "use_ompl": use_ompl,
                 "tracking_rate_hz": tracking_rate_hz,
+                "planning_chunk_size": planning_chunk_size,        
+                "planning_parallel_chunks": planning_parallel_chunks, 
             }],
             output="screen"
         ),
@@ -311,6 +314,8 @@ def generate_launch_description():
         DeclareLaunchArgument("online_mode", default_value="false"),
         DeclareLaunchArgument("use_ompl", default_value="true"),
         DeclareLaunchArgument("tracking_rate_hz", default_value="3.0"),
+        DeclareLaunchArgument("planning_chunk_size", default_value="5"),
+        DeclareLaunchArgument("planning_parallel_chunks", default_value="2"),
         *nodes,
         *control_nodes,
         *mesh_nodes

@@ -109,8 +109,8 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
     // ---- Tracking ----
-    bool tracking_enabled_{false}; // runtime switch: true = follow TF, false = planning mode
-    double tracking_rate_hz_{30.0};
+    bool tracking_enabled_{false};  // runtime switch: true = follow TF, false = planning mode
+    double tracking_rate_hz_{50.0}; // Increased from 30 Hz to 50 Hz for faster replanning cycles
     std::string tracking_world_frame_{"world"};
     std::string tracking_gantry_base_frame_{"gantry_base_link"};
     std::string tracking_tip_frame_{"working_tip"};
@@ -127,6 +127,25 @@ private:
     double tf_poll_rate_hz_{200.0};
     double tracking_ema_alpha_{0.6};
 
+    // Joint state polling thread — fast, continuous joint state caching
+    std::thread joint_state_poll_thread_;
+    std::atomic<bool> joint_state_poll_running_{false};
+    mutable std::mutex joint_state_poll_mutex_;
+    sensor_msgs::msg::JointState latest_polled_joint_state_;
+    bool joint_state_poll_initialized_{false};
+    double joint_state_poll_rate_hz_{100.0}; // 100 Hz polling for responsive joint state
+
+    // Tracking trajectory throttling — prevents controller splicing errors
+    rclcpp::Time last_tracking_publish_time_{0, 0, RCL_ROS_TIME};
+    double tracking_publish_throttle_sec_{0.025}; // Reduced from 0.05s to 0.025s (~40 Hz) for continuous real-time tracking
+    Eigen::Isometry3d last_published_target_{Eigen::Isometry3d::Identity()};
+    double tracking_position_threshold_m_{0.002}; // Reduced from 0.005m to 0.002m (2mm) for very responsive tracking
+
+    // Continuous tracking — detect trajectory completion
+    std::vector<double> last_trajectory_end_state_; // Joint positions at end of last published trajectory
+    double trajectory_completion_tolerance_{0.15};  // Increased from 0.1 to 0.15 rad (~8.6 deg) for relaxed completion detection
+    bool last_trajectory_completed_{true};          // Flag to check if trajectory has been reached
+
     // ---- Private Methods ----
 
     // Setup
@@ -137,6 +156,12 @@ private:
     void startTfPolling();
     void stopTfPolling();
     Eigen::Isometry3d getLatestTipPose() const;
+
+    void jointStatePollLoop(); // runs in joint_state_poll_thread_
+    void startJointStatePolling();
+    void stopJointStatePolling();
+    sensor_msgs::msg::JointState getLatestJointState() const;
+
     void trackingTick();
 
     // Callbacks (motomini_node_callbacks.cpp)

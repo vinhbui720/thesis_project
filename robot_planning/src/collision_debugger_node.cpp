@@ -162,11 +162,10 @@ private:
 
                     // --- FIX: Format the text to exact user specification ---
                     char text_buffer[256];
-                    snprintf(text_buffer, sizeof(text_buffer), "%s<->%s",
+                    snprintf(text_buffer, sizeof(text_buffer), "%s <-> %s\n(%.2f cm)",
                              result.link_names[0].c_str(),
-                             result.distance * 100.0,
-                             result.distance * 100.0,
-                             result.link_names[1].c_str());
+                             result.link_names[1].c_str(),
+                             result.distance * 100.0);
 
                     text_marker.text = text_buffer;
 

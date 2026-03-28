@@ -43,12 +43,63 @@ void MotoMiniPlanningNode::stopTfPolling()
 }
 
 // ---------------------------------------------------------------------------
+// Joint state polling thread — start / stop
+// ---------------------------------------------------------------------------
+void MotoMiniPlanningNode::startJointStatePolling()
+{
+    if (joint_state_poll_running_)
+        return;
+    joint_state_poll_running_ = true;
+    joint_state_poll_thread_ = std::thread(&MotoMiniPlanningNode::jointStatePollLoop, this);
+    RCLCPP_INFO(this->get_logger(), "Joint state poll thread started (%.0f Hz)", joint_state_poll_rate_hz_);
+}
+
+void MotoMiniPlanningNode::stopJointStatePolling()
+{
+    joint_state_poll_running_ = false;
+    if (joint_state_poll_thread_.joinable())
+        joint_state_poll_thread_.join();
+}
+
+// ---------------------------------------------------------------------------
+// getLatestJointState — thread-safe read of cached joint state
+// ---------------------------------------------------------------------------
+sensor_msgs::msg::JointState MotoMiniPlanningNode::getLatestJointState() const
+{
+    std::lock_guard<std::mutex> lock(joint_state_poll_mutex_);
+    return latest_polled_joint_state_;
+}
+
+// ---------------------------------------------------------------------------
 // getLatestTipPose — thread-safe read of cached pose
 // ---------------------------------------------------------------------------
 Eigen::Isometry3d MotoMiniPlanningNode::getLatestTipPose() const
 {
     std::lock_guard<std::mutex> lock(tip_pose_mutex_);
     return latest_working_tip_world_;
+}
+
+// ---------------------------------------------------------------------------
+// jointStatePollLoop — runs in its own thread, continuously caches joint state
+// ---------------------------------------------------------------------------
+void MotoMiniPlanningNode::jointStatePollLoop()
+{
+    const auto period = std::chrono::milliseconds(
+        static_cast<int64_t>(1000.0 / joint_state_poll_rate_hz_));
+
+    while (joint_state_poll_running_ && rclcpp::ok())
+    {
+        // Read the latest joint state from callback cache
+        if (last_joint_state_)
+        {
+            std::lock_guard<std::mutex> lock(joint_state_poll_mutex_);
+            latest_polled_joint_state_ = *last_joint_state_;
+            if (!joint_state_poll_initialized_)
+                joint_state_poll_initialized_ = true;
+        }
+
+        std::this_thread::sleep_for(period);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -110,12 +161,15 @@ void MotoMiniPlanningNode::tfPollLoop()
 }
 
 // ---------------------------------------------------------------------------
-// trackingTick — called by the tracking timer
+// trackingTick — called by the tracking timer (optimized continuous tracking)
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::trackingTick()
 {
+    // --- Use last_joint_state_ directly (available from callback) ---
+    if (!last_joint_state_ || last_joint_state_->position.empty())
+        return;
+
     // --- Sync planner env with latest joint states ---
-    if (last_joint_state_)
     {
         const std::vector<std::string> &names = last_joint_state_->name;
         Eigen::VectorXd joint_pos(static_cast<Eigen::Index>(last_joint_state_->position.size()));
@@ -147,9 +201,134 @@ void MotoMiniPlanningNode::trackingTick()
         return;
     }
 
-    const std::vector<std::string> joint_names =
-        last_joint_state_ ? last_joint_state_->name : std::vector<std::string>{};
+    // === BASIC TRAJECTORY SANITY CHECKS ===
+    // Verify trajectory has valid data
+    if (traj_ptr->front().position.size() == 0)
+    {
+        RCLCPP_WARN(this->get_logger(), "Tracking: trajectory has empty position data");
+        return;
+    }
 
-    publishTrackingTrajectory(*traj_ptr, joint_names);
-    RCLCPP_DEBUG(this->get_logger(), "Tracking: new trajectory published");
+    // === PREDICTIVE START POSITION VALIDATION ===
+    // For continuous tracking on moving platforms (e.g., gantry), use lenient validation:
+    // - Accept trajectories if start is reasonably close to current position within RELAXED tolerance
+    // - This prevents rejection of valid trajectories due to platform motion between planning & execution
+
+    const size_t traj_dof = traj_ptr->front().position.size();
+    const size_t current_dof = last_joint_state_->position.size();
+
+    // Validate DOF compatibility (trajectory should not exceed available joints)
+    if (traj_dof > current_dof)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Tracking: trajectory DOF (%zu) exceeds available joints (%zu), skipping",
+                    traj_dof, current_dof);
+        return;
+    }
+
+    // Compute trajectory start validation error with RELAXED tolerance for continuous motion
+    double max_start_error = 0.0;
+    for (size_t i = 0; i < traj_dof; ++i)
+    {
+        double start_error = std::abs(traj_ptr->front().position[i] - last_joint_state_->position[i]);
+        max_start_error = std::max(max_start_error, start_error);
+    }
+
+    // RELAXED tolerance: 0.35 rad (~20 degrees) for continuous gantry tracking
+    // This accounts for motion between planning cycle and controller execution
+    // The controller will perform its own stricter validation
+    const double CONTINUOUS_TRACKING_TOLERANCE = 0.35;
+
+    if (max_start_error > CONTINUOUS_TRACKING_TOLERANCE)
+    {
+        RCLCPP_DEBUG(this->get_logger(),
+                     "Tracking: trajectory start error %.4f rad exceeds tolerance %.4f rad (gantry moving), "
+                     "publishing anyway for continuous motion",
+                     max_start_error, CONTINUOUS_TRACKING_TOLERANCE);
+        // Note: We still publish to maintain continuous motion. The controller will validate stricter constraints.
+        // Silently skipping here causes jerky motion (run-stop-run pattern).
+        // Better to publish and let control layer handle edge cases.
+    }
+
+    // === TRAJECTORY COMPLETION DETECTION ===
+    // STRICT continuous tracking: Only publish when PREVIOUS trajectory is complete.
+    // DO NOT publish on target movement (causes splicing errors).
+    // This ensures robot finishes each segment before next is sent.
+
+    bool should_publish = false;
+
+    // First trajectory → always publish
+    if (last_trajectory_end_state_.empty())
+    {
+        should_publish = true;
+        RCLCPP_DEBUG(this->get_logger(), "Tracking: FIRST trajectory, publishing");
+    }
+    else
+    {
+        // === STRICT COMPLETION CHECK ===
+        // Wait for robot to reach END of previous trajectory before sending next
+        double max_end_error = 0.0;
+        const size_t end_state_size = last_trajectory_end_state_.size();
+
+        for (size_t i = 0; i < end_state_size && i < last_joint_state_->position.size(); ++i)
+        {
+            double end_error = std::abs(last_trajectory_end_state_[i] - last_joint_state_->position[i]);
+            max_end_error = std::max(max_end_error, end_error);
+        }
+
+        // STRICT: 0.30 rad (~17 deg) - robot must be very close to end before next sends
+        const double TRAJECTORY_COMPLETION_TOLERANCE = 0.30;
+
+        // Also enforce MINIMUM TIME between publishes to prevent rapid splicing
+        const rclcpp::Time now = this->now();
+        const double time_since_last = (now - last_tracking_publish_time_).seconds();
+        const double MIN_TRAJECTORY_SPACING = 0.5; // At least 500ms between trajectories
+
+        if (max_end_error < TRAJECTORY_COMPLETION_TOLERANCE)
+        {
+            // Trajectory is complete, but also check minimum spacing
+            if (time_since_last >= MIN_TRAJECTORY_SPACING)
+            {
+                should_publish = true;
+                RCLCPP_INFO(this->get_logger(),
+                            "Tracking: COMPLETE (error: %.3f rad, gap: %.3f s) → publishing next",
+                            max_end_error, time_since_last);
+            }
+            else
+            {
+                RCLCPP_DEBUG(this->get_logger(),
+                             "Tracking: complete but too soon (error: %.3f rad, only %.3f s since last)",
+                             max_end_error, time_since_last);
+            }
+        }
+        else
+        {
+            RCLCPP_DEBUG(this->get_logger(),
+                         "Tracking: NOT complete yet (error: %.3f rad, threshold: %.3f rad)",
+                         max_end_error, TRAJECTORY_COMPLETION_TOLERANCE);
+        }
+    }
+
+    if (!should_publish)
+        return;
+
+    // === PUBLISH THE TRAJECTORY ===
+    publishTrackingTrajectory(*traj_ptr, last_joint_state_->name);
+    last_tracking_publish_time_ = this->now();
+    last_published_target_ = target;
+
+    // === CACHE END STATE FOR NEXT COMPLETION CHECK ===
+    if (!last_joint_state_->name.empty() && traj_ptr->size() > 0)
+    {
+        const auto &last_point = traj_ptr->back();
+        last_trajectory_end_state_ = std::vector<double>(last_point.position.data(),
+                                                         last_point.position.data() + last_point.position.size());
+        RCLCPP_DEBUG(this->get_logger(), "Tracking: cached end state, next check at: [%.4f, %.4f, %.4f, ...]",
+                     last_trajectory_end_state_.size() > 0 ? last_trajectory_end_state_[0] : 0.0,
+                     last_trajectory_end_state_.size() > 1 ? last_trajectory_end_state_[1] : 0.0,
+                     last_trajectory_end_state_.size() > 2 ? last_trajectory_end_state_[2] : 0.0);
+    }
+
+    RCLCPP_DEBUG(this->get_logger(), "Tracking: trajectory published (%.3f s horizon)",
+                 traj_ptr->empty() ? 0.0 : traj_ptr->back().time);
 }

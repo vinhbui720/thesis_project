@@ -369,11 +369,16 @@ namespace Vinhtesseract_examples
                 const double dt = trajectory[i].time - trajectory[i - 1].time;
                 if (dt > 1e-6)
                 {
-                    trajectory[i].velocity.resize(n_dof);
-                    for (int j = 0; j < n_dof; ++j)
+                    // Safely compute and assign velocities
+                    const int pos_size = static_cast<int>(trajectory[i].position.size());
+                    if (pos_size == n_dof)
                     {
-                        trajectory[i].velocity[j] =
-                            (trajectory[i].position[j] - trajectory[i - 1].position[j]) / dt;
+                        Eigen::VectorXd vel = Eigen::VectorXd::Zero(n_dof);
+                        for (int j = 0; j < n_dof; ++j)
+                        {
+                            vel[j] = (trajectory[i].position[j] - trajectory[i - 1].position[j]) / dt;
+                        }
+                        trajectory[i].velocity = vel;
                     }
                 }
             }
@@ -384,19 +389,39 @@ namespace Vinhtesseract_examples
         // Clamp all velocities to URDF limits
         for (auto &state : trajectory)
         {
-            if (state.velocity.size() != n_dof)
-                state.velocity.resize(n_dof);
+            // Ensure velocity data exists and is sized correctly
+            const int vel_size = static_cast<int>(state.velocity.size());
+            if (vel_size != n_dof)
+            {
+                if (vel_size > 0)
+                {
+                    // Resize to n_dof with zero-padding
+                    Eigen::VectorXd temp = Eigen::VectorXd::Zero(n_dof);
+                    const int copy_size = (vel_size < n_dof) ? vel_size : n_dof;
+                    for (int i = 0; i < copy_size; ++i)
+                        temp[i] = state.velocity[i];
+                    state.velocity = temp;
+                }
+                else
+                {
+                    state.velocity = Eigen::VectorXd::Zero(n_dof);
+                }
+            }
 
             for (int j = 0; j < n_dof; ++j)
             {
+                if (j >= static_cast<int>(state.velocity.size()))
+                    break;
+
                 const double vel_min = tracking_velocity_limits_(j, 0);
                 const double vel_max = tracking_velocity_limits_(j, 1);
                 state.velocity[j] = std::clamp(state.velocity[j], vel_min, vel_max);
             }
         }
 
-        CONSOLE_BRIDGE_logDebug("[Tracking] Velocity enforcement complete: %zu pts with velocities",
-                                trajectory.size());
+        // DEBUG SUPPRESSED: Velocity enforcement debug spam removed
+        // CONSOLE_BRIDGE_logDebug("[Tracking] Velocity enforcement complete: %zu pts with velocities",
+        //                         trajectory.size());
 
         // ---- Persist state for next tick ----
         last_tracking_command_ = target_joints;
@@ -417,9 +442,10 @@ namespace Vinhtesseract_examples
             toolpath_cb_(ee_path);
         }
 
-        CONSOLE_BRIDGE_logDebug("[Tracking] Trajectory ready: %zu pts, %.3f s horizon",
-                                trajectory.size(),
-                                trajectory.empty() ? 0.0 : trajectory.back().time);
+        // DEBUG SUPPRESSED: Trajectory ready debug spam removed
+        // CONSOLE_BRIDGE_logDebug("[Tracking] Trajectory ready: %zu pts, %.3f s horizon",
+        //                         trajectory.size(),
+        //                         trajectory.empty() ? 0.0 : trajectory.back().time);
         return true;
     }
 
