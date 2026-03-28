@@ -89,6 +89,6 @@ def generate_launch_description():
         ),
 
         rsp_node,
-        jsp_gui_node,  
+        # jsp_gui_node,  
         rviz_node,
     ])

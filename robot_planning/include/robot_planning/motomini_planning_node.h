@@ -109,9 +109,8 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
     // ---- Tracking ----
-    bool tracking_mode_{false};
-    bool tracking_enabled_{false};
-    double tracking_rate_hz_{5.0};
+    bool tracking_enabled_{false}; // runtime switch: true = follow TF, false = planning mode
+    double tracking_rate_hz_{30.0};
     std::string tracking_world_frame_{"world"};
     std::string tracking_gantry_base_frame_{"gantry_base_link"};
     std::string tracking_tip_frame_{"working_tip"};
@@ -124,7 +123,6 @@ private:
     std::atomic<bool> tf_poll_running_{false};
     mutable std::mutex tip_pose_mutex_;
     Eigen::Isometry3d latest_working_tip_world_{Eigen::Isometry3d::Identity()};
-    Eigen::Isometry3d initial_robot_pose_{Eigen::Isometry3d::Identity()};
     bool tracking_pose_initialized_{false};
     double tf_poll_rate_hz_{200.0};
     double tracking_ema_alpha_{0.6};
@@ -154,7 +152,8 @@ private:
     void publishStatus(const std::string &status);
     void publishTrajectory(const tesseract_common::JointTrajectory &tess_traj,
                            const std::vector<std::string> &joint_names,
-                           double start_delay_sec = 0.10);
+                           double start_delay_sec = 0.10,
+                           double min_step_dt_sec = 0.02);
     void publishTrackingTrajectory(const tesseract_common::JointTrajectory &tess_traj,
                                    const std::vector<std::string> &joint_names);
 };

@@ -70,8 +70,14 @@ namespace Vinhtesseract_examples
         }
         void updateEnvironmentState(const std::vector<std::string> &joint_names, const Eigen::VectorXd &joint_pos);
         using ToolpathCallback = std::function<void(const std::vector<Eigen::Vector3d> &)>;
+        // Called for every completed chunk: (chunk_trajectory, joint_names, is_last_chunk)
+        using ChunkReadyCallback = std::function<void(
+            const tesseract_common::JointTrajectory &,
+            const std::vector<std::string> &,
+            bool)>;
 
         void setToolpathCallback(ToolpathCallback cb);
+        void setChunkReadyCallback(ChunkReadyCallback cb) { chunk_ready_cb_ = std::move(cb); }
 
         // Lightweight tracking planner (collision check only, no optimization yet)
         bool runTrackingPlanner(const Eigen::Isometry3d &target_pose);
@@ -80,6 +86,19 @@ namespace Vinhtesseract_examples
         void configureTracking(bool use_trajopt, bool enable_collision,
                                int num_steps, int trajopt_max_iter,
                                double max_joint_step);
+
+        // Configure offline chunked planning
+        void configureChunking(int chunk_size, int parallel_chunks)
+        {
+            chunk_size_ = std::max(1, chunk_size);
+            parallel_chunks_ = std::max(1, parallel_chunks);
+        }
+
+        // Get velocity limits for validation
+        Eigen::MatrixX2d getTrackingVelocityLimits() const
+        {
+            return tracking_velocity_limits_;
+        }
 
     private:
         std::string manipulator_group_;
@@ -97,8 +116,12 @@ namespace Vinhtesseract_examples
         CommandCallback command_cb_;
         mutable std::shared_mutex env_mutex_;
         ToolpathCallback toolpath_cb_;
+        ChunkReadyCallback chunk_ready_cb_;
         Eigen::VectorXd last_tracking_command_;
         bool has_last_tracking_command_{false};
+        // --- Offline chunked planning ---
+        int chunk_size_{20};     // waypoints per TrajOpt solve
+        int parallel_chunks_{2}; // max chunks in flight simultaneously
         // --- Tracking TrajOpt configuration ---
         bool tracking_use_trajopt_{true};       // TrajOpt smoothing + optional collision
         bool tracking_enable_collision_{false}; // collision avoidance (slower)

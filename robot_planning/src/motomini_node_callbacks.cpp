@@ -89,11 +89,11 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
     if (!msg->data)
         return;
 
-    if (tracking_mode_)
+    if (tracking_enabled_)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Tracking mode is active. Use /tracking_control instead.");
-        publishStatus("Tracking mode active: use /tracking_control");
+                    "Tracking is active. Send /tracking_control false first.");
+        publishStatus("Failed: Tracking active");
         return;
     }
 
@@ -148,9 +148,8 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
         auto traj_ptr = planner_->getTrajectory();
         if (traj_ptr && !traj_ptr->empty())
         {
-            publishTrajectory(*traj_ptr, last_joint_state_->name);
-
-            // Setup execution monitor
+            // Chunks were already streamed to the controller via chunk_ready_cb_ during run().
+            // Set up execution monitor from the full stitched trajectory.
             target_joint_names_ = last_joint_state_->name;
             Eigen::VectorXd final_pos = traj_ptr->back().position;
             final_joint_target_.assign(final_pos.data(), final_pos.data() + final_pos.size());
@@ -161,7 +160,7 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
             bool online_mode = this->get_parameter("online_mode").as_bool();
             publishStatus(online_mode ? "Optimization Success. Executing ONLINE..."
                                       : "Optimization Success. Executing STATIC...");
-            RCLCPP_INFO(this->get_logger(), "Trajectory dispatched. Monitoring joints...");
+            RCLCPP_INFO(this->get_logger(), "All chunks dispatched. Monitoring joints...");
         }
         else
         {
@@ -175,28 +174,26 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
 }
 
 // ---------------------------------------------------------------------------
-// trackingControlCallback — enable / disable the tracking tick
+// trackingControlCallback — runtime mode switch: true = tracking, false = planning
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::trackingControlCallback(
     const std_msgs::msg::Bool::SharedPtr msg)
 {
-    if (!tracking_mode_)
-    {
-        RCLCPP_WARN(this->get_logger(),
-                    "Tracking mode is not enabled. This topic has no effect.");
-        return;
-    }
-
     tracking_enabled_ = msg->data;
     if (msg->data)
     {
-        RCLCPP_INFO(this->get_logger(), "Tracking ENABLED");
-        publishStatus("Tracking ENABLED");
+        // Reset TF pose cache so tracking re-locks onto the current tip position.
+        {
+            std::lock_guard<std::mutex> lock(tip_pose_mutex_);
+            tracking_pose_initialized_ = false;
+        }
+        RCLCPP_INFO(this->get_logger(), "Mode → TRACKING");
+        publishStatus("Mode: Tracking");
     }
     else
     {
-        RCLCPP_INFO(this->get_logger(), "Tracking DISABLED, returning to initial pose");
-        publishStatus("Tracking DISABLED");
+        RCLCPP_INFO(this->get_logger(), "Mode → PLANNING (use /target_poses + /start)");
+        publishStatus("Mode: Planning");
     }
 }
 

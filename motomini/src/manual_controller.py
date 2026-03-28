@@ -50,6 +50,7 @@ class MasterDebugNode(Node):
         self.pub_targets = self.create_publisher(PoseArray,"/target_poses",10)
         self.pub_start = self.create_publisher(Bool,"/start",10)
         self.pub_clear = self.create_publisher(Bool,"/clear_targets",10)
+        self.pub_tracking_control = self.create_publisher(Bool,"/tracking_control",10)
 
         self.pub_gantry_targets = self.create_publisher(PoseArray,"/gantry/target_poses",10)
         self.pub_gantry_start = self.create_publisher(Bool,"/gantry/start",10)
@@ -172,6 +173,8 @@ class PlanningTab(QWidget):
         for row,(label,key,mn,mx,val) in enumerate(fields):
             grid.addWidget(QLabel(label),row,0)
             sb=QDoubleSpinBox()
+            sb.setDecimals(9)          # 9 decimal places — maximum useful float64 precision
+            sb.setSingleStep(0.000000001)
             sb.setRange(mn,mx)
             sb.setValue(val)
             spin[key]=sb
@@ -195,6 +198,20 @@ class PlanningTab(QWidget):
         box_layout.addWidget(self.indicator)
         box_layout.addWidget(self.robot_pose)
         box_layout.addWidget(self.progress)
+
+        # ---- Tracking mode toggle ----
+        tracking_row = QHBoxLayout()
+        self.btn_tracking = QPushButton("▶ Enable Tracking")
+        self.btn_tracking.setCheckable(True)
+        self.btn_tracking.setStyleSheet(
+            "QPushButton:checked { background-color: #2ecc71; color: white; font-weight: bold; }"
+            "QPushButton { background-color: #e74c3c; color: white; font-weight: bold; }"
+        )
+        self.btn_tracking.toggled.connect(self.set_tracking_mode)
+        self.tracking_mode_label = QLabel("Mode: Planning")
+        tracking_row.addWidget(self.btn_tracking)
+        tracking_row.addWidget(self.tracking_mode_label)
+        box_layout.addLayout(tracking_row)
 
         input_grid,self.motomini_spin=self._build_pose_inputs([0.18,0.0,0.24,0.0,0.0,0.0])
         box_layout.addLayout(input_grid)
@@ -269,7 +286,22 @@ class PlanningTab(QWidget):
 
         self.status_label.setText(text)
 
-        self._set_status_visuals(text,self.indicator,self.progress)
+        # Sync the toggle button if the node reports a mode change
+        t = text.lower()
+        if "mode: tracking" in t:
+            self.btn_tracking.blockSignals(True)
+            self.btn_tracking.setChecked(True)
+            self.btn_tracking.setText("⏹ Disable Tracking")
+            self.tracking_mode_label.setText("Mode: Tracking")
+            self.btn_tracking.blockSignals(False)
+        elif "mode: planning" in t:
+            self.btn_tracking.blockSignals(True)
+            self.btn_tracking.setChecked(False)
+            self.btn_tracking.setText("▶ Enable Tracking")
+            self.tracking_mode_label.setText("Mode: Planning")
+            self.btn_tracking.blockSignals(False)
+        else:
+            self._set_status_visuals(text, self.indicator, self.progress)
 
     # ------------------------------------------------
 
@@ -435,6 +467,21 @@ class PlanningTab(QWidget):
 
         self.gantry_buffer=[]
         self.gantry_list.clear()
+
+    # ------------------------------------------------
+
+    def set_tracking_mode(self, enabled: bool):
+
+        msg = Bool()
+        msg.data = enabled
+        self.node.pub_tracking_control.publish(msg)
+
+        if enabled:
+            self.btn_tracking.setText("⏹ Disable Tracking")
+            self.tracking_mode_label.setText("Mode: Tracking")
+        else:
+            self.btn_tracking.setText("▶ Enable Tracking")
+            self.tracking_mode_label.setText("Mode: Planning")
 
 
 # =====================================================

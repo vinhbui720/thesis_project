@@ -114,9 +114,6 @@ void MotoMiniPlanningNode::tfPollLoop()
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::trackingTick()
 {
-    if (!tracking_mode_)
-        return;
-
     // --- Sync planner env with latest joint states ---
     if (last_joint_state_)
     {
@@ -127,23 +124,9 @@ void MotoMiniPlanningNode::trackingTick()
         planner_->updateEnvironmentState(names, joint_pos);
     }
 
-    // --- Tracking DISABLED: return to initial pose ---
+    // --- Tracking DISABLED: yield to planning mode, do nothing ---
     if (!tracking_enabled_)
-    {
-        if (!last_joint_state_)
-            return;
-
-        if (!planner_->runTrackingPlanner(initial_robot_pose_))
-            return;
-
-        auto traj_ptr = planner_->getTrajectory();
-        if (!traj_ptr || traj_ptr->empty())
-            return;
-
-        publishTrackingTrajectory(*traj_ptr, last_joint_state_->name);
-        publishStatus("Tracking disabled: returning to initial pose");
         return;
-    }
 
     // --- Tracking ENABLED: follow cached working_tip pose ---
     if (!tracking_pose_initialized_)

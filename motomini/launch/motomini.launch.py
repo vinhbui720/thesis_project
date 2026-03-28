@@ -17,7 +17,6 @@ def generate_launch_description():
     gantry_mode = LaunchConfiguration("gantry_mode")
     online_mode = LaunchConfiguration("online_mode")
     use_ompl = LaunchConfiguration("use_ompl")
-    tracking_mode = LaunchConfiguration("tracking_mode")
     tracking_rate_hz = LaunchConfiguration("tracking_rate_hz")
 
     gantry_mode_tesser = IfCondition(PythonExpression(["'", gantry_mode, "' == 'tesser'"]))
@@ -67,9 +66,7 @@ def generate_launch_description():
                 "online_mode": online_mode,
                 "debug": debug,
                 "use_ompl": use_ompl,
-                "tracking_mode": tracking_mode,
                 "tracking_rate_hz": tracking_rate_hz,
-
             }],
             output="screen"
         ),
@@ -93,9 +90,9 @@ def generate_launch_description():
             executable="gantry_loop_controller_node",
             parameters=[{
                 "x_start": 0.0,
-                "x_end": -0.28,
+                "x_end": -0.08,
                 "z_start": 0.0,
-                "z_end": -0.06,
+                "z_end": -0.05,
                 "steps": 28,
                 "publish_period_sec": 0.3,
                 "motion_time_sec": 0.3,
@@ -313,7 +310,6 @@ def generate_launch_description():
         DeclareLaunchArgument("gantry_mode", default_value="loop"),
         DeclareLaunchArgument("online_mode", default_value="false"),
         DeclareLaunchArgument("use_ompl", default_value="true"),
-        DeclareLaunchArgument("tracking_mode", default_value="false"),
         DeclareLaunchArgument("tracking_rate_hz", default_value="3.0"),
         *nodes,
         *control_nodes,

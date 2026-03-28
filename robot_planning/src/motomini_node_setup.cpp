@@ -43,7 +43,6 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<bool>("online_mode", false);
     this->declare_parameter<bool>("debug", false);
     this->declare_parameter<bool>("use_ompl", false);
-    this->declare_parameter<bool>("tracking_mode", false);
     this->declare_parameter<double>("tracking_rate_hz", 30.0);
     this->declare_parameter<bool>("tracking_use_trajopt", false);
     this->declare_parameter<bool>("tracking_enable_collision", false);
@@ -53,7 +52,6 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("tf_poll_rate_hz", 200.0);
     this->declare_parameter<double>("tracking_ema_alpha", 0.6);
 
-    tracking_mode_ = this->get_parameter("tracking_mode").as_bool();
     tracking_rate_hz_ = this->get_parameter("tracking_rate_hz").as_double();
     tf_poll_rate_hz_ = this->get_parameter("tf_poll_rate_hz").as_double();
     tracking_ema_alpha_ = this->get_parameter("tracking_ema_alpha").as_double();
@@ -84,6 +82,25 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         this->get_parameter("tracking_num_steps").as_int(),
         this->get_parameter("tracking_trajopt_max_iter").as_int(),
         this->get_parameter("tracking_max_joint_step").as_double());
+
+    // ---- Offline chunked planning parameters ----
+    this->declare_parameter<int>("planning_chunk_size", 20);
+    this->declare_parameter<int>("planning_parallel_chunks", 2);
+    planner_->configureChunking(
+        this->get_parameter("planning_chunk_size").as_int(),
+        this->get_parameter("planning_parallel_chunks").as_int());
+
+    // Streaming chunk callback: publish each chunk as soon as it is solved.
+    // The execution monitor is set up in startCallback after run() returns.
+    planner_->setChunkReadyCallback(
+        [this](const tesseract_common::JointTrajectory &chunk_traj,
+               const std::vector<std::string> &jnames,
+               bool is_last)
+        {
+            publishTrajectory(chunk_traj, jnames);
+            if (is_last)
+                RCLCPP_INFO(this->get_logger(), "Last chunk streamed — run() about to return.");
+        });
     // ---- Subscribers ----
     sub_joint_states_ = this->create_subscription<sensor_msgs::msg::JointState>(
         "/joint_states", 10,
@@ -182,27 +199,17 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // ---- Tracking timer + TF poll thread ----
-    if (tracking_mode_)
+    // ---- Tracking timer + TF poll thread (always active; mode switched at runtime) ----
     {
         const double hz = std::max(0.1, tracking_rate_hz_);
         const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / hz));
-
         tracking_timer_ = this->create_wall_timer(
-            period,
-            std::bind(&MotoMiniPlanningNode::trackingTick, this));
-
-        // Start dedicated TF polling thread (decoupled from planning tick)
+            period, std::bind(&MotoMiniPlanningNode::trackingTick, this));
         startTfPolling();
-
         RCLCPP_INFO(this->get_logger(),
-                    "Tracking mode enabled: planner=%.0f Hz, TF poll=%.0f Hz, EMA alpha=%.2f",
+                    "Tracking ready: %.0f Hz planner, %.0f Hz TF poll, EMA=%.2f — "
+                    "publish /tracking_control true to activate",
                     hz, tf_poll_rate_hz_, tracking_ema_alpha_);
-        RCLCPP_INFO(this->get_logger(),
-                    "  world='%s', base='%s', tip='%s'",
-                    tracking_world_frame_.c_str(),
-                    tracking_gantry_base_frame_.c_str(),
-                    tracking_tip_frame_.c_str());
     }
 
     RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready.");
@@ -228,20 +235,8 @@ void MotoMiniPlanningNode::postInit()
     monitor_->startPublishingEnvironment();
     monitor_->startStateMonitor("/joint_states");
 
-    // Capture initial EE pose so tracking-disabled mode can return to it
-    const std::vector<std::string> joint_names = {
-        "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
-    auto manip = env_->getKinematicGroup("manipulator");
-    if (manip)
-    {
-        Eigen::VectorXd q = env_->getCurrentJointValues(joint_names);
-        auto fk = manip->calcFwdKin(q);
-        if (!fk.empty())
-        {
-            initial_robot_pose_ = fk.at("tool0");
-            RCLCPP_INFO(this->get_logger(), "Initial pose stored for tracking mode reset.");
-        }
-    }
+    // Initial robot pose is now captured lazily from the first /joint_states
+    // message in jointStateCallback(), avoiding the URDF-default race condition.
 
     RCLCPP_INFO(this->get_logger(), "Environment monitor started.");
 }

@@ -42,13 +42,13 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
         return;
 
     const double tracking_period = 1.0 / std::max(0.1, tracking_rate_hz_);
-    const double start_delay = std::clamp(0.1 * tracking_period, 0.005, 0.02);
-    const double min_step_dt = 0.02;
-    const double max_horizon = std::max(min_step_dt, tracking_period - start_delay);
+    const double min_step_dt = std::clamp(0.25 * tracking_period, 0.001, 0.02);
+    const double start_delay = std::clamp(0.10 * tracking_period, 0.001, 0.005);
+    const double max_horizon = std::max(min_step_dt, 0.95 * tracking_period - start_delay);
 
     if (tess_traj.size() <= 1)
     {
-        publishTrajectory(tess_traj, joint_names, start_delay);
+        publishTrajectory(tess_traj, joint_names, start_delay, min_step_dt);
         return;
     }
 
@@ -73,7 +73,25 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
         }
     }
 
-    publishTrajectory(forward, joint_names, start_delay);
+    // === ENFORCE VELOCITY LIMITS ===
+    // Get velocity limits from the planner's kinematic group
+    const Eigen::MatrixX2d vel_limits = planner_->getTrackingVelocityLimits();
+    if (vel_limits.rows() > 0)
+    {
+        for (auto &state : forward)
+        {
+            for (Eigen::Index i = 0; i < state.velocity.size() && i < vel_limits.rows(); ++i)
+            {
+                const double max_vel = vel_limits(i, 1);
+                const double min_vel = vel_limits(i, 0);
+                // Clamp to [-max_abs, +max_abs]
+                const double abs_max = std::max(std::abs(min_vel), std::abs(max_vel));
+                state.velocity[i] = std::clamp(state.velocity[i], -abs_max, abs_max);
+            }
+        }
+    }
+
+    publishTrajectory(forward, joint_names, start_delay, min_step_dt);
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +103,8 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
 void MotoMiniPlanningNode::publishTrajectory(
     const tesseract_common::JointTrajectory &tess_traj,
     const std::vector<std::string> &joint_names,
-    double start_delay_sec)
+    double start_delay_sec,
+    double min_step_dt_sec)
 {
     if (tess_traj.empty())
         return;
@@ -94,7 +113,7 @@ void MotoMiniPlanningNode::publishTrajectory(
     static const std::vector<std::string> controlled_joints = {
         "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
 
-    const double min_step_dt = 0.02; // 20 ms minimum inter-point spacing
+    const double min_step_dt = std::max(0.001, min_step_dt_sec);
     const double start_delay = std::max(0.0, start_delay_sec);
 
     trajectory_msgs::msg::JointTrajectory ros_msg;

@@ -221,15 +221,41 @@ namespace Vinhtesseract_examples
                 nlp->addVariableSet(var);
             }
 
+            // --- Velocity limit constraints (hard bounds) ---
+            // Each consecutive waypoint difference must respect max velocity * (time step)
+            // Assume uniform time distribution: dt = total_time / (N-1)
+            // For tracking, use conservative 0.1s per step
+            const double dt_trajopt = 0.1;
+            const double dt_inv = 1.0 / dt_trajopt;
+
+            // Velocity = (q_{i+1} - q_i) / dt must be <= velocity_limit
+            // Therefore: q_{i+1} - q_i <= velocity_limit * dt
+            for (int i = 0; i < N - 1; ++i)
+            {
+                // Get velocity limits (asymmetric, but we use symmetric bounds)
+                Eigen::VectorXd vel_ub = Eigen::VectorXd::Zero(n_dof);
+                for (int j = 0; j < n_dof; ++j)
+                {
+                    double lim_neg = std::abs(tracking_velocity_limits_(j, 0));
+                    double lim_pos = tracking_velocity_limits_(j, 1);
+                    vel_ub[j] = std::min(lim_neg, lim_pos) * dt_trajopt * 0.8; // 80% safety margin
+                }
+
+                // q_{i+1} - q_i <= vel_ub (velocity constraint as difference bound)
+                auto vel_constraint = std::make_shared<trajopt_ifopt::JointVelConstraint>(
+                    vel_ub, vars, Eigen::VectorXd::Ones(n_dof), "VelBound_" + std::to_string(i));
+                nlp->addConstraintSet(vel_constraint);
+            }
+
             // --- Smoothing costs ---
             // Velocity smoothing: minimize (q_{i+1} - q_i)^2
-            Eigen::VectorXd vel_coeffs = Eigen::VectorXd::Ones(n_dof) * 1.0;
+            Eigen::VectorXd vel_coeffs = Eigen::VectorXd::Ones(n_dof) * 0.5;
             auto vel_cost = std::make_shared<trajopt_ifopt::JointVelConstraint>(
                 Eigen::VectorXd::Zero(n_dof), vars, vel_coeffs, "VelSmooth");
             nlp->addCostSet(vel_cost, trajopt_sqp::CostPenaltyType::SQUARED);
 
             // Acceleration smoothing: minimize (q_{i+2} - 2*q_{i+1} + q_i)^2
-            Eigen::VectorXd accel_coeffs = Eigen::VectorXd::Ones(n_dof) * 5.0;
+            Eigen::VectorXd accel_coeffs = Eigen::VectorXd::Ones(n_dof) * 2.0;
             auto accel_cost = std::make_shared<trajopt_ifopt::JointAccelConstraint>(
                 Eigen::VectorXd::Zero(n_dof), vars, accel_coeffs, "AccelSmooth");
             nlp->addCostSet(accel_cost, trajopt_sqp::CostPenaltyType::SQUARED);
@@ -288,11 +314,11 @@ namespace Vinhtesseract_examples
 
         tesseract_planning::formatProgram(ci, *env_);
 
-        // ISP profile: use URDF velocity limits (optionally scaled)
+        // ISP profile: use URDF velocity limits (scaled down for tracking safety)
         auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
         auto isp_profile =
             std::make_shared<IterativeSplineParameterizationCompositeProfile>(
-                1.0,  // max_velocity_scaling_factor  (tune: lower = slower/smoother)
+                0.65, // max_velocity_scaling_factor  (65% of URDF limits for safe margin)
                 0.5); // max_acceleration_scaling_factor (conservative for tracking)
         profiles->addProfile(
             "IterativeSplineParameterization", "DEFAULT", isp_profile);
@@ -320,6 +346,57 @@ namespace Vinhtesseract_examples
             CONSOLE_BRIDGE_logWarn("[Tracking] Empty trajectory from ISP");
             return false;
         }
+
+        // ================================================================
+        //  VERIFY & CLAMP: Ensure velocities are within URDF limits
+        // ================================================================
+        bool has_velocity_data = false;
+        for (const auto &state : trajectory)
+        {
+            if (state.velocity.size() > 0 && state.velocity.size() == n_dof)
+            {
+                has_velocity_data = true;
+                break;
+            }
+        }
+
+        if (!has_velocity_data)
+        {
+            CONSOLE_BRIDGE_logWarn("[Tracking] ISP produced trajectory without velocity data!");
+            // Fallback: compute velocities numerically from positions
+            for (std::size_t i = 1; i < trajectory.size(); ++i)
+            {
+                const double dt = trajectory[i].time - trajectory[i - 1].time;
+                if (dt > 1e-6)
+                {
+                    trajectory[i].velocity.resize(n_dof);
+                    for (int j = 0; j < n_dof; ++j)
+                    {
+                        trajectory[i].velocity[j] =
+                            (trajectory[i].position[j] - trajectory[i - 1].position[j]) / dt;
+                    }
+                }
+            }
+            if (!trajectory.empty())
+                trajectory[0].velocity = Eigen::VectorXd::Zero(n_dof);
+        }
+
+        // Clamp all velocities to URDF limits
+        for (auto &state : trajectory)
+        {
+            if (state.velocity.size() != n_dof)
+                state.velocity.resize(n_dof);
+
+            for (int j = 0; j < n_dof; ++j)
+            {
+                const double vel_min = tracking_velocity_limits_(j, 0);
+                const double vel_max = tracking_velocity_limits_(j, 1);
+                state.velocity[j] = std::clamp(state.velocity[j], vel_min, vel_max);
+            }
+        }
+
+        CONSOLE_BRIDGE_logDebug("[Tracking] Velocity enforcement complete: %zu pts with velocities",
+                                trajectory.size());
 
         // ---- Persist state for next tick ----
         last_tracking_command_ = target_joints;

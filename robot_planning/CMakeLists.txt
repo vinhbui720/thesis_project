@@ -27,6 +27,8 @@ find_package(tesseract_scene_graph REQUIRED)
 find_package(tesseract_collision REQUIRED COMPONENTS core)
 find_package(tesseract_urdf REQUIRED)
 
+find_package(Taskflow REQUIRED HINTS /home/vinbui/vinh_ws/install/Taskflow/lib/cmake/Taskflow)
+
 find_package(
   tesseract_motion_planners REQUIRED
   COMPONENTS core simple
@@ -77,6 +79,7 @@ target_link_libraries(
   tesseract::tesseract_time_parameterization_core
   tesseract::tesseract_time_parameterization_isp
 
+  Taskflow::Taskflow
   console_bridge::console_bridge)
 
 target_compile_options(${PROJECT_NAME} PUBLIC ${TESSERACT_COMPILE_OPTIONS})
@@ -141,6 +144,18 @@ ament_target_dependencies(online_collision_debugger
   visualization_msgs
 )
 
+add_executable(grinding_task src/grinding_task.cpp)
+target_link_libraries(grinding_task ${PROJECT_NAME})
+ament_target_dependencies(grinding_task
+  rclcpp
+  std_msgs
+  sensor_msgs
+  geometry_msgs
+  tesseract_environment
+  tesseract_common
+  tesseract_rosutils
+)
+
 install(
   DIRECTORY include/
   DESTINATION include
@@ -161,6 +176,7 @@ install(TARGETS
   gantry_planning_node
   gantry_loop_controller_node
   online_collision_debugger
+  grinding_task
   DESTINATION lib/${PROJECT_NAME}
 )
 
