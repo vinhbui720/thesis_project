@@ -1,0 +1,77 @@
+###############################################################################
+#  planning_params.yaml
+#  Runtime-tunable planning hyperparameters for MotoMini.
+#  Edit this file and relaunch — no rebuild needed.
+###############################################################################
+
+motomini_planning_node:
+  ros__parameters:
+
+    # ===========================================================================
+    #  MOTION INSTRUCTION TYPE
+    #   "FREESPACE" — robot reaches each Cartesian waypoint via any joint path,
+    #                 orientation is NOT constrained → cheaper solve, more rotation.
+    #   "LINEAR"    — robot moves in a straight TCP line between waypoints,
+    #                 orientation follows the path → more constrained, less rotation.
+    # ===========================================================================
+    move_instruction_type: "FREESPACE"
+
+    # ===========================================================================
+    #  OMPL — runtime enable/disable toggle (overrides launch-time use_ompl flag)
+    # ===========================================================================
+    use_ompl: false
+
+    # ===========================================================================
+    #  OMPL hyperparameters
+    # ===========================================================================
+    ompl_planning_time: 10.0            # seconds allowed per OMPL planning call
+    ompl_max_solutions: 5               # OMPL stops after finding this many solutions
+    ompl_simplify: true                 # post-process path to smooth/shorten
+    ompl_longest_valid_segment: 0.005   # collision check resolution (meters in joint space)
+    ompl_rrt_range_1: 0.05             # RRTConnect tree expansion range — tight
+    ompl_rrt_range_2: 0.10             # RRTConnect tree expansion range — loose
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Cartesian Constraint Coefficients (per axis)
+    #  Each coefficient is the penalty weight for violating that DOF.
+    #  Set rotation coefficients to 0.0 to allow free end-effector rotation.
+    # ===========================================================================
+    ifopt_cart_coeff_x:  100.0   # X translation weight
+    ifopt_cart_coeff_y:  100.0   # Y translation weight
+    ifopt_cart_coeff_z:  100.0   # Z translation weight
+    ifopt_cart_coeff_rx:   0.0   # Roll  weight (0 = free)
+    ifopt_cart_coeff_ry:   0.0   # Pitch weight (0 = free)
+    ifopt_cart_coeff_rz:   0.0   # Yaw   weight (0 = free)
+
+    # Joint cost (discourages large joint movements; acts like a regularizer)
+    ifopt_joint_cost_coeff: 5.0
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Collision Avoidance (soft cost, not hard constraint)
+    #  collision_cost_margin: minimum clearance (meters) from obstacles
+    #  collision_cost_coeff:  penalty for violating the margin (higher = stronger push)
+    #  coll_margin_buffer:    extra buffer on top of margin for LVS swept volume check
+    # ===========================================================================
+    ifopt_coll_cost_margin: 0.02        # 20 mm minimum clearance
+    ifopt_coll_cost_coeff: 500.0        # penalty weight
+    ifopt_coll_margin_buffer: 0.02      # swept-volume buffer
+    # 0 = DISCRETE, 1 = CONTINUOUS, 2 = LVS_CONTINUOUS
+    ifopt_coll_eval_type: 2
+    ifopt_coll_lvs_length: 0.005        # longest_valid_segment_length (m)
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Trajectory Smoothing
+    #  Regularize velocity / acceleration / jerk across waypoints.
+    #  Lower values = less smooth but more aggressive optimization.
+    # ===========================================================================
+    ifopt_smooth_vel_coeff: 0.1     # velocity smoothing weight
+    ifopt_smooth_acc_coeff: 1.0     # acceleration smoothing weight
+    ifopt_smooth_jerk_coeff: 1.0    # jerk smoothing weight
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — SQP Solver
+    # ===========================================================================
+    ifopt_max_iter: 300                    # max SQP iterations
+    ifopt_min_approx_improve: 1.0e-6       # stop if cost improvement < this
+    ifopt_min_trust_box_size: 1.0e-5       # stop if trust region shrinks below this
+    ifopt_initial_trust_box_size: 0.5      # initial SQP step size

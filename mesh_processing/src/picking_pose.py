@@ -14,7 +14,7 @@ from std_msgs.msg import ColorRGBA, Empty, Bool
 
 from tf2_ros import Buffer, TransformListener
 from ament_index_python.packages import get_package_share_directory
-from tf_transformations import quaternion_matrix
+from tf_transformations import quaternion_matrix, quaternion_from_matrix
 
 
 class PickPointTransformer(Node):
@@ -36,7 +36,7 @@ class PickPointTransformer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Publishers
-        self.pick_pub = self.create_publisher(Point, "/pick_point", 10)
+        self.pick_pub = self.create_publisher(Pose, "/pick_point", 10)
         self.traj_pub = self.create_publisher(PoseArray, "/trajectory_waypoints", 10)
         self.ok_pub = self.create_publisher(Bool, "/trajectory_ok", 10)
 
@@ -161,13 +161,19 @@ class PickPointTransformer(Node):
         if matrix is None:
             return None, None, None
 
-        # Pick point
+        # Pick point: transform position, and extract orientation from rotation matrix
         wp = matrix @ self.pick_point
 
-        world_pick = Point()
-        world_pick.x = wp[0]
-        world_pick.y = wp[1]
-        world_pick.z = wp[2]
+        rot_quat = quaternion_from_matrix(matrix)  # [x, y, z, w]
+
+        world_pick = Pose()
+        world_pick.position.x = wp[0]
+        world_pick.position.y = wp[1]
+        world_pick.position.z = wp[2]
+        world_pick.orientation.x = rot_quat[0]
+        world_pick.orientation.y = rot_quat[1]
+        world_pick.orientation.z = rot_quat[2]
+        world_pick.orientation.w = rot_quat[3]
 
         pose_array = PoseArray()
         pose_array.header.frame_id = self.target_frame
@@ -218,7 +224,7 @@ class PickPointTransformer(Node):
         self.ok_pub.publish(ok)
 
         if self.debug_mode:
-            self.publish_markers(world_pick, world_traj)
+            self.publish_markers(world_pick.position, world_traj)
 
     # ------------------------------------------------
 
@@ -232,7 +238,7 @@ class PickPointTransformer(Node):
         if world_pick is None:
             return
 
-        self.publish_markers(world_pick, world_traj)
+        self.publish_markers(world_pick.position, world_traj)
 
     # ------------------------------------------------
 

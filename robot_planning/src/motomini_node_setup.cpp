@@ -90,16 +90,92 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         this->get_parameter("planning_chunk_size").as_int(),
         this->get_parameter("planning_parallel_chunks").as_int());
 
-    // Streaming chunk callback: publish each chunk as soon as it is solved.
-    // The execution monitor is set up in startCallback after run() returns.
+    // ---- Runtime-tunable planning hyperparameters (from planning_params.yaml) ----
+    this->declare_parameter<std::string>("move_instruction_type", "LINEAR");
+    // OMPL
+    this->declare_parameter<double>("ompl_planning_time", 10.0);
+    this->declare_parameter<int>("ompl_max_solutions", 5);
+    this->declare_parameter<bool>("ompl_simplify", true);
+    this->declare_parameter<double>("ompl_longest_valid_segment", 0.005);
+    this->declare_parameter<double>("ompl_rrt_range_1", 0.05);
+    this->declare_parameter<double>("ompl_rrt_range_2", 0.10);
+    // TrajOptIfopt
+    // Per-axis cartesian constraint coefficients
+    this->declare_parameter<double>("ifopt_cart_coeff_x", 100.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_y", 100.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_z", 100.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_rx", 0.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_ry", 0.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_rz", 0.0);
+    this->declare_parameter<double>("ifopt_joint_cost_coeff", 5.0);
+    this->declare_parameter<double>("ifopt_coll_cost_margin", 0.02);
+    this->declare_parameter<double>("ifopt_coll_cost_coeff", 500.0);
+    this->declare_parameter<double>("ifopt_coll_margin_buffer", 0.02);
+    // Collision evaluator: 0=DISCRETE, 1=CONTINUOUS, 2=LVS_CONTINUOUS
+    this->declare_parameter<int>("ifopt_coll_eval_type", 2);
+    this->declare_parameter<double>("ifopt_coll_lvs_length", 0.005);
+    this->declare_parameter<double>("ifopt_smooth_vel_coeff", 0.1);
+    this->declare_parameter<double>("ifopt_smooth_acc_coeff", 1.0);
+    this->declare_parameter<double>("ifopt_smooth_jerk_coeff", 1.0);
+    this->declare_parameter<int>("ifopt_max_iter", 300);
+    this->declare_parameter<double>("ifopt_min_approx_improve", 1e-6);
+    this->declare_parameter<double>("ifopt_min_trust_box_size", 1e-5);
+    this->declare_parameter<double>("ifopt_initial_trust_box_size", 0.5);
+
+    {
+        MotoMiniPlanning::PlanningConfig cfg;
+        const std::string instr = this->get_parameter("move_instruction_type").as_string();
+        cfg.use_linear = (instr == "LINEAR");
+        cfg.ompl_planning_time = this->get_parameter("ompl_planning_time").as_double();
+        cfg.ompl_max_solutions = this->get_parameter("ompl_max_solutions").as_int();
+        cfg.ompl_simplify = this->get_parameter("ompl_simplify").as_bool();
+        cfg.ompl_longest_valid_segment = this->get_parameter("ompl_longest_valid_segment").as_double();
+        cfg.ompl_rrt_range_1 = this->get_parameter("ompl_rrt_range_1").as_double();
+        cfg.ompl_rrt_range_2 = this->get_parameter("ompl_rrt_range_2").as_double();
+        cfg.use_ompl_runtime = this->get_parameter("use_ompl").as_bool();
+        cfg.ifopt_cart_coeff_x = this->get_parameter("ifopt_cart_coeff_x").as_double();
+        cfg.ifopt_cart_coeff_y = this->get_parameter("ifopt_cart_coeff_y").as_double();
+        cfg.ifopt_cart_coeff_z = this->get_parameter("ifopt_cart_coeff_z").as_double();
+        cfg.ifopt_cart_coeff_rx = this->get_parameter("ifopt_cart_coeff_rx").as_double();
+        cfg.ifopt_cart_coeff_ry = this->get_parameter("ifopt_cart_coeff_ry").as_double();
+        cfg.ifopt_cart_coeff_rz = this->get_parameter("ifopt_cart_coeff_rz").as_double();
+        cfg.ifopt_joint_cost_coeff = this->get_parameter("ifopt_joint_cost_coeff").as_double();
+        cfg.ifopt_coll_cost_margin = this->get_parameter("ifopt_coll_cost_margin").as_double();
+        cfg.ifopt_coll_cost_coeff = this->get_parameter("ifopt_coll_cost_coeff").as_double();
+        cfg.ifopt_coll_margin_buffer = this->get_parameter("ifopt_coll_margin_buffer").as_double();
+        cfg.ifopt_coll_eval_type = static_cast<int>(this->get_parameter("ifopt_coll_eval_type").as_int());
+        cfg.ifopt_coll_lvs_length = this->get_parameter("ifopt_coll_lvs_length").as_double();
+        cfg.ifopt_smooth_vel = this->get_parameter("ifopt_smooth_vel_coeff").as_double();
+        cfg.ifopt_smooth_acc = this->get_parameter("ifopt_smooth_acc_coeff").as_double();
+        cfg.ifopt_smooth_jerk = this->get_parameter("ifopt_smooth_jerk_coeff").as_double();
+        cfg.ifopt_max_iter = this->get_parameter("ifopt_max_iter").as_int();
+        cfg.ifopt_min_approx_improve = this->get_parameter("ifopt_min_approx_improve").as_double();
+        cfg.ifopt_min_trust_box_size = this->get_parameter("ifopt_min_trust_box_size").as_double();
+        cfg.ifopt_initial_trust_box_size = this->get_parameter("ifopt_initial_trust_box_size").as_double();
+        planner_->configurePlanningParams(cfg);
+        RCLCPP_INFO(this->get_logger(),
+                    "Planning config: mode=%s  ompl=%s  chunk=%d  parallel=%d  "
+                    "cart=[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]  coll_margin=%.3f  eval=%d  lvs=%.4f",
+                    instr.c_str(),
+                    cfg.use_ompl_runtime ? "ON" : "OFF",
+                    this->get_parameter("planning_chunk_size").as_int(),
+                    this->get_parameter("planning_parallel_chunks").as_int(),
+                    cfg.ifopt_cart_coeff_x, cfg.ifopt_cart_coeff_y, cfg.ifopt_cart_coeff_z,
+                    cfg.ifopt_cart_coeff_rx, cfg.ifopt_cart_coeff_ry, cfg.ifopt_cart_coeff_rz,
+                    cfg.ifopt_coll_cost_margin, cfg.ifopt_coll_eval_type, cfg.ifopt_coll_lvs_length);
+    }
+
+    // Progress callback: log each chunk completion during planning.
+    // The full stitched trajectory is published once in startCallback after run() returns.
     planner_->setChunkReadyCallback(
         [this](const tesseract_common::JointTrajectory &chunk_traj,
-               const std::vector<std::string> &jnames,
+               const std::vector<std::string> & /*jnames*/,
                bool is_last)
         {
-            publishTrajectory(chunk_traj, jnames);
-            if (is_last)
-                RCLCPP_INFO(this->get_logger(), "Last chunk streamed — run() about to return.");
+            RCLCPP_INFO(this->get_logger(),
+                        "Chunk solved: %zu points%s",
+                        chunk_traj.size(),
+                        is_last ? " — last chunk, run() returning." : "...");
         });
     // ---- Subscribers ----
     sub_joint_states_ = this->create_subscription<sensor_msgs::msg::JointState>(
@@ -216,6 +292,11 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready.");
     RCLCPP_INFO(this->get_logger(),
                 "Topics: /joint_states, /target_poses, /clear_targets, /start, /tracking_control");
+
+    // Register runtime parameter change callback so GUI updates take effect
+    // immediately without restarting the node.
+    param_callback_handle_ = this->add_on_set_parameters_callback(
+        std::bind(&MotoMiniPlanningNode::onParameterChange, this, std::placeholders::_1));
 }
 
 // ---------------------------------------------------------------------------
@@ -267,4 +348,110 @@ bool MotoMiniPlanningNode::initializeEnvironment()
     plotter_ = std::make_shared<tesseract_rosutils::ROSPlotting>(
         env_->getSceneGraph()->getRoot());
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// onParameterChange — propagates runtime param changes (e.g. from GUI) to planner
+// ---------------------------------------------------------------------------
+rcl_interfaces::msg::SetParametersResult
+MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &params)
+{
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+
+    MotoMiniPlanning::PlanningConfig cfg = planner_->getPlanningConfig();
+    int new_chunk_size = this->get_parameter("planning_chunk_size").as_int();
+    int new_parallel = this->get_parameter("planning_parallel_chunks").as_int();
+    bool chunk_changed = false;
+
+    for (const auto &p : params)
+    {
+        const std::string &n = p.get_name();
+        try
+        {
+            if (n == "move_instruction_type")
+                cfg.use_linear = (p.as_string() == "LINEAR");
+            else if (n == "use_ompl")
+                cfg.use_ompl_runtime = p.as_bool();
+            else if (n == "ifopt_cart_coeff_x")
+                cfg.ifopt_cart_coeff_x = p.as_double();
+            else if (n == "ifopt_cart_coeff_y")
+                cfg.ifopt_cart_coeff_y = p.as_double();
+            else if (n == "ifopt_cart_coeff_z")
+                cfg.ifopt_cart_coeff_z = p.as_double();
+            else if (n == "ifopt_cart_coeff_rx")
+                cfg.ifopt_cart_coeff_rx = p.as_double();
+            else if (n == "ifopt_cart_coeff_ry")
+                cfg.ifopt_cart_coeff_ry = p.as_double();
+            else if (n == "ifopt_cart_coeff_rz")
+                cfg.ifopt_cart_coeff_rz = p.as_double();
+            else if (n == "ifopt_coll_eval_type")
+                cfg.ifopt_coll_eval_type = static_cast<int>(p.as_int());
+            else if (n == "ifopt_coll_lvs_length")
+                cfg.ifopt_coll_lvs_length = p.as_double();
+            else if (n == "ifopt_joint_cost_coeff")
+                cfg.ifopt_joint_cost_coeff = p.as_double();
+            else if (n == "ifopt_coll_cost_margin")
+                cfg.ifopt_coll_cost_margin = p.as_double();
+            else if (n == "ifopt_coll_cost_coeff")
+                cfg.ifopt_coll_cost_coeff = p.as_double();
+            else if (n == "ifopt_coll_margin_buffer")
+                cfg.ifopt_coll_margin_buffer = p.as_double();
+            else if (n == "ifopt_smooth_vel_coeff")
+                cfg.ifopt_smooth_vel = p.as_double();
+            else if (n == "ifopt_smooth_acc_coeff")
+                cfg.ifopt_smooth_acc = p.as_double();
+            else if (n == "ifopt_smooth_jerk_coeff")
+                cfg.ifopt_smooth_jerk = p.as_double();
+            else if (n == "ifopt_max_iter")
+                cfg.ifopt_max_iter = static_cast<int>(p.as_int());
+            else if (n == "ifopt_min_approx_improve")
+                cfg.ifopt_min_approx_improve = p.as_double();
+            else if (n == "ifopt_min_trust_box_size")
+                cfg.ifopt_min_trust_box_size = p.as_double();
+            else if (n == "ifopt_initial_trust_box_size")
+                cfg.ifopt_initial_trust_box_size = p.as_double();
+            else if (n == "ompl_planning_time")
+                cfg.ompl_planning_time = p.as_double();
+            else if (n == "ompl_max_solutions")
+                cfg.ompl_max_solutions = static_cast<int>(p.as_int());
+            else if (n == "ompl_simplify")
+                cfg.ompl_simplify = p.as_bool();
+            else if (n == "ompl_rrt_range_1")
+                cfg.ompl_rrt_range_1 = p.as_double();
+            else if (n == "ompl_rrt_range_2")
+                cfg.ompl_rrt_range_2 = p.as_double();
+            else if (n == "planning_chunk_size")
+            {
+                new_chunk_size = static_cast<int>(p.as_int());
+                chunk_changed = true;
+            }
+            else if (n == "planning_parallel_chunks")
+            {
+                new_parallel = static_cast<int>(p.as_int());
+                chunk_changed = true;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            result.successful = false;
+            result.reason = "Failed to apply " + n + ": " + e.what();
+            return result;
+        }
+    }
+
+    planner_->configurePlanningParams(cfg);
+    if (chunk_changed)
+        planner_->configureChunking(new_chunk_size, new_parallel);
+
+    RCLCPP_INFO(this->get_logger(),
+                "[ParamUpdate] mode=%s  ompl=%s  cart=[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f]  "
+                "eval=%d  lvs=%.4f  chunk=%d",
+                cfg.use_linear ? "LINEAR" : "FREESPACE",
+                cfg.use_ompl_runtime ? "ON" : "OFF",
+                cfg.ifopt_cart_coeff_x, cfg.ifopt_cart_coeff_y, cfg.ifopt_cart_coeff_z,
+                cfg.ifopt_cart_coeff_rx, cfg.ifopt_cart_coeff_ry, cfg.ifopt_cart_coeff_rz,
+                cfg.ifopt_coll_eval_type, cfg.ifopt_coll_lvs_length,
+                new_chunk_size);
+    return result;
 }

@@ -9,6 +9,8 @@ from launch_ros.parameter_descriptions import ParameterValue
 def generate_launch_description():
     # 1. Path Helpers
     motomini_share = FindPackageShare("motomini")
+    robot_planning_share = FindPackageShare("robot_planning")
+    planning_params_yaml = PathJoinSubstitution([robot_planning_share, "config", "planning_params.yaml"])
 
     # 2. Launch Configurations
     tool_type = LaunchConfiguration("tool_type")
@@ -60,7 +62,7 @@ def generate_launch_description():
         Node(
             package="robot_planning",
             executable="motomini_planning_node",
-            parameters=[*common_params, {
+            parameters=[*common_params, planning_params_yaml, {
                 "manipulator_group": "manipulator",
                 "base_link": "world",
                 "ee_link": concrete_ee_link,
@@ -68,8 +70,8 @@ def generate_launch_description():
                 "debug": debug,
                 "use_ompl": use_ompl,
                 "tracking_rate_hz": tracking_rate_hz,
-                "planning_chunk_size": planning_chunk_size,        
-                "planning_parallel_chunks": planning_parallel_chunks, 
+                "planning_chunk_size": planning_chunk_size,
+                "planning_parallel_chunks": planning_parallel_chunks,
             }],
             output="screen"
         ),

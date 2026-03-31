@@ -15,7 +15,7 @@
         </inertial>
     </link>
     <link name="world_range_link">
-        <visual>
+        <!-- <visual>
             <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />
             <geometry>
 
@@ -27,7 +27,7 @@
             <geometry>
                 <box size="0.3 0.06 0.03" />
             </geometry>
-        </collision>
+        </collision> -->
         <inertial>
             <mass value="0.05" />
             <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0" />

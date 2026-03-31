@@ -181,6 +181,11 @@ private:
                            double min_step_dt_sec = 0.02);
     void publishTrackingTrajectory(const tesseract_common::JointTrajectory &tess_traj,
                                    const std::vector<std::string> &joint_names);
+
+    // Parameter change callback — propagates GUI/service param updates to the planner
+    rcl_interfaces::msg::SetParametersResult
+    onParameterChange(const std::vector<rclcpp::Parameter> &params);
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
 };
 
 #endif // ROBOT_PLANNING_MOTOMINI_PLANNING_NODE_H

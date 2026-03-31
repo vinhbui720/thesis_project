@@ -37,6 +37,63 @@ namespace Vinhtesseract_examples
     public:
         using CommandCallback = std::function<void(const Eigen::VectorXd &)>;
 
+        // All runtime-tunable planning hyperparameters (loaded from YAML, no rebuild needed)
+        struct PlanningConfig
+        {
+            // --- OMPL ---
+            double ompl_planning_time{10.0};
+            int ompl_max_solutions{5};
+            bool ompl_simplify{true};
+            double ompl_longest_valid_segment{0.005};
+            double ompl_rrt_range_1{0.05};
+            double ompl_rrt_range_2{0.10};
+
+            // --- Runtime OMPL toggle (overrides launch-time use_ompl flag) ---
+            bool use_ompl_runtime{false};
+
+            // --- Motion instruction type ---
+            bool use_linear{false}; // false = FREESPACE, true = LINEAR
+
+            // --- TrajOptIfopt: Cartesian constraint coefficients [x, y, z, rx, ry, rz] ---
+            double ifopt_cart_coeff_x{100.0};  // weight for X translation
+            double ifopt_cart_coeff_y{100.0};  // weight for Y translation
+            double ifopt_cart_coeff_z{100.0};  // weight for Z translation
+            double ifopt_cart_coeff_rx{0.0};   // weight for roll  (0 = free)
+            double ifopt_cart_coeff_ry{0.0};   // weight for pitch (0 = free)
+            double ifopt_cart_coeff_rz{0.0};   // weight for yaw   (0 = free)
+
+            // --- TrajOptIfopt: Collision evaluator ---
+            // 0 = DISCRETE, 1 = CONTINUOUS, 2 = LVS_CONTINUOUS
+            int    ifopt_coll_eval_type{2};
+            double ifopt_coll_lvs_length{0.005}; // longest_valid_segment_length (m)
+
+            // --- TrajOptIfopt: Joint cost (regularizer) ---
+            double ifopt_joint_cost_coeff{5.0};
+
+            // --- TrajOptIfopt: Collision avoidance (soft cost) ---
+            double ifopt_coll_cost_margin{0.02};   // minimum clearance (m)
+            double ifopt_coll_cost_coeff{500.0};   // penalty weight
+            double ifopt_coll_margin_buffer{0.02}; // LVS swept-volume buffer (m)
+
+            // --- TrajOptIfopt: Trajectory smoothing ---
+            double ifopt_smooth_vel{0.1};
+            double ifopt_smooth_acc{1.0};
+            double ifopt_smooth_jerk{1.0};
+
+            // --- TrajOptIfopt: SQP solver ---
+            int ifopt_max_iter{300};
+            double ifopt_min_approx_improve{1e-6};
+            double ifopt_min_trust_box_size{1e-5};
+            double ifopt_initial_trust_box_size{0.5};
+        };
+
+        void configurePlanningParams(const PlanningConfig &cfg)
+        {
+            planning_cfg_ = cfg;
+            use_ompl_ = cfg.use_ompl_runtime; // propagate runtime toggle
+        }
+        PlanningConfig getPlanningConfig() const { return planning_cfg_; }
+
         MotoMiniPlanning(std::shared_ptr<tesseract_environment::Environment> env,
                          std::shared_ptr<tesseract_visualization::Visualization> plotter = nullptr,
                          std::string manipulator_group = "manipulator",
@@ -119,6 +176,8 @@ namespace Vinhtesseract_examples
         ChunkReadyCallback chunk_ready_cb_;
         Eigen::VectorXd last_tracking_command_;
         bool has_last_tracking_command_{false};
+        // --- Runtime-tunable planning config (loaded from YAML) ---
+        PlanningConfig planning_cfg_;
         // --- Offline chunked planning ---
         int chunk_size_{20};     // waypoints per TrajOpt solve
         int parallel_chunks_{2}; // max chunks in flight simultaneously

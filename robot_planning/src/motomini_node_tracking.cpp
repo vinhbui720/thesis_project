@@ -165,29 +165,57 @@ void MotoMiniPlanningNode::tfPollLoop()
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::trackingTick()
 {
-    // --- Use last_joint_state_ directly (available from callback) ---
+    // === GUARD: Check preconditions ===
     if (!last_joint_state_ || last_joint_state_->position.empty())
         return;
+    if (!tracking_enabled_ || !tracking_pose_initialized_)
+        return;
 
-    // --- Sync planner env with latest joint states ---
+    const std::vector<std::string> joint_names = {
+        "joint_1_s", "joint_2_l", "joint_3_u",
+        "joint_4_r", "joint_5_b", "joint_6_t"};
+
+    // ========================================================================
+    // CRITICAL: Sync environment state with actual robot position (like run.cpp)
+    // updateEnvironmentState() internally calls setState() to sync the planner's env
+    // Filter positions to match manipulator joint_names (skip gantry joints)
+    // ========================================================================
     {
-        const std::vector<std::string> &names = last_joint_state_->name;
-        Eigen::VectorXd joint_pos(static_cast<Eigen::Index>(last_joint_state_->position.size()));
-        for (size_t i = 0; i < last_joint_state_->position.size(); ++i)
-            joint_pos[static_cast<Eigen::Index>(i)] = last_joint_state_->position[i];
-        planner_->updateEnvironmentState(names, joint_pos);
+        // Construct joint_pos by matching indices with joint_names
+        Eigen::VectorXd joint_pos(static_cast<Eigen::Index>(joint_names.size()));
+
+        for (size_t i = 0; i < joint_names.size(); ++i)
+        {
+            // Find the index of joint_names[i] in last_joint_state_->name
+            auto it = std::find(last_joint_state_->name.begin(),
+                                last_joint_state_->name.end(),
+                                joint_names[i]);
+
+            if (it != last_joint_state_->name.end())
+            {
+                size_t idx = std::distance(last_joint_state_->name.begin(), it);
+                joint_pos[static_cast<Eigen::Index>(i)] = last_joint_state_->position[idx];
+            }
+            else
+            {
+                RCLCPP_WARN(this->get_logger(),
+                            "Tracking: Joint '%s' not found in joint_states",
+                            joint_names[i].c_str());
+                joint_pos[static_cast<Eigen::Index>(i)] = 0.0;
+            }
+        }
+
+        planner_->updateEnvironmentState(joint_names, joint_pos);
+
+        RCLCPP_DEBUG(this->get_logger(),
+                     "Tracking: synced env state [%.4f, %.4f, %.4f]",
+                     joint_pos[0], joint_pos[1], joint_pos[2]);
     }
 
-    // --- Tracking DISABLED: yield to planning mode, do nothing ---
-    if (!tracking_enabled_)
-        return;
-
-    // --- Tracking ENABLED: follow cached working_tip pose ---
-    if (!tracking_pose_initialized_)
-        return;
-
+    // === Get target tracking pose ===
     const Eigen::Isometry3d target = getLatestTipPose();
 
+    // === CALL TRACKING PLANNER ===
     if (!planner_->runTrackingPlanner(target))
     {
         RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed");
@@ -201,134 +229,80 @@ void MotoMiniPlanningNode::trackingTick()
         return;
     }
 
-    // === BASIC TRAJECTORY SANITY CHECKS ===
-    // Verify trajectory has valid data
-    if (traj_ptr->front().position.size() == 0)
-    {
-        RCLCPP_WARN(this->get_logger(), "Tracking: trajectory has empty position data");
-        return;
-    }
-
-    // === PREDICTIVE START POSITION VALIDATION ===
-    // For continuous tracking on moving platforms (e.g., gantry), use lenient validation:
-    // - Accept trajectories if start is reasonably close to current position within RELAXED tolerance
-    // - This prevents rejection of valid trajectories due to platform motion between planning & execution
-
-    const size_t traj_dof = traj_ptr->front().position.size();
-    const size_t current_dof = last_joint_state_->position.size();
-
-    // Validate DOF compatibility (trajectory should not exceed available joints)
-    if (traj_dof > current_dof)
-    {
-        RCLCPP_WARN(this->get_logger(),
-                    "Tracking: trajectory DOF (%zu) exceeds available joints (%zu), skipping",
-                    traj_dof, current_dof);
-        return;
-    }
-
-    // Compute trajectory start validation error with RELAXED tolerance for continuous motion
-    double max_start_error = 0.0;
-    for (size_t i = 0; i < traj_dof; ++i)
-    {
-        double start_error = std::abs(traj_ptr->front().position[i] - last_joint_state_->position[i]);
-        max_start_error = std::max(max_start_error, start_error);
-    }
-
-    // RELAXED tolerance: 0.35 rad (~20 degrees) for continuous gantry tracking
-    // This accounts for motion between planning cycle and controller execution
-    // The controller will perform its own stricter validation
-    const double CONTINUOUS_TRACKING_TOLERANCE = 0.35;
-
-    if (max_start_error > CONTINUOUS_TRACKING_TOLERANCE)
-    {
-        RCLCPP_DEBUG(this->get_logger(),
-                     "Tracking: trajectory start error %.4f rad exceeds tolerance %.4f rad (gantry moving), "
-                     "publishing anyway for continuous motion",
-                     max_start_error, CONTINUOUS_TRACKING_TOLERANCE);
-        // Note: We still publish to maintain continuous motion. The controller will validate stricter constraints.
-        // Silently skipping here causes jerky motion (run-stop-run pattern).
-        // Better to publish and let control layer handle edge cases.
-    }
-
-    // === TRAJECTORY COMPLETION DETECTION ===
-    // STRICT continuous tracking: Only publish when PREVIOUS trajectory is complete.
-    // DO NOT publish on target movement (causes splicing errors).
-    // This ensures robot finishes each segment before next is sent.
-
+    // === TRAJECTORY COMPLETION DETECTION (gating logic) ===
     bool should_publish = false;
 
     // First trajectory → always publish
     if (last_trajectory_end_state_.empty())
     {
         should_publish = true;
-        RCLCPP_DEBUG(this->get_logger(), "Tracking: FIRST trajectory, publishing");
+        RCLCPP_INFO(this->get_logger(), "Tracking: FIRST trajectory → publishing");
     }
     else
     {
-        // === STRICT COMPLETION CHECK ===
-        // Wait for robot to reach END of previous trajectory before sending next
+        // Check if robot reached END of previous trajectory
+        // CRITICAL: Extract ONLY manipulator joint positions (matching trajectory format)
         double max_end_error = 0.0;
-        const size_t end_state_size = last_trajectory_end_state_.size();
 
-        for (size_t i = 0; i < end_state_size && i < last_joint_state_->position.size(); ++i)
+        for (size_t i = 0; i < joint_names.size() && i < last_trajectory_end_state_.size(); ++i)
         {
-            double end_error = std::abs(last_trajectory_end_state_[i] - last_joint_state_->position[i]);
-            max_end_error = std::max(max_end_error, end_error);
+            // Find current position of manipulator joint i
+            auto it = std::find(last_joint_state_->name.begin(),
+                                last_joint_state_->name.end(),
+                                joint_names[i]);
+
+            if (it != last_joint_state_->name.end())
+            {
+                size_t idx = std::distance(last_joint_state_->name.begin(), it);
+                double current_pos = last_joint_state_->position[idx];
+                double err = std::abs(last_trajectory_end_state_[i] - current_pos);
+                max_end_error = std::max(max_end_error, err);
+            }
         }
 
-        // STRICT: 0.30 rad (~17 deg) - robot must be very close to end before next sends
-        const double TRAJECTORY_COMPLETION_TOLERANCE = 0.30;
-
-        // Also enforce MINIMUM TIME between publishes to prevent rapid splicing
+        const double COMPLETION_TOLERANCE = 0.15; // 8.6 degrees - tighter for smooth tracking
         const rclcpp::Time now = this->now();
         const double time_since_last = (now - last_tracking_publish_time_).seconds();
-        const double MIN_TRAJECTORY_SPACING = 0.5; // At least 500ms between trajectories
+        const double MIN_SPACING = 0.3; // 300ms minimum between trajectories
 
-        if (max_end_error < TRAJECTORY_COMPLETION_TOLERANCE)
+        if (max_end_error < COMPLETION_TOLERANCE && time_since_last >= MIN_SPACING)
         {
-            // Trajectory is complete, but also check minimum spacing
-            if (time_since_last >= MIN_TRAJECTORY_SPACING)
-            {
-                should_publish = true;
-                RCLCPP_INFO(this->get_logger(),
-                            "Tracking: COMPLETE (error: %.3f rad, gap: %.3f s) → publishing next",
-                            max_end_error, time_since_last);
-            }
-            else
-            {
-                RCLCPP_DEBUG(this->get_logger(),
-                             "Tracking: complete but too soon (error: %.3f rad, only %.3f s since last)",
-                             max_end_error, time_since_last);
-            }
+            should_publish = true;
+            RCLCPP_INFO(this->get_logger(),
+                        "Tracking: COMPLETE (error: %.3f rad, gap: %.3f s) → publishing next",
+                        max_end_error, time_since_last);
         }
         else
         {
             RCLCPP_DEBUG(this->get_logger(),
-                         "Tracking: NOT complete yet (error: %.3f rad, threshold: %.3f rad)",
-                         max_end_error, TRAJECTORY_COMPLETION_TOLERANCE);
+                         "Tracking: waiting (error: %.3f rad < %.3f, gap: %.3f s < %.3f s)",
+                         max_end_error, COMPLETION_TOLERANCE,
+                         time_since_last, MIN_SPACING);
         }
     }
 
+    // === ENFORCE COMPLETION GATE ===
     if (!should_publish)
+    {
+        RCLCPP_DEBUG(this->get_logger(), "Tracking: gate closed - waiting for completion");
         return;
+    }
 
     // === PUBLISH THE TRAJECTORY ===
     publishTrackingTrajectory(*traj_ptr, last_joint_state_->name);
     last_tracking_publish_time_ = this->now();
     last_published_target_ = target;
 
-    // === CACHE END STATE FOR NEXT COMPLETION CHECK ===
+    // === CACHE END STATE FOR NEXT CHECK ===
     if (!last_joint_state_->name.empty() && traj_ptr->size() > 0)
     {
         const auto &last_point = traj_ptr->back();
-        last_trajectory_end_state_ = std::vector<double>(last_point.position.data(),
-                                                         last_point.position.data() + last_point.position.size());
-        RCLCPP_DEBUG(this->get_logger(), "Tracking: cached end state, next check at: [%.4f, %.4f, %.4f, ...]",
-                     last_trajectory_end_state_.size() > 0 ? last_trajectory_end_state_[0] : 0.0,
-                     last_trajectory_end_state_.size() > 1 ? last_trajectory_end_state_[1] : 0.0,
-                     last_trajectory_end_state_.size() > 2 ? last_trajectory_end_state_[2] : 0.0);
+        last_trajectory_end_state_ = std::vector<double>(
+            last_point.position.data(),
+            last_point.position.data() + last_point.position.size());
     }
 
-    RCLCPP_DEBUG(this->get_logger(), "Tracking: trajectory published (%.3f s horizon)",
-                 traj_ptr->empty() ? 0.0 : traj_ptr->back().time);
+    RCLCPP_INFO(this->get_logger(),
+                "Tracking: trajectory published (%.3f s horizon)",
+                traj_ptr->empty() ? 0.0 : traj_ptr->back().time);
 }

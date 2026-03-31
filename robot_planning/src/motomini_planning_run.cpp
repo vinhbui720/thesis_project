@@ -149,7 +149,7 @@ namespace Vinhtesseract_examples
                                  std::make_shared<SimplePlannerCompositeProfile>());
 
             auto ompl_profile = std::make_shared<OMPLRealVectorMoveProfile>();
-            ompl_profile->collision_check_config.longest_valid_segment_length = 0.005;
+            ompl_profile->collision_check_config.longest_valid_segment_length = planning_cfg_.ompl_longest_valid_segment;
             ompl_profile->collision_check_config.type =
                 tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
             ompl_profile->collision_check_config.contact_request.type =
@@ -157,14 +157,14 @@ namespace Vinhtesseract_examples
 
             ompl_profile->solver_config.planners.clear();
             auto rrt1 = std::make_shared<RRTConnectConfigurator>();
-            rrt1->range = 0.05;
+            rrt1->range = planning_cfg_.ompl_rrt_range_1;
             auto rrt2 = std::make_shared<RRTConnectConfigurator>();
-            rrt2->range = 0.1;
+            rrt2->range = planning_cfg_.ompl_rrt_range_2;
             ompl_profile->solver_config.planners.push_back(rrt1);
             ompl_profile->solver_config.planners.push_back(rrt2);
-            ompl_profile->solver_config.planning_time = 10.0;
-            ompl_profile->solver_config.max_solutions = 5;
-            ompl_profile->solver_config.simplify = true;
+            ompl_profile->solver_config.planning_time = planning_cfg_.ompl_planning_time;
+            ompl_profile->solver_config.max_solutions = planning_cfg_.ompl_max_solutions;
+            ompl_profile->solver_config.simplify = planning_cfg_.ompl_simplify;
 
             profiles->addProfile("OMPLTask", "FREESPACE", ompl_profile);
         }
@@ -175,47 +175,56 @@ namespace Vinhtesseract_examples
             trajopt_ifopt_move->cartesian_constraint_config.enabled = true;
             trajopt_ifopt_move->cartesian_cost_config.enabled = false;
             trajopt_ifopt_move->joint_cost_config.enabled = true;
-            trajopt_ifopt_move->joint_cost_config.coeff = Eigen::VectorXd::Ones(6) * 5.0;
+            trajopt_ifopt_move->joint_cost_config.coeff = Eigen::VectorXd::Ones(6) * planning_cfg_.ifopt_joint_cost_coeff;
 
             Eigen::VectorXd coeffs(6);
-            coeffs << 100.0, 100.0, 100.0, 100.0, 100.0, 100.0;
+            // [x, y, z, rx, ry, rz] — individual per-axis weights
+            coeffs << planning_cfg_.ifopt_cart_coeff_x,
+                planning_cfg_.ifopt_cart_coeff_y,
+                planning_cfg_.ifopt_cart_coeff_z,
+                planning_cfg_.ifopt_cart_coeff_rx,
+                planning_cfg_.ifopt_cart_coeff_ry,
+                planning_cfg_.ifopt_cart_coeff_rz;
             trajopt_ifopt_move->cartesian_constraint_config.coeff = coeffs;
 
             auto trajopt_ifopt_composite = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
 
-            // Hard collision constraint disabled for dense Cartesian toolpaths:
-            // satisfying both Cartesian constraints and hard collision avoidance simultaneously
-            // makes the NLP infeasible. Use soft cost penalty instead.
             trajopt_ifopt_composite->collision_constraint_config =
                 trajopt_common::TrajOptCollisionConfig(0.0, 200);
             trajopt_ifopt_composite->collision_constraint_config.enabled = false;
 
-            // Use LVS_CONTINUOUS so swept-volume collision is evaluated between waypoints,
-            // catching transient penetrations at substeps (e.g. magnetic_link/world_range_link).
-            // Safety margin 20 mm keeps the path well clear of the 30 mm range-sensor box.
             trajopt_ifopt_composite->collision_cost_config =
-                trajopt_common::TrajOptCollisionConfig(0.02, 500);
+                trajopt_common::TrajOptCollisionConfig(planning_cfg_.ifopt_coll_cost_margin,
+                                                       planning_cfg_.ifopt_coll_cost_coeff);
             trajopt_ifopt_composite->collision_cost_config.enabled = true;
+            // Collision evaluator type: 0=DISCRETE, 1=CONTINUOUS, 2=LVS_CONTINUOUS
+            static const tesseract_collision::CollisionEvaluatorType kEvalTypes[] = {
+                tesseract_collision::CollisionEvaluatorType::DISCRETE,
+                tesseract_collision::CollisionEvaluatorType::CONTINUOUS,
+                tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS};
+            const int eval_idx = std::max(0, std::min(2, planning_cfg_.ifopt_coll_eval_type));
             trajopt_ifopt_composite->collision_cost_config.collision_check_config.type =
-                tesseract_collision::CollisionEvaluatorType::LVS_CONTINUOUS;
+                kEvalTypes[eval_idx];
             trajopt_ifopt_composite->collision_cost_config.collision_check_config
-                .longest_valid_segment_length = 0.005;
-            trajopt_ifopt_composite->collision_cost_config.collision_margin_buffer = 0.02;
+                .longest_valid_segment_length = planning_cfg_.ifopt_coll_lvs_length;
+            trajopt_ifopt_composite->collision_cost_config.collision_margin_buffer = planning_cfg_.ifopt_coll_margin_buffer;
 
             trajopt_ifopt_composite->smooth_velocities = true;
-            trajopt_ifopt_composite->velocity_coeff = 0.1 * Eigen::VectorXd::Ones(1);
+            trajopt_ifopt_composite->velocity_coeff = planning_cfg_.ifopt_smooth_vel * Eigen::VectorXd::Ones(1);
             trajopt_ifopt_composite->smooth_accelerations = true;
-            trajopt_ifopt_composite->acceleration_coeff = Eigen::VectorXd::Ones(1);
+            trajopt_ifopt_composite->acceleration_coeff = planning_cfg_.ifopt_smooth_acc * Eigen::VectorXd::Ones(1);
             trajopt_ifopt_composite->smooth_jerks = true;
-            trajopt_ifopt_composite->jerk_coeff = Eigen::VectorXd::Ones(1);
+            trajopt_ifopt_composite->jerk_coeff = planning_cfg_.ifopt_smooth_jerk * Eigen::VectorXd::Ones(1);
 
             auto trajopt_ifopt_solver = std::make_shared<TrajOptIfoptOSQPSolverProfile>();
-            trajopt_ifopt_solver->opt_params.max_iterations = 300;
-            trajopt_ifopt_solver->opt_params.min_approx_improve = 1e-6;
-            trajopt_ifopt_solver->opt_params.min_trust_box_size = 1e-5;
-            trajopt_ifopt_solver->opt_params.initial_trust_box_size = 0.5;
+            trajopt_ifopt_solver->opt_params.max_iterations = planning_cfg_.ifopt_max_iter;
+            trajopt_ifopt_solver->opt_params.min_approx_improve = planning_cfg_.ifopt_min_approx_improve;
+            trajopt_ifopt_solver->opt_params.min_trust_box_size = planning_cfg_.ifopt_min_trust_box_size;
+            trajopt_ifopt_solver->opt_params.initial_trust_box_size = planning_cfg_.ifopt_initial_trust_box_size;
 
+            // Register move profile under both keys so either FREESPACE or LINEAR works
             profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "FREESPACE", trajopt_ifopt_move);
+            profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "CARTESIAN", trajopt_ifopt_move);
             profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "DEFAULT", trajopt_ifopt_composite);
             profiles->addProfile(TRAJOPT_IFOPT_DEFAULT_NAMESPACE, "DEFAULT", trajopt_ifopt_solver);
         }
@@ -235,6 +244,7 @@ namespace Vinhtesseract_examples
             trajopt_solver->opt_params.max_iter = 100;
 
             profiles->addProfile(TRAJOPT_DEFAULT_NAMESPACE, "FREESPACE", trajopt_freespace);
+            profiles->addProfile(TRAJOPT_DEFAULT_NAMESPACE, "CARTESIAN", trajopt_freespace);
             profiles->addProfile(TRAJOPT_DEFAULT_NAMESPACE, "DEFAULT", trajopt_composite);
             profiles->addProfile(TRAJOPT_DEFAULT_NAMESPACE, "DEFAULT", trajopt_solver);
         }
@@ -251,15 +261,17 @@ namespace Vinhtesseract_examples
         //  ADAPTIVE PARALLEL CHUNK PIPELINE
         //
         //  Architecture:
-        //    - Split target_poses into chunks of chunk_size_ (adaptive: 1..N).
-        //    - Pre-compute IK seeds at chunk boundaries so chunks can start
-        //      in parallel without waiting for the previous chunk's full solve.
+        //    - Split target_poses into chunks of chunk_size_ waypoints.
+        //    - Pre-compute IK seeds at chunk boundaries for parallel start states.
         //    - Process batches of parallel_chunks_ chunks concurrently using
         //      Taskflow async tasks, each on a cloned environment.
-        //    - As soon as a chunk is solved + ISP'd, fire chunk_ready_cb_ so
-        //      the node can publish it immediately (streaming, not all-at-once).
+        //    - Stitch all chunk trajectories into a single full_traj with
+        //      continuous timestamps (duplicate seam points dropped).
+        //    - chunk_ready_cb_ fires per chunk for progress notification only.
         //    - Seam stitching: after each batch, update the confirmed start state
-        //      from the actual end of chunk[batch_end-1] for the next batch.
+        //      from the actual TrajOpt end state for the next batch.
+        //    - The caller (startCallback) publishes full_traj once after run()
+        //      returns so the controller receives one complete trajectory.
         // ================================================================
         const std::string task_name = use_ompl_ ? "FreespacePipeline"
                                                 : (ifopt_ ? "TrajOptIfoptPipeline" : "TrajOptPipeline");
@@ -330,15 +342,23 @@ namespace Vinhtesseract_examples
             env_c->setState(joint_names, chunk_starts[ci]);
 
             // Build CI for this chunk
+            // Motion type is configurable: LINEAR keeps straight TCP paths + constrained orientation;
+            // FREESPACE allows any joint configuration to reach the Cartesian waypoint.
+            const auto move_type = planning_cfg_.use_linear ? MoveInstructionType::LINEAR
+                                                            : MoveInstructionType::FREESPACE;
+            const std::string move_profile = planning_cfg_.use_linear ? "CARTESIAN" : "FREESPACE";
+
+            // Build the Cartesian program for this chunk:
+            //   [start_state] → [pose_0] → [pose_1] → ... → [pose_N-1]
             CompositeInstruction ci_prog(
                 "DEFAULT", ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
             ci_prog.push_back(MoveInstruction(
                 StateWaypoint(joint_names, chunk_starts[ci]),
-                MoveInstructionType::FREESPACE, "FREESPACE"));
+                move_type, move_profile));
             for (size_t k = pose_begin; k < pose_end; ++k)
                 ci_prog.push_back(MoveInstruction(
                     CartesianWaypoint(target_poses_[k]),
-                    MoveInstructionType::FREESPACE, "FREESPACE"));
+                    move_type, move_profile));
 
             // TaskComposer
             TaskComposerNode::UPtr tc_task = factory.createTaskComposerNode(task_name);
@@ -456,10 +476,11 @@ namespace Vinhtesseract_examples
                 if (b == batch_sz - 1 && batch_end < n_chunks)
                     chunk_starts[batch_end] = res.traj.back().position;
 
-                CONSOLE_BRIDGE_logInform("[Run] Chunk %zu/%zu done → %.2f s total, publishing...",
-                                         ci + 1, n_chunks, time_offset);
+                CONSOLE_BRIDGE_logInform("[Run] Chunk %zu/%zu done → %zu pts, %.2f s total.",
+                                         ci + 1, n_chunks, res.traj.size(), time_offset);
 
-                // Stream-publish this chunk immediately via callback
+                // Notify chunk completion (progress only — full trajectory published by
+                // the caller after run() returns, not per-chunk).
                 if (chunk_ready_cb_)
                     chunk_ready_cb_(res.traj, joint_names, is_last);
             }

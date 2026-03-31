@@ -49,6 +49,8 @@ def generate_launch_description():
     }
 
     # 5. Define The Planner Node
+    planning_params = PathJoinSubstitution([pkg_share, "config", "planning_params.yaml"])
+
     planner_node = Node(
         package="robot_planning",
         executable="motomini_planner_node",
@@ -56,6 +58,7 @@ def generate_launch_description():
         parameters=[
             robot_description,
             robot_description_semantic,
+            planning_params,
         ],
     )
 

@@ -148,8 +148,15 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
         auto traj_ptr = planner_->getTrajectory();
         if (traj_ptr && !traj_ptr->empty())
         {
-            // Chunks were already streamed to the controller via chunk_ready_cb_ during run().
-            // Set up execution monitor from the full stitched trajectory.
+            // Publish the complete stitched trajectory once.
+            // Per-chunk streaming is NOT used: the Motoman controller does not queue
+            // trajectories — each new message preempts the current one, so only
+            // the last chunk would ever fully execute if we published per-chunk.
+            static const std::vector<std::string> planned_joints = {
+                "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+            publishTrajectory(*traj_ptr, planned_joints);
+
+            // Set up execution monitor
             target_joint_names_ = last_joint_state_->name;
             Eigen::VectorXd final_pos = traj_ptr->back().position;
             final_joint_target_.assign(final_pos.data(), final_pos.data() + final_pos.size());
@@ -160,7 +167,9 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
             bool online_mode = this->get_parameter("online_mode").as_bool();
             publishStatus(online_mode ? "Optimization Success. Executing ONLINE..."
                                       : "Optimization Success. Executing STATIC...");
-            RCLCPP_INFO(this->get_logger(), "All chunks dispatched. Monitoring joints...");
+            RCLCPP_INFO(this->get_logger(),
+                        "Full trajectory published: %zu pts, %.2f s. Monitoring joints...",
+                        traj_ptr->size(), traj_ptr->back().time);
         }
         else
         {
