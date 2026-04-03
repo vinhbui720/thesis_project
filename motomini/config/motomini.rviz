@@ -11,7 +11,7 @@ Panels:
         - /Marker2
         - /MarkerArray1
       Splitter Ratio: 0.5
-    Tree Height: 865
+    Tree Height: 441
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -137,7 +137,6 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-          Value: true
         x_carriage:
           Alpha: 1
           Show Axes: false
@@ -161,8 +160,6 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: true
-        aligned_object_frame:
-          Value: true
         base:
           Value: true
         base_link:
@@ -199,10 +196,6 @@ Visualization Manager:
           Value: true
         world_range_link:
           Value: true
-        wp_0:
-          Value: true
-        wp_1:
-          Value: true
         x_carriage:
           Value: true
         z_shaft:
@@ -214,8 +207,6 @@ Visualization Manager:
       Show Names: true
       Tree:
         world:
-          aligned_object_frame:
-            {}
           gantry_base_link:
             x_carriage:
               z_shaft:
@@ -241,10 +232,6 @@ Visualization Manager:
               {}
             world_range_link:
               {}
-          wp_0:
-            {}
-          wp_1:
-            {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
@@ -333,7 +320,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        online_planner_path: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -411,7 +398,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        online_planner_path: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -448,37 +435,37 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.3744441568851471
+      Distance: 1.056749939918518
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.5595988035202026
-        Y: -0.30863332748413086
-        Z: 0.5080916285514832
+        X: 0.1048203781247139
+        Y: -0.18363025784492493
+        Z: 0.1687472015619278
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.35000038146972656
+      Pitch: 0.2850002944469452
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 6.060019016265869
+      Yaw: 6.275031089782715
     Saved: ~
 Window Geometry:
   Displays:
-    collapsed: false
-  Height: 1016
-  Hide Left Dock: false
+    collapsed: true
+  Height: 752
+  Hide Left Dock: true
   Hide Right Dock: true
   Image:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000200000000000001f40000039efc0200000002fb000000100044006900730070006c006100790073010000003d0000039e000000c900fffffffb0000000a0049006d00610067006500000002af0000012c0000002800ffffff000000010000018e0000039efc0200000001fb0000000a00560069006500770073000000003d0000039e000000a400ffffff000005860000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000200000000000001f400000296fc0200000002fb000000100044006900730070006c006100790073000000003d00000296000000c900fffffffb0000000a0049006d00610067006500000002af0000012c0000002800ffffff000000010000018e0000039efc0200000001fb0000000a00560069006500770073000000003d0000039e000000a400ffffff000003090000029600000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: true
-  Width: 1920
-  X: 0
-  Y: 27
+  Width: 777
+  X: 1018
+  Y: 114

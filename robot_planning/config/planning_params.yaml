@@ -39,9 +39,9 @@ motomini_planning_node:
     ifopt_cart_coeff_x:  100.0   # X translation weight
     ifopt_cart_coeff_y:  100.0   # Y translation weight
     ifopt_cart_coeff_z:  100.0   # Z translation weight
-    ifopt_cart_coeff_rx:   0.0   # Roll  weight (0 = free)
-    ifopt_cart_coeff_ry:   0.0   # Pitch weight (0 = free)
-    ifopt_cart_coeff_rz:   0.0   # Yaw   weight (0 = free)
+    ifopt_cart_coeff_rx: 10.0   # Roll  weight (0 = free)
+    ifopt_cart_coeff_ry: 10.0   # Pitch weight (0 = free)
+    ifopt_cart_coeff_rz: 10.0   # Yaw   weight (0 = free)
 
     # Joint cost (discourages large joint movements; acts like a regularizer)
     ifopt_joint_cost_coeff: 5.0
@@ -52,11 +52,11 @@ motomini_planning_node:
     #  collision_cost_coeff:  penalty for violating the margin (higher = stronger push)
     #  coll_margin_buffer:    extra buffer on top of margin for LVS swept volume check
     # ===========================================================================
-    ifopt_coll_cost_margin: 0.02        # 20 mm minimum clearance
-    ifopt_coll_cost_coeff: 500.0        # penalty weight
-    ifopt_coll_margin_buffer: 0.02      # swept-volume buffer
+    ifopt_coll_cost_margin: 0.0002        # 20 mm minimum clearance
+    ifopt_coll_cost_coeff: 50.0        # penalty weight
+    ifopt_coll_margin_buffer: 0.2      # swept-volume buffer
     # 0 = DISCRETE, 1 = CONTINUOUS, 2 = LVS_CONTINUOUS
-    ifopt_coll_eval_type: 2
+    ifopt_coll_eval_type: 0
     ifopt_coll_lvs_length: 0.005        # longest_valid_segment_length (m)
 
     # ===========================================================================
@@ -71,7 +71,7 @@ motomini_planning_node:
     # ===========================================================================
     #  TRAJOPT-IFOPT — SQP Solver
     # ===========================================================================
-    ifopt_max_iter: 300                    # max SQP iterations
-    ifopt_min_approx_improve: 1.0e-6       # stop if cost improvement < this
+    ifopt_max_iter: 200                    # max SQP iterations
+    ifopt_min_approx_improve: 1.0e-3       # stop if cost improvement < this
     ifopt_min_trust_box_size: 1.0e-5       # stop if trust region shrinks below this
     ifopt_initial_trust_box_size: 0.5      # initial SQP step size

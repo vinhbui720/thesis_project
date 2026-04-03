@@ -3,6 +3,8 @@
 import sys
 import math
 import signal
+import yaml
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -24,6 +26,33 @@ from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import QValidator
+
+
+# =====================================================
+# CONFIG LOADER
+# =====================================================
+
+def load_planning_params():
+    """Load planning parameters from planning_params.yaml.
+    Returns a dict of parameters, or an empty dict if file not found."""
+    config_paths = [
+        Path.home() / "vinh_ws" / "install" / "robot_planning" / "share" / "robot_planning" / "config" / "planning_params.yaml",
+        Path.home() / "vinh_ws" / "src" / "thesis_project" / "robot_planning" / "config" / "planning_params.yaml",
+        Path("/home/vinbui/vinh_ws/src/thesis_project/robot_planning/config/planning_params.yaml"),
+    ]
+    
+    for config_path in config_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    data = yaml.safe_load(f)
+                    if data and 'motomini_planning_node' in data:
+                        return data['motomini_planning_node'].get('ros__parameters', {})
+            except Exception as e:
+                print(f"Error loading {config_path}: {e}")
+    
+    print("Warning: planning_params.yaml not found, using hardcoded defaults")
+    return {}
 
 
 # =====================================================
@@ -323,7 +352,7 @@ class PlanningTab(QWidget):
 
         for row,(label,key,mn,mx,val) in enumerate(fields):
             grid.addWidget(QLabel(label),row,0)
-            sb=QDoubleSpinBox()
+            sb=ScientificDoubleSpinBox()
             sb.setDecimals(9)          # 9 decimal places — maximum useful float64 precision
             sb.setSingleStep(0.000000001)
             sb.setRange(mn,mx)
@@ -372,16 +401,21 @@ class PlanningTab(QWidget):
         send=QPushButton("Send")
         start=QPushButton("Start")
         clear=QPushButton("Clear")
+        home=QPushButton("🏠 Home")
+        home.setStyleSheet("font-weight: bold; background-color: #3498db; color: white;")
+        home.setToolTip("Move to home position (x=0.18, y=0.0, z=0.245) and start")
 
         add.clicked.connect(self.add_motomini_pose)
         send.clicked.connect(self.send_motomini)
         start.clicked.connect(self.start_motomini)
         clear.clicked.connect(self.clear_motomini)
+        home.clicked.connect(self.home_motomini)
 
         btn_layout.addWidget(add)
         btn_layout.addWidget(send)
         btn_layout.addWidget(start)
         btn_layout.addWidget(clear)
+        btn_layout.addWidget(home)
         box_layout.addLayout(btn_layout)
 
         self.motomini_list=QListWidget()
@@ -621,6 +655,31 @@ class PlanningTab(QWidget):
 
     # ------------------------------------------------
 
+    def home_motomini(self):
+        """Send robot to home position (x=0.18, y=0.0, z=0.245) with no orientation constraint."""
+        
+        # Create home pose
+        pose = Pose()
+        pose.position.x = 0.18
+        pose.position.y = 0.0
+        pose.position.z = 0.245
+        # No orientation constraint (identity quaternion)
+        pose.orientation.w = 1.0
+        pose.orientation.x = 0.0
+        pose.orientation.y = 0.0
+        pose.orientation.z = 0.0
+        
+        # Add to buffer and send
+        self.motomini_buffer = [pose]
+        self.motomini_list.clear()
+        self.motomini_list.addItem("0.18, 0.0, 0.245 (Home)")
+        
+        # Send pose and start immediately
+        self.send_motomini()
+        self.start_motomini()
+
+    # ------------------------------------------------
+
     def set_tracking_mode(self, enabled: bool):
 
         msg = Bool()
@@ -649,6 +708,9 @@ class PlannerTuningTab(QWidget):
         super().__init__()
         self.node = node
         self._pending_future = None
+        
+        # Load configuration from planning_params.yaml
+        self.params = load_planning_params()
 
         # Wrap everything in a scroll area (many params)
         outer = QVBoxLayout()
@@ -664,7 +726,8 @@ class PlannerTuningTab(QWidget):
         r.addWidget(QLabel("Type:"))
         self.motion_type = QComboBox()
         self.motion_type.addItems(["FREESPACE", "LINEAR"])
-        self.motion_type.setCurrentText("FREESPACE")
+        default_motion_type = self.params.get("move_instruction_type", "FREESPACE")
+        self.motion_type.setCurrentText(default_motion_type)
         self.motion_type.setToolTip(
             "FREESPACE: free joint path to reach each waypoint (orientation unconstrained)\n"
             "LINEAR: straight TCP path between waypoints (orientation constrained)")
@@ -676,12 +739,12 @@ class PlannerTuningTab(QWidget):
         # --- Cartesian Constraint Coefficients ---
         g = QGroupBox("Cartesian Constraint Coefficients  [x, y, z,  rx, ry, rz]")
         gl = QGridLayout()
-        self.cart_x  = self._dspin(0, 10000, 100.0, 10.0, "Weight for X translation.")
-        self.cart_y  = self._dspin(0, 10000, 100.0, 10.0, "Weight for Y translation.")
-        self.cart_z  = self._dspin(0, 10000, 100.0, 10.0, "Weight for Z translation.")
-        self.cart_rx = self._dspin(0, 10000,   0.0, 10.0, "Weight for Roll  (0 = free rotation).")
-        self.cart_ry = self._dspin(0, 10000,   0.0, 10.0, "Weight for Pitch (0 = free rotation).")
-        self.cart_rz = self._dspin(0, 10000,   0.0, 10.0, "Weight for Yaw   (0 = free rotation).")
+        self.cart_x  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_x", 100.0), 10.0, "Weight for X translation.")
+        self.cart_y  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_y", 100.0), 10.0, "Weight for Y translation.")
+        self.cart_z  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_z", 100.0), 10.0, "Weight for Z translation.")
+        self.cart_rx = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rx", 0.0), 10.0, "Weight for Roll  (0 = free rotation).")
+        self.cart_ry = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_ry", 0.0), 10.0, "Weight for Pitch (0 = free rotation).")
+        self.cart_rz = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rz", 0.0), 10.0, "Weight for Yaw   (0 = free rotation).")
         gl.addWidget(QLabel("X weight:"),  0, 0); gl.addWidget(self.cart_x,  0, 1)
         gl.addWidget(QLabel("Y weight:"),  1, 0); gl.addWidget(self.cart_y,  1, 1)
         gl.addWidget(QLabel("Z weight:"),  2, 0); gl.addWidget(self.cart_z,  2, 1)
@@ -695,7 +758,7 @@ class PlannerTuningTab(QWidget):
         # --- Joint Cost ---
         g = QGroupBox("Joint Cost  (regularizer — penalises large joint moves)")
         r = QHBoxLayout()
-        self.joint_coeff = self._dspin(0, 1000, 5.0, 1.0,
+        self.joint_coeff = self._dspin(0, 1000, self.params.get("ifopt_joint_cost_coeff", 5.0), 1.0,
             "Higher = smoother joint trajectory, less aggressive movement.")
         r.addWidget(QLabel("Joint cost coeff:"))
         r.addWidget(self.joint_coeff)
@@ -706,21 +769,21 @@ class PlannerTuningTab(QWidget):
         # --- Collision Avoidance ---
         g = QGroupBox("Collision Avoidance  (soft cost)")
         gl = QGridLayout()
-        self.coll_margin = self._dspin(0, 0.5, 0.02, 0.005, decimals=4,
+        self.coll_margin = self._dspin(0, 0.5, self.params.get("ifopt_coll_cost_margin", 0.02), 0.005, decimals=4,
             tip="Minimum clearance from obstacles (metres).")
-        self.coll_coeff  = self._dspin(0, 10000, 500.0, 50.0,
+        self.coll_coeff  = self._dspin(0, 10000, self.params.get("ifopt_coll_cost_coeff", 500.0), 50.0,
             tip="Penalty weight for violating the margin. Higher = stronger push-away.")
-        self.coll_buffer = self._dspin(0, 0.5, 0.02, 0.005, decimals=4,
+        self.coll_buffer = self._dspin(0, 0.5, self.params.get("ifopt_coll_margin_buffer", 0.02), 0.005, decimals=4,
             tip="Extra buffer on top of margin for LVS swept-volume check.")
         self.coll_eval_type = QComboBox()
         self.coll_eval_type.addItems(["0 – DISCRETE", "1 – CONTINUOUS", "2 – LVS_CONTINUOUS"])
-        self.coll_eval_type.setCurrentIndex(2)
+        self.coll_eval_type.setCurrentIndex(self.params.get("ifopt_coll_eval_type", 0))
         self.coll_eval_type.setToolTip(
             "Collision evaluator type used during TrajOpt planning.\n"
             "DISCRETE: check at each point only.\n"
             "CONTINUOUS: swept-volume check between consecutive points.\n"
             "LVS_CONTINUOUS: continuous with longest-valid-segment length.")
-        self.coll_lvs = self._dspin(0.0001, 1.0, 0.005, 0.001, decimals=5,
+        self.coll_lvs = self._dspin(0.0001, 1.0, self.params.get("ifopt_coll_lvs_length", 0.005), 0.001, decimals=5,
             tip="longest_valid_segment_length (m) — used when eval type is LVS_CONTINUOUS.")
         gl.addWidget(QLabel("Margin (m):"),        0, 0); gl.addWidget(self.coll_margin,    0, 1)
         gl.addWidget(QLabel("Coeff:"),             1, 0); gl.addWidget(self.coll_coeff,     1, 1)
@@ -733,11 +796,11 @@ class PlannerTuningTab(QWidget):
         # --- Trajectory Smoothing ---
         g = QGroupBox("Trajectory Smoothing  (velocity / acceleration / jerk)")
         gl = QGridLayout()
-        self.smooth_vel  = self._dspin(0, 100, 0.1, 0.05, decimals=4,
+        self.smooth_vel  = self._dspin(0, 100, self.params.get("ifopt_smooth_vel_coeff", 0.1), 0.05, decimals=4,
             tip="Velocity smoothing weight across waypoints.")
-        self.smooth_acc  = self._dspin(0, 100, 1.0, 0.1,
+        self.smooth_acc  = self._dspin(0, 100, self.params.get("ifopt_smooth_acc_coeff", 1.0), 0.1,
             tip="Acceleration smoothing weight.")
-        self.smooth_jerk = self._dspin(0, 100, 1.0, 0.1,
+        self.smooth_jerk = self._dspin(0, 100, self.params.get("ifopt_smooth_jerk_coeff", 1.0), 0.1,
             tip="Jerk smoothing weight.")
         gl.addWidget(QLabel("Velocity:"),     0, 0); gl.addWidget(self.smooth_vel,  0, 1)
         gl.addWidget(QLabel("Acceleration:"), 1, 0); gl.addWidget(self.smooth_acc,  1, 1)
@@ -750,13 +813,13 @@ class PlannerTuningTab(QWidget):
         gl = QGridLayout()
         self.max_iter   = QSpinBox()
         self.max_iter.setRange(1, 10000)
-        self.max_iter.setValue(300)
+        self.max_iter.setValue(self.params.get("ifopt_max_iter", 200))
         self.max_iter.setToolTip("Maximum SQP iterations per chunk.")
-        self.min_approx = self._dspin(0, 1, 1e-6, 1e-7, decimals=9,
+        self.min_approx = self._dspin(0, 1, self.params.get("ifopt_min_approx_improve", 1.0e-3), 1e-7, decimals=9,
             tip="Stop if cost improvement per iteration < this.")
-        self.min_trust  = self._dspin(0, 1, 1e-5, 1e-6, decimals=9,
+        self.min_trust  = self._dspin(0, 1, self.params.get("ifopt_min_trust_box_size", 1.0e-3), 1e-6, decimals=9,
             tip="Stop if trust region shrinks below this.")
-        self.init_trust = self._dspin(0, 10, 0.5, 0.05,
+        self.init_trust = self._dspin(0, 10, self.params.get("ifopt_initial_trust_box_size", 0.5), 0.05,
             tip="Initial SQP step size.")
         gl.addWidget(QLabel("Max iterations:"),      0, 0); gl.addWidget(self.max_iter,   0, 1)
         gl.addWidget(QLabel("Min approx improve:"),  1, 0); gl.addWidget(self.min_approx, 1, 1)
@@ -770,11 +833,11 @@ class PlannerTuningTab(QWidget):
         gl = QGridLayout()
         self.chunk_size     = QSpinBox()
         self.chunk_size.setRange(1, 1000)
-        self.chunk_size.setValue(5)
+        self.chunk_size.setValue(self.params.get("planning_chunk_size", 5))
         self.chunk_size.setToolTip("Number of waypoints per TrajOpt solve. Smaller = faster per chunk, more chunks.")
         self.parallel_chunks = QSpinBox()
         self.parallel_chunks.setRange(1, 32)
-        self.parallel_chunks.setValue(2)
+        self.parallel_chunks.setValue(self.params.get("planning_parallel_chunks", 2))
         self.parallel_chunks.setToolTip("Maximum concurrent TrajOpt solves (should match CPU core count).")
         gl.addWidget(QLabel("Chunk size (waypoints):"), 0, 0); gl.addWidget(self.chunk_size,      0, 1)
         gl.addWidget(QLabel("Parallel chunks:"),        1, 0); gl.addWidget(self.parallel_chunks, 1, 1)
@@ -785,23 +848,23 @@ class PlannerTuningTab(QWidget):
         g = QGroupBox("OMPL  (toggle below or set use_ompl at launch)")
         gl = QGridLayout()
         self.ompl_enable = QCheckBox("Enable OMPL (use_ompl)")
-        self.ompl_enable.setChecked(False)
+        self.ompl_enable.setChecked(self.params.get("use_ompl", False))
         self.ompl_enable.setToolTip(
             "Toggle OMPL planner on/off at runtime.\n"
             "When ON: FreespacePipeline (OMPL + TrajOpt refine).\n"
             "When OFF: TrajOptIfopt or TrajOpt direct.")
-        self.ompl_time    = self._dspin(0.1, 120, 10.0, 1.0,
+        self.ompl_time    = self._dspin(0.1, 120, self.params.get("ompl_planning_time", 10.0), 1.0,
             tip="Seconds allowed per OMPL planning call.")
         self.ompl_max_sol = QSpinBox()
         self.ompl_max_sol.setRange(1, 100)
-        self.ompl_max_sol.setValue(5)
+        self.ompl_max_sol.setValue(self.params.get("ompl_max_solutions", 5))
         self.ompl_max_sol.setToolTip("OMPL stops after finding this many solutions.")
         self.ompl_simplify = QCheckBox("Simplify path")
-        self.ompl_simplify.setChecked(True)
+        self.ompl_simplify.setChecked(self.params.get("ompl_simplify", True))
         self.ompl_simplify.setToolTip("Post-process OMPL path to smooth / shorten.")
-        self.ompl_rrt1 = self._dspin(0.001, 5.0, 0.05, 0.01, decimals=4,
+        self.ompl_rrt1 = self._dspin(0.001, 5.0, self.params.get("ompl_rrt_range_1", 0.05), 0.01, decimals=4,
             tip="RRTConnect tree expansion range (tight).")
-        self.ompl_rrt2 = self._dspin(0.001, 5.0, 0.10, 0.01, decimals=4,
+        self.ompl_rrt2 = self._dspin(0.001, 5.0, self.params.get("ompl_rrt_range_2", 0.10), 0.01, decimals=4,
             tip="RRTConnect tree expansion range (loose).")
         gl.addWidget(self.ompl_enable,             0, 0, 1, 2)
         gl.addWidget(QLabel("Planning time (s):"), 1, 0); gl.addWidget(self.ompl_time,    1, 1)
