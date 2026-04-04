@@ -144,6 +144,27 @@ ament_target_dependencies(online_collision_debugger
   visualization_msgs
 )
 
+add_executable(enhanced_debug_node src/enhanced_debug_node.cpp)
+target_link_libraries(enhanced_debug_node
+  tesseract::tesseract_environment
+  tesseract::tesseract_collision_core
+  tesseract::tesseract_kinematics_core
+  tesseract::tesseract_visualization
+  tesseract::tesseract_scene_graph
+  tesseract::tesseract_command_language
+)
+ament_target_dependencies(enhanced_debug_node
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  tesseract_environment
+  tesseract_common
+  tesseract_visualization
+)
+target_include_directories(enhanced_debug_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+
 add_executable(grinding_task src/grinding_task.cpp)
 target_link_libraries(grinding_task ${PROJECT_NAME})
 ament_target_dependencies(grinding_task
@@ -176,6 +197,7 @@ install(TARGETS
   gantry_planning_node
   gantry_loop_controller_node
   online_collision_debugger
+  enhanced_debug_node
   grinding_task
   DESTINATION lib/${PROJECT_NAME}
 )

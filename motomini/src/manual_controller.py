@@ -739,36 +739,54 @@ class PlannerTuningTab(QWidget):
         # --- Cartesian Constraint Coefficients ---
         g = QGroupBox("Cartesian Constraint Coefficients  [x, y, z,  rx, ry, rz]")
         gl = QGridLayout()
+        self.cart_constraint_en = QCheckBox("Enable cartesian_constraint (hard)")
+        self.cart_constraint_en.setChecked(self.params.get("ifopt_cart_constraint_enable", True))
+        self.cart_constraint_en.setToolTip("Enable the hard Cartesian constraint. Disable if using cart_cost instead.")
+        self.cart_cost_en = QCheckBox("Enable cartesian_cost (soft)")
+        self.cart_cost_en.setChecked(self.params.get("ifopt_cart_cost_enable", False))
+        self.cart_cost_en.setToolTip("Enable Cartesian target as a soft cost. Usually off when constraint is on.")
         self.cart_x  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_x", 100.0), 10.0, "Weight for X translation.")
         self.cart_y  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_y", 100.0), 10.0, "Weight for Y translation.")
         self.cart_z  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_z", 100.0), 10.0, "Weight for Z translation.")
         self.cart_rx = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rx", 0.0), 10.0, "Weight for Roll  (0 = free rotation).")
         self.cart_ry = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_ry", 0.0), 10.0, "Weight for Pitch (0 = free rotation).")
         self.cart_rz = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rz", 0.0), 10.0, "Weight for Yaw   (0 = free rotation).")
-        gl.addWidget(QLabel("X weight:"),  0, 0); gl.addWidget(self.cart_x,  0, 1)
-        gl.addWidget(QLabel("Y weight:"),  1, 0); gl.addWidget(self.cart_y,  1, 1)
-        gl.addWidget(QLabel("Z weight:"),  2, 0); gl.addWidget(self.cart_z,  2, 1)
-        gl.addWidget(QLabel("Rx (roll):"), 3, 0); gl.addWidget(self.cart_rx, 3, 1)
-        gl.addWidget(QLabel("Ry (pitch):"),4, 0); gl.addWidget(self.cart_ry, 4, 1)
-        gl.addWidget(QLabel("Rz (yaw):"),  5, 0); gl.addWidget(self.cart_rz, 5, 1)
-        gl.addWidget(QLabel("(0 = free rotation, 100+ = constrained)"), 6, 0, 1, 2)
+        gl.addWidget(self.cart_constraint_en, 0, 0, 1, 2)
+        gl.addWidget(self.cart_cost_en,       1, 0, 1, 2)
+        gl.addWidget(QLabel("X weight:"),  2, 0); gl.addWidget(self.cart_x,  2, 1)
+        gl.addWidget(QLabel("Y weight:"),  3, 0); gl.addWidget(self.cart_y,  3, 1)
+        gl.addWidget(QLabel("Z weight:"),  4, 0); gl.addWidget(self.cart_z,  4, 1)
+        gl.addWidget(QLabel("Rx (roll):"), 5, 0); gl.addWidget(self.cart_rx, 5, 1)
+        gl.addWidget(QLabel("Ry (pitch):"),6, 0); gl.addWidget(self.cart_ry, 6, 1)
+        gl.addWidget(QLabel("Rz (yaw):"),  7, 0); gl.addWidget(self.cart_rz, 7, 1)
+        gl.addWidget(QLabel("(0 = free rotation, 100+ = constrained)"), 8, 0, 1, 2)
         g.setLayout(gl)
         layout.addWidget(g)
 
         # --- Joint Cost ---
         g = QGroupBox("Joint Cost  (regularizer — penalises large joint moves)")
         r = QHBoxLayout()
+        self.joint_cost_en = QCheckBox("Enable")
+        self.joint_cost_en.setChecked(self.params.get("ifopt_joint_cost_enable", True))
+        self.joint_cost_en.setToolTip("Enable the joint cost regularizer. Disable to stop overshoot caused by joint-vs-Cartesian conflict.")
         self.joint_coeff = self._dspin(0, 1000, self.params.get("ifopt_joint_cost_coeff", 5.0), 1.0,
             "Higher = smoother joint trajectory, less aggressive movement.")
-        r.addWidget(QLabel("Joint cost coeff:"))
+        r.addWidget(self.joint_cost_en)
+        r.addWidget(QLabel("Coeff:"))
         r.addWidget(self.joint_coeff)
         r.addStretch()
         g.setLayout(r)
         layout.addWidget(g)
 
         # --- Collision Avoidance ---
-        g = QGroupBox("Collision Avoidance  (soft cost)")
+        g = QGroupBox("Collision Avoidance  (soft cost / hard constraint)")
         gl = QGridLayout()
+        self.coll_cost_en = QCheckBox("Enable collision cost (soft)")
+        self.coll_cost_en.setChecked(self.params.get("ifopt_coll_cost_enable", True))
+        self.coll_cost_en.setToolTip("Soft penalty cost pushing away from obstacles.")
+        self.coll_constraint_en = QCheckBox("Enable collision constraint (hard, slow)")
+        self.coll_constraint_en.setChecked(self.params.get("ifopt_coll_constraint_enable", False))
+        self.coll_constraint_en.setToolTip("Hard constraint — much slower. Usually keep disabled.")
         self.coll_margin = self._dspin(0, 0.5, self.params.get("ifopt_coll_cost_margin", 0.02), 0.005, decimals=4,
             tip="Minimum clearance from obstacles (metres).")
         self.coll_coeff  = self._dspin(0, 10000, self.params.get("ifopt_coll_cost_coeff", 500.0), 50.0,
@@ -785,26 +803,34 @@ class PlannerTuningTab(QWidget):
             "LVS_CONTINUOUS: continuous with longest-valid-segment length.")
         self.coll_lvs = self._dspin(0.0001, 1.0, self.params.get("ifopt_coll_lvs_length", 0.005), 0.001, decimals=5,
             tip="longest_valid_segment_length (m) — used when eval type is LVS_CONTINUOUS.")
-        gl.addWidget(QLabel("Margin (m):"),        0, 0); gl.addWidget(self.coll_margin,    0, 1)
-        gl.addWidget(QLabel("Coeff:"),             1, 0); gl.addWidget(self.coll_coeff,     1, 1)
-        gl.addWidget(QLabel("Buffer (m):"),        2, 0); gl.addWidget(self.coll_buffer,    2, 1)
-        gl.addWidget(QLabel("Evaluator type:"),    3, 0); gl.addWidget(self.coll_eval_type, 3, 1)
-        gl.addWidget(QLabel("LVS length (m):"),    4, 0); gl.addWidget(self.coll_lvs,       4, 1)
+        gl.addWidget(self.coll_cost_en,            0, 0, 1, 2)
+        gl.addWidget(self.coll_constraint_en,      1, 0, 1, 2)
+        gl.addWidget(QLabel("Margin (m):"),        2, 0); gl.addWidget(self.coll_margin,    2, 1)
+        gl.addWidget(QLabel("Coeff:"),             3, 0); gl.addWidget(self.coll_coeff,     3, 1)
+        gl.addWidget(QLabel("Buffer (m):"),        4, 0); gl.addWidget(self.coll_buffer,    4, 1)
+        gl.addWidget(QLabel("Evaluator type:"),    5, 0); gl.addWidget(self.coll_eval_type, 5, 1)
+        gl.addWidget(QLabel("LVS length (m):"),    6, 0); gl.addWidget(self.coll_lvs,       6, 1)
         g.setLayout(gl)
         layout.addWidget(g)
 
         # --- Trajectory Smoothing ---
         g = QGroupBox("Trajectory Smoothing  (velocity / acceleration / jerk)")
         gl = QGridLayout()
+        self.smooth_vel_en  = QCheckBox("Enable velocity smoothing")
+        self.smooth_vel_en.setChecked(self.params.get("ifopt_smooth_vel_enable", True))
+        self.smooth_acc_en  = QCheckBox("Enable acceleration smoothing")
+        self.smooth_acc_en.setChecked(self.params.get("ifopt_smooth_acc_enable", True))
+        self.smooth_jerk_en = QCheckBox("Enable jerk smoothing")
+        self.smooth_jerk_en.setChecked(self.params.get("ifopt_smooth_jerk_enable", True))
         self.smooth_vel  = self._dspin(0, 100, self.params.get("ifopt_smooth_vel_coeff", 0.1), 0.05, decimals=4,
             tip="Velocity smoothing weight across waypoints.")
         self.smooth_acc  = self._dspin(0, 100, self.params.get("ifopt_smooth_acc_coeff", 1.0), 0.1,
             tip="Acceleration smoothing weight.")
         self.smooth_jerk = self._dspin(0, 100, self.params.get("ifopt_smooth_jerk_coeff", 1.0), 0.1,
             tip="Jerk smoothing weight.")
-        gl.addWidget(QLabel("Velocity:"),     0, 0); gl.addWidget(self.smooth_vel,  0, 1)
-        gl.addWidget(QLabel("Acceleration:"), 1, 0); gl.addWidget(self.smooth_acc,  1, 1)
-        gl.addWidget(QLabel("Jerk:"),         2, 0); gl.addWidget(self.smooth_jerk, 2, 1)
+        gl.addWidget(self.smooth_vel_en,       0, 0); gl.addWidget(self.smooth_vel,  0, 1)
+        gl.addWidget(self.smooth_acc_en,       1, 0); gl.addWidget(self.smooth_acc,  1, 1)
+        gl.addWidget(self.smooth_jerk_en,      2, 0); gl.addWidget(self.smooth_jerk, 2, 1)
         g.setLayout(gl)
         layout.addWidget(g)
 
@@ -915,6 +941,15 @@ class PlannerTuningTab(QWidget):
             "move_instruction_type":      self.motion_type.currentText(),
             # Runtime OMPL toggle
             "use_ompl":                   self.ompl_enable.isChecked(),
+            # IFOPT enable flags
+            "ifopt_joint_cost_enable":    self.joint_cost_en.isChecked(),
+            "ifopt_cart_constraint_enable": self.cart_constraint_en.isChecked(),
+            "ifopt_cart_cost_enable":     self.cart_cost_en.isChecked(),
+            "ifopt_coll_constraint_enable": self.coll_constraint_en.isChecked(),
+            "ifopt_coll_cost_enable":     self.coll_cost_en.isChecked(),
+            "ifopt_smooth_vel_enable":    self.smooth_vel_en.isChecked(),
+            "ifopt_smooth_acc_enable":    self.smooth_acc_en.isChecked(),
+            "ifopt_smooth_jerk_enable":   self.smooth_jerk_en.isChecked(),
             # Per-axis cartesian constraints
             "ifopt_cart_coeff_x":         self.cart_x.value(),
             "ifopt_cart_coeff_y":         self.cart_y.value(),

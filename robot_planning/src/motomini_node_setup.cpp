@@ -121,6 +121,15 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("ifopt_min_approx_improve", 1e-6);
     this->declare_parameter<double>("ifopt_min_trust_box_size", 1e-5);
     this->declare_parameter<double>("ifopt_initial_trust_box_size", 0.5);
+    // IFOPT enable/disable flags
+    this->declare_parameter<bool>("ifopt_joint_cost_enable", true);
+    this->declare_parameter<bool>("ifopt_cart_constraint_enable", true);
+    this->declare_parameter<bool>("ifopt_cart_cost_enable", false);
+    this->declare_parameter<bool>("ifopt_coll_constraint_enable", false);
+    this->declare_parameter<bool>("ifopt_coll_cost_enable", true);
+    this->declare_parameter<bool>("ifopt_smooth_vel_enable", true);
+    this->declare_parameter<bool>("ifopt_smooth_acc_enable", true);
+    this->declare_parameter<bool>("ifopt_smooth_jerk_enable", true);
 
     {
         MotoMiniPlanning::PlanningConfig cfg;
@@ -152,6 +161,14 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         cfg.ifopt_min_approx_improve = this->get_parameter("ifopt_min_approx_improve").as_double();
         cfg.ifopt_min_trust_box_size = this->get_parameter("ifopt_min_trust_box_size").as_double();
         cfg.ifopt_initial_trust_box_size = this->get_parameter("ifopt_initial_trust_box_size").as_double();
+        cfg.ifopt_joint_cost_enable = this->get_parameter("ifopt_joint_cost_enable").as_bool();
+        cfg.ifopt_cart_constraint_enable = this->get_parameter("ifopt_cart_constraint_enable").as_bool();
+        cfg.ifopt_cart_cost_enable = this->get_parameter("ifopt_cart_cost_enable").as_bool();
+        cfg.ifopt_coll_constraint_enable = this->get_parameter("ifopt_coll_constraint_enable").as_bool();
+        cfg.ifopt_coll_cost_enable = this->get_parameter("ifopt_coll_cost_enable").as_bool();
+        cfg.ifopt_smooth_vel_enable = this->get_parameter("ifopt_smooth_vel_enable").as_bool();
+        cfg.ifopt_smooth_acc_enable = this->get_parameter("ifopt_smooth_acc_enable").as_bool();
+        cfg.ifopt_smooth_jerk_enable = this->get_parameter("ifopt_smooth_jerk_enable").as_bool();
         planner_->configurePlanningParams(cfg);
         RCLCPP_INFO(this->get_logger(),
                     "Planning config: mode=%s  ompl=%s  chunk=%d  parallel=%d  "
@@ -411,6 +428,22 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
                 cfg.ifopt_min_trust_box_size = p.as_double();
             else if (n == "ifopt_initial_trust_box_size")
                 cfg.ifopt_initial_trust_box_size = p.as_double();
+            else if (n == "ifopt_joint_cost_enable")
+                cfg.ifopt_joint_cost_enable = p.as_bool();
+            else if (n == "ifopt_cart_constraint_enable")
+                cfg.ifopt_cart_constraint_enable = p.as_bool();
+            else if (n == "ifopt_cart_cost_enable")
+                cfg.ifopt_cart_cost_enable = p.as_bool();
+            else if (n == "ifopt_coll_constraint_enable")
+                cfg.ifopt_coll_constraint_enable = p.as_bool();
+            else if (n == "ifopt_coll_cost_enable")
+                cfg.ifopt_coll_cost_enable = p.as_bool();
+            else if (n == "ifopt_smooth_vel_enable")
+                cfg.ifopt_smooth_vel_enable = p.as_bool();
+            else if (n == "ifopt_smooth_acc_enable")
+                cfg.ifopt_smooth_acc_enable = p.as_bool();
+            else if (n == "ifopt_smooth_jerk_enable")
+                cfg.ifopt_smooth_jerk_enable = p.as_bool();
             else if (n == "ompl_planning_time")
                 cfg.ompl_planning_time = p.as_double();
             else if (n == "ompl_max_solutions")

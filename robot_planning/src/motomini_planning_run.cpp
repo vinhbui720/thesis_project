@@ -172,9 +172,9 @@ namespace Vinhtesseract_examples
         if (ifopt_)
         {
             auto trajopt_ifopt_move = std::make_shared<TrajOptIfoptDefaultMoveProfile>();
-            trajopt_ifopt_move->cartesian_constraint_config.enabled = true;
-            trajopt_ifopt_move->cartesian_cost_config.enabled = false;
-            trajopt_ifopt_move->joint_cost_config.enabled = true;
+            trajopt_ifopt_move->cartesian_constraint_config.enabled = planning_cfg_.ifopt_cart_constraint_enable;
+            trajopt_ifopt_move->cartesian_cost_config.enabled = planning_cfg_.ifopt_cart_cost_enable;
+            trajopt_ifopt_move->joint_cost_config.enabled = planning_cfg_.ifopt_joint_cost_enable;
             trajopt_ifopt_move->joint_cost_config.coeff = Eigen::VectorXd::Ones(6) * planning_cfg_.ifopt_joint_cost_coeff;
 
             Eigen::VectorXd coeffs(6);
@@ -191,12 +191,12 @@ namespace Vinhtesseract_examples
 
             trajopt_ifopt_composite->collision_constraint_config =
                 trajopt_common::TrajOptCollisionConfig(0.0, 200);
-            trajopt_ifopt_composite->collision_constraint_config.enabled = false;
+            trajopt_ifopt_composite->collision_constraint_config.enabled = planning_cfg_.ifopt_coll_constraint_enable;
 
             trajopt_ifopt_composite->collision_cost_config =
                 trajopt_common::TrajOptCollisionConfig(planning_cfg_.ifopt_coll_cost_margin,
                                                        planning_cfg_.ifopt_coll_cost_coeff);
-            trajopt_ifopt_composite->collision_cost_config.enabled = true;
+            trajopt_ifopt_composite->collision_cost_config.enabled = planning_cfg_.ifopt_coll_cost_enable;
             // Collision evaluator type: 0=DISCRETE, 1=CONTINUOUS, 2=LVS_CONTINUOUS
             static const tesseract_collision::CollisionEvaluatorType kEvalTypes[] = {
                 tesseract_collision::CollisionEvaluatorType::DISCRETE,
@@ -209,11 +209,11 @@ namespace Vinhtesseract_examples
                 .longest_valid_segment_length = planning_cfg_.ifopt_coll_lvs_length;
             trajopt_ifopt_composite->collision_cost_config.collision_margin_buffer = planning_cfg_.ifopt_coll_margin_buffer;
 
-            trajopt_ifopt_composite->smooth_velocities = true;
+            trajopt_ifopt_composite->smooth_velocities = planning_cfg_.ifopt_smooth_vel_enable;
             trajopt_ifopt_composite->velocity_coeff = planning_cfg_.ifopt_smooth_vel * Eigen::VectorXd::Ones(1);
-            trajopt_ifopt_composite->smooth_accelerations = true;
+            trajopt_ifopt_composite->smooth_accelerations = planning_cfg_.ifopt_smooth_acc_enable;
             trajopt_ifopt_composite->acceleration_coeff = planning_cfg_.ifopt_smooth_acc * Eigen::VectorXd::Ones(1);
-            trajopt_ifopt_composite->smooth_jerks = true;
+            trajopt_ifopt_composite->smooth_jerks = planning_cfg_.ifopt_smooth_jerk_enable;
             trajopt_ifopt_composite->jerk_coeff = planning_cfg_.ifopt_smooth_jerk * Eigen::VectorXd::Ones(1);
 
             auto trajopt_ifopt_solver = std::make_shared<TrajOptIfoptOSQPSolverProfile>();

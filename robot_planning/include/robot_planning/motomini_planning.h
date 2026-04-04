@@ -54,17 +54,27 @@ namespace Vinhtesseract_examples
             // --- Motion instruction type ---
             bool use_linear{false}; // false = FREESPACE, true = LINEAR
 
+            // --- TrajOptIfopt: Enable/disable flags ---
+            bool ifopt_joint_cost_enable{true};
+            bool ifopt_cart_constraint_enable{true};
+            bool ifopt_cart_cost_enable{false};
+            bool ifopt_coll_constraint_enable{false};
+            bool ifopt_coll_cost_enable{true};
+            bool ifopt_smooth_vel_enable{true};
+            bool ifopt_smooth_acc_enable{true};
+            bool ifopt_smooth_jerk_enable{true};
+
             // --- TrajOptIfopt: Cartesian constraint coefficients [x, y, z, rx, ry, rz] ---
-            double ifopt_cart_coeff_x{100.0};  // weight for X translation
-            double ifopt_cart_coeff_y{100.0};  // weight for Y translation
-            double ifopt_cart_coeff_z{100.0};  // weight for Z translation
-            double ifopt_cart_coeff_rx{0.0};   // weight for roll  (0 = free)
-            double ifopt_cart_coeff_ry{0.0};   // weight for pitch (0 = free)
-            double ifopt_cart_coeff_rz{0.0};   // weight for yaw   (0 = free)
+            double ifopt_cart_coeff_x{100.0}; // weight for X translation
+            double ifopt_cart_coeff_y{100.0}; // weight for Y translation
+            double ifopt_cart_coeff_z{100.0}; // weight for Z translation
+            double ifopt_cart_coeff_rx{0.0};  // weight for roll  (0 = free)
+            double ifopt_cart_coeff_ry{0.0};  // weight for pitch (0 = free)
+            double ifopt_cart_coeff_rz{0.0};  // weight for yaw   (0 = free)
 
             // --- TrajOptIfopt: Collision evaluator ---
             // 0 = DISCRETE, 1 = CONTINUOUS, 2 = LVS_CONTINUOUS
-            int    ifopt_coll_eval_type{2};
+            int ifopt_coll_eval_type{2};
             double ifopt_coll_lvs_length{0.005}; // longest_valid_segment_length (m)
 
             // --- TrajOptIfopt: Joint cost (regularizer) ---

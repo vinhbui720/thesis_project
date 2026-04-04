@@ -32,6 +32,19 @@ motomini_planning_node:
     ompl_rrt_range_2: 0.10             # RRTConnect tree expansion range — loose
 
     # ===========================================================================
+    #  TRAJOPT-IFOPT — Enable / Disable Flags
+    #  Toggle each optimizer term on or off independently.
+    # ===========================================================================
+    ifopt_joint_cost_enable: true          # penalise large joint movements
+    ifopt_cart_constraint_enable: true     # enforce Cartesian target (hard constraint)
+    ifopt_cart_cost_enable: false          # Cartesian target as soft cost (use constraint OR cost, not both)
+    ifopt_coll_constraint_enable: false    # hard collision constraint (very slow, usually keep false)
+    ifopt_coll_cost_enable: true           # soft collision avoidance cost
+    ifopt_smooth_vel_enable: true          # velocity smoothing term
+    ifopt_smooth_acc_enable: true          # acceleration smoothing term
+    ifopt_smooth_jerk_enable: true         # jerk smoothing term
+
+    # ===========================================================================
     #  TRAJOPT-IFOPT — Cartesian Constraint Coefficients (per axis)
     #  Each coefficient is the penalty weight for violating that DOF.
     #  Set rotation coefficients to 0.0 to allow free end-effector rotation.
