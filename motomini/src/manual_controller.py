@@ -700,20 +700,87 @@ class PlanningTab(QWidget):
 
 class PlannerTuningTab(QWidget):
     """GUI tab for online tuning of all planning hyperparameters.
-    Changes are sent to the planning node via the SetParameters service
-    and take effect on the next Start (no rebuild needed)."""
+
+    Two modes selectable at the top:
+    • Manual Tuning — edit every parameter individually via spinboxes.
+    • Config Mode   — pick a named task preset (YAML), load it into the
+                      manual widgets, and optionally apply in one click.
+    """
+
+    # Named config presets: (display name, yaml filename, short description)
+    _CONFIGS = [
+        (
+            "Default",
+            "planning_params.yaml",
+            "General-purpose settings — TrajOpt-IFOPT, FREESPACE, free rotation, "
+            "soft collision avoidance.",
+        ),
+        (
+            "Long Distance (OMPL)",
+            "planning_params_longdistance.yaml",
+            "OMPL-seeded FREESPACE planning for large repositioning moves. "
+            "Free end-effector rotation, collision cost enabled.",
+        ),
+        (
+            "Grinding (LINEAR)",
+            "planning_params_grinding.yaml",
+            "Straight TCP moves with full orientation constraint (Rz=0 = free tool spin). "
+            "margin=0.025, coeff=20, velocity smoothing off, tight trust box.",
+        ),
+    ]
 
     def __init__(self, node):
 
         super().__init__()
         self.node = node
         self._pending_future = None
-        
-        # Load configuration from planning_params.yaml
         self.params = load_planning_params()
 
-        # Wrap everything in a scroll area (many params)
         outer = QVBoxLayout()
+        outer.setSpacing(4)
+
+        # ── Mode selector bar ────────────────────────────────────────────────────────────────────
+        mode_bar = QHBoxLayout()
+        mode_bar.addWidget(QLabel("<b>Mode:</b>"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Manual Tuning", "Config Mode"])
+        self.mode_combo.setToolTip(
+            "Manual Tuning: edit every parameter individually.\n"
+            "Config Mode: choose a named task preset and apply it in one click.")
+        self.mode_combo.setMinimumWidth(200)
+        self.mode_combo.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
+        mode_bar.addWidget(self.mode_combo)
+        mode_bar.addStretch()
+        outer.addLayout(mode_bar)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        outer.addWidget(sep)
+
+        # ── Stacked pages ────────────────────────────────────────────────────────────────────────
+        self.stack = QStackedWidget()
+        self.mode_combo.currentIndexChanged.connect(self.stack.setCurrentIndex)
+
+        # Page 0 — Manual Tuning
+        self.stack.addWidget(self._build_manual_page())
+        # Page 1 — Config Mode
+        self.stack.addWidget(self._build_config_page())
+
+        # ── Shared status label (always below the stack) ────────────────────────────
+        self.status_label = QLabel("Select mode and parameters above, then click Apply.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #555; font-style: italic;")
+
+        outer.addWidget(self.stack)
+        outer.addWidget(self.status_label)
+        self.setLayout(outer)
+
+    # ── Page builders ────────────────────────────────────────────────────────────────────
+
+    def _build_manual_page(self):
+        """Build the full hand-tuning scroll area."""
+        page = QWidget()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         content = QWidget()
@@ -726,8 +793,7 @@ class PlannerTuningTab(QWidget):
         r.addWidget(QLabel("Type:"))
         self.motion_type = QComboBox()
         self.motion_type.addItems(["FREESPACE", "LINEAR"])
-        default_motion_type = self.params.get("move_instruction_type", "FREESPACE")
-        self.motion_type.setCurrentText(default_motion_type)
+        self.motion_type.setCurrentText(self.params.get("move_instruction_type", "FREESPACE"))
         self.motion_type.setToolTip(
             "FREESPACE: free joint path to reach each waypoint (orientation unconstrained)\n"
             "LINEAR: straight TCP path between waypoints (orientation constrained)")
@@ -745,20 +811,20 @@ class PlannerTuningTab(QWidget):
         self.cart_cost_en = QCheckBox("Enable cartesian_cost (soft)")
         self.cart_cost_en.setChecked(self.params.get("ifopt_cart_cost_enable", False))
         self.cart_cost_en.setToolTip("Enable Cartesian target as a soft cost. Usually off when constraint is on.")
-        self.cart_x  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_x", 100.0), 10.0, "Weight for X translation.")
-        self.cart_y  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_y", 100.0), 10.0, "Weight for Y translation.")
-        self.cart_z  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_z", 100.0), 10.0, "Weight for Z translation.")
-        self.cart_rx = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rx", 0.0), 10.0, "Weight for Roll  (0 = free rotation).")
-        self.cart_ry = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_ry", 0.0), 10.0, "Weight for Pitch (0 = free rotation).")
-        self.cart_rz = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rz", 0.0), 10.0, "Weight for Yaw   (0 = free rotation).")
-        gl.addWidget(self.cart_constraint_en, 0, 0, 1, 2)
-        gl.addWidget(self.cart_cost_en,       1, 0, 1, 2)
-        gl.addWidget(QLabel("X weight:"),  2, 0); gl.addWidget(self.cart_x,  2, 1)
-        gl.addWidget(QLabel("Y weight:"),  3, 0); gl.addWidget(self.cart_y,  3, 1)
-        gl.addWidget(QLabel("Z weight:"),  4, 0); gl.addWidget(self.cart_z,  4, 1)
-        gl.addWidget(QLabel("Rx (roll):"), 5, 0); gl.addWidget(self.cart_rx, 5, 1)
-        gl.addWidget(QLabel("Ry (pitch):"),6, 0); gl.addWidget(self.cart_ry, 6, 1)
-        gl.addWidget(QLabel("Rz (yaw):"),  7, 0); gl.addWidget(self.cart_rz, 7, 1)
+        self.cart_x  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_x",  100.0), 10.0, "Weight for X translation.")
+        self.cart_y  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_y",  100.0), 10.0, "Weight for Y translation.")
+        self.cart_z  = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_z",  100.0), 10.0, "Weight for Z translation.")
+        self.cart_rx = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rx",    0.0), 10.0, "Weight for Roll  (0 = free rotation).")
+        self.cart_ry = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_ry",    0.0), 10.0, "Weight for Pitch (0 = free rotation).")
+        self.cart_rz = self._dspin(0, 10000, self.params.get("ifopt_cart_coeff_rz",    0.0), 10.0, "Weight for Yaw   (0 = free rotation).")
+        gl.addWidget(self.cart_constraint_en,                      0, 0, 1, 2)
+        gl.addWidget(self.cart_cost_en,                            1, 0, 1, 2)
+        gl.addWidget(QLabel("X weight:"),   2, 0); gl.addWidget(self.cart_x,  2, 1)
+        gl.addWidget(QLabel("Y weight:"),   3, 0); gl.addWidget(self.cart_y,  3, 1)
+        gl.addWidget(QLabel("Z weight:"),   4, 0); gl.addWidget(self.cart_z,  4, 1)
+        gl.addWidget(QLabel("Rx (roll):"),  5, 0); gl.addWidget(self.cart_rx, 5, 1)
+        gl.addWidget(QLabel("Ry (pitch):"), 6, 0); gl.addWidget(self.cart_ry, 6, 1)
+        gl.addWidget(QLabel("Rz (yaw):"),   7, 0); gl.addWidget(self.cart_rz, 7, 1)
         gl.addWidget(QLabel("(0 = free rotation, 100+ = constrained)"), 8, 0, 1, 2)
         g.setLayout(gl)
         layout.addWidget(g)
@@ -768,7 +834,9 @@ class PlannerTuningTab(QWidget):
         r = QHBoxLayout()
         self.joint_cost_en = QCheckBox("Enable")
         self.joint_cost_en.setChecked(self.params.get("ifopt_joint_cost_enable", True))
-        self.joint_cost_en.setToolTip("Enable the joint cost regularizer. Disable to stop overshoot caused by joint-vs-Cartesian conflict.")
+        self.joint_cost_en.setToolTip(
+            "Enable the joint cost regularizer. "
+            "Disable to stop overshoot caused by joint-vs-Cartesian conflict.")
         self.joint_coeff = self._dspin(0, 1000, self.params.get("ifopt_joint_cost_coeff", 5.0), 1.0,
             "Higher = smoother joint trajectory, less aggressive movement.")
         r.addWidget(self.joint_cost_en)
@@ -787,11 +855,11 @@ class PlannerTuningTab(QWidget):
         self.coll_constraint_en = QCheckBox("Enable collision constraint (hard, slow)")
         self.coll_constraint_en.setChecked(self.params.get("ifopt_coll_constraint_enable", False))
         self.coll_constraint_en.setToolTip("Hard constraint — much slower. Usually keep disabled.")
-        self.coll_margin = self._dspin(0, 0.5, self.params.get("ifopt_coll_cost_margin", 0.02), 0.005, decimals=4,
+        self.coll_margin = self._dspin(0, 0.5, self.params.get("ifopt_coll_cost_margin",   0.02),  0.005, decimals=4,
             tip="Minimum clearance from obstacles (metres).")
         self.coll_coeff  = self._dspin(0, 10000, self.params.get("ifopt_coll_cost_coeff", 500.0), 50.0,
             tip="Penalty weight for violating the margin. Higher = stronger push-away.")
-        self.coll_buffer = self._dspin(0, 0.5, self.params.get("ifopt_coll_margin_buffer", 0.02), 0.005, decimals=4,
+        self.coll_buffer = self._dspin(0, 0.5, self.params.get("ifopt_coll_margin_buffer",  0.02),  0.005, decimals=4,
             tip="Extra buffer on top of margin for LVS swept-volume check.")
         self.coll_eval_type = QComboBox()
         self.coll_eval_type.addItems(["0 – DISCRETE", "1 – CONTINUOUS", "2 – LVS_CONTINUOUS"])
@@ -822,42 +890,42 @@ class PlannerTuningTab(QWidget):
         self.smooth_acc_en.setChecked(self.params.get("ifopt_smooth_acc_enable", True))
         self.smooth_jerk_en = QCheckBox("Enable jerk smoothing")
         self.smooth_jerk_en.setChecked(self.params.get("ifopt_smooth_jerk_enable", True))
-        self.smooth_vel  = self._dspin(0, 100, self.params.get("ifopt_smooth_vel_coeff", 0.1), 0.05, decimals=4,
+        self.smooth_vel  = self._dspin(0, 100, self.params.get("ifopt_smooth_vel_coeff",  0.1), 0.05, decimals=4,
             tip="Velocity smoothing weight across waypoints.")
-        self.smooth_acc  = self._dspin(0, 100, self.params.get("ifopt_smooth_acc_coeff", 1.0), 0.1,
+        self.smooth_acc  = self._dspin(0, 100, self.params.get("ifopt_smooth_acc_coeff",  1.0), 0.1,
             tip="Acceleration smoothing weight.")
         self.smooth_jerk = self._dspin(0, 100, self.params.get("ifopt_smooth_jerk_coeff", 1.0), 0.1,
             tip="Jerk smoothing weight.")
-        gl.addWidget(self.smooth_vel_en,       0, 0); gl.addWidget(self.smooth_vel,  0, 1)
-        gl.addWidget(self.smooth_acc_en,       1, 0); gl.addWidget(self.smooth_acc,  1, 1)
-        gl.addWidget(self.smooth_jerk_en,      2, 0); gl.addWidget(self.smooth_jerk, 2, 1)
+        gl.addWidget(self.smooth_vel_en,  0, 0); gl.addWidget(self.smooth_vel,  0, 1)
+        gl.addWidget(self.smooth_acc_en,  1, 0); gl.addWidget(self.smooth_acc,  1, 1)
+        gl.addWidget(self.smooth_jerk_en, 2, 0); gl.addWidget(self.smooth_jerk, 2, 1)
         g.setLayout(gl)
         layout.addWidget(g)
 
         # --- SQP Solver ---
         g = QGroupBox("SQP Solver")
         gl = QGridLayout()
-        self.max_iter   = QSpinBox()
+        self.max_iter = QSpinBox()
         self.max_iter.setRange(1, 10000)
         self.max_iter.setValue(self.params.get("ifopt_max_iter", 200))
         self.max_iter.setToolTip("Maximum SQP iterations per chunk.")
-        self.min_approx = self._dspin(0, 1, self.params.get("ifopt_min_approx_improve", 1.0e-3), 1e-7, decimals=9,
+        self.min_approx = self._dspin(0, 1, self.params.get("ifopt_min_approx_improve",    1.0e-3), 1e-7, decimals=9,
             tip="Stop if cost improvement per iteration < this.")
-        self.min_trust  = self._dspin(0, 1, self.params.get("ifopt_min_trust_box_size", 1.0e-3), 1e-6, decimals=9,
+        self.min_trust  = self._dspin(0, 1, self.params.get("ifopt_min_trust_box_size",    1.0e-3), 1e-6, decimals=9,
             tip="Stop if trust region shrinks below this.")
-        self.init_trust = self._dspin(0, 10, self.params.get("ifopt_initial_trust_box_size", 0.5), 0.05,
+        self.init_trust = self._dspin(0, 10, self.params.get("ifopt_initial_trust_box_size", 0.5),  0.05,
             tip="Initial SQP step size.")
-        gl.addWidget(QLabel("Max iterations:"),      0, 0); gl.addWidget(self.max_iter,   0, 1)
-        gl.addWidget(QLabel("Min approx improve:"),  1, 0); gl.addWidget(self.min_approx, 1, 1)
-        gl.addWidget(QLabel("Min trust box size:"),  2, 0); gl.addWidget(self.min_trust,  2, 1)
-        gl.addWidget(QLabel("Initial trust box:"),   3, 0); gl.addWidget(self.init_trust, 3, 1)
+        gl.addWidget(QLabel("Max iterations:"),     0, 0); gl.addWidget(self.max_iter,   0, 1)
+        gl.addWidget(QLabel("Min approx improve:"), 1, 0); gl.addWidget(self.min_approx, 1, 1)
+        gl.addWidget(QLabel("Min trust box size:"), 2, 0); gl.addWidget(self.min_trust,  2, 1)
+        gl.addWidget(QLabel("Initial trust box:"),  3, 0); gl.addWidget(self.init_trust, 3, 1)
         g.setLayout(gl)
         layout.addWidget(g)
 
         # --- Chunk Planning ---
         g = QGroupBox("Chunk Planning")
         gl = QGridLayout()
-        self.chunk_size     = QSpinBox()
+        self.chunk_size = QSpinBox()
         self.chunk_size.setRange(1, 1000)
         self.chunk_size.setValue(self.params.get("planning_chunk_size", 5))
         self.chunk_size.setToolTip("Number of waypoints per TrajOpt solve. Smaller = faster per chunk, more chunks.")
@@ -901,26 +969,160 @@ class PlannerTuningTab(QWidget):
         g.setLayout(gl)
         layout.addWidget(g)
 
-        # --- Apply button + status ---
+        # --- Apply button ---
         btn = QPushButton("\u2705  Apply to Planner Node")
         btn.setStyleSheet("font-weight: bold; padding: 8px; font-size: 13px;")
         btn.setToolTip("Sends all parameters to the running planning node.\n"
                        "Changes take effect on the NEXT Start press.")
         btn.clicked.connect(self.apply_clicked)
-
-        self.status_label = QLabel("Edit parameters above, then click Apply.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #555; font-style: italic;")
-
         layout.addWidget(btn)
-        layout.addWidget(self.status_label)
         layout.addStretch()
 
         scroll.setWidget(content)
-        outer.addWidget(scroll)
-        self.setLayout(outer)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.addWidget(scroll)
+        return page
 
-    # ------------------------------------------------
+    def _build_config_page(self):
+        """Build the Config Mode page with task preset selector."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+
+        info = QLabel(
+            "Select a task preset below.\n"
+            "\u2022  \"Load into Manual\" \u2014 populate the Manual Tuning tab so you can review before sending.\n"
+            "\u2022  \"Load & Apply\" \u2014 load the preset and immediately send all parameters to the node.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #444; font-size: 12px; padding: 4px;")
+        layout.addWidget(info)
+
+        self._cfg_radios = []
+        for i, (name, _fname, desc) in enumerate(self._CONFIGS):
+            card = QGroupBox()
+            card_layout = QVBoxLayout()
+            radio = QRadioButton(f"  {name}")
+            radio.setStyleSheet("font-weight: bold; font-size: 13px;")
+            if i == 0:
+                radio.setChecked(True)
+            desc_lbl = QLabel(f"     {desc}")
+            desc_lbl.setWordWrap(True)
+            desc_lbl.setStyleSheet("color: #555; font-size: 11px;")
+            card_layout.addWidget(radio)
+            card_layout.addWidget(desc_lbl)
+            card.setLayout(card_layout)
+            layout.addWidget(card)
+            self._cfg_radios.append(radio)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_load = QPushButton("Load into Manual Tab")
+        btn_load.setToolTip("Populate the Manual Tuning tab without sending to the node.")
+        btn_load.setStyleSheet("padding: 7px; font-size: 12px;")
+        btn_apply = QPushButton("\u2705  Load & Apply")
+        btn_apply.setToolTip("Load this preset and immediately send all parameters to the planning node.")
+        btn_apply.setStyleSheet(
+            "font-weight: bold; padding: 7px; font-size: 13px; "
+            "background-color: #2980b9; color: white;")
+        btn_load.clicked.connect(lambda: self._load_config(apply=False))
+        btn_apply.clicked.connect(lambda: self._load_config(apply=True))
+        btn_row.addWidget(btn_load)
+        btn_row.addWidget(btn_apply)
+        layout.addLayout(btn_row)
+
+        return page
+
+    # ── Config loading ──────────────────────────────────────────────────────────────────────────
+
+    def _load_config(self, apply=False):
+        """Load the selected preset YAML into the manual-tab widgets."""
+        idx = next((i for i, r in enumerate(self._cfg_radios) if r.isChecked()), 0)
+        _, fname, _ = self._CONFIGS[idx]
+
+        search_dirs = [
+            Path.home() / "vinh_ws" / "install" / "robot_planning" / "share" / "robot_planning" / "config",
+            Path.home() / "vinh_ws" / "src" / "thesis_project" / "robot_planning" / "config",
+            Path("/home/vinbui/vinh_ws/src/thesis_project/robot_planning/config"),
+        ]
+
+        params = None
+        for d in search_dirs:
+            p = d / fname
+            if p.exists():
+                try:
+                    with open(p, "r") as f:
+                        data = yaml.safe_load(f)
+                    if data and "motomini_planning_node" in data:
+                        params = data["motomini_planning_node"].get("ros__parameters", {})
+                        break
+                except Exception as e:
+                    self.status_label.setText(f"\u274c Error reading {fname}: {e}")
+                    self.status_label.setStyleSheet("color: red;")
+                    return
+
+        if params is None:
+            self.status_label.setText(
+                f"\u274c Could not find \"{fname}\" in any known config directory.")
+            self.status_label.setStyleSheet("color: red;")
+            return
+
+        self._populate_widgets(params)
+        cfg_name = self._CONFIGS[idx][0]
+        self.status_label.setText(
+            f"\u2139\ufe0f Preset \"{cfg_name}\" loaded into Manual Tuning tab.")
+        self.status_label.setStyleSheet("color: #2980b9;")
+
+        if apply:
+            self.apply_clicked()
+
+    def _populate_widgets(self, params):
+        """Push a params dict into every manual-tab widget."""
+        mt = params.get("move_instruction_type", "FREESPACE")
+        if self.motion_type.findText(mt) >= 0:
+            self.motion_type.setCurrentText(mt)
+
+        self.cart_constraint_en.setChecked(params.get("ifopt_cart_constraint_enable", True))
+        self.cart_cost_en.setChecked(params.get("ifopt_cart_cost_enable", False))
+        self.cart_x.setValue(params.get("ifopt_cart_coeff_x",   100.0))
+        self.cart_y.setValue(params.get("ifopt_cart_coeff_y",   100.0))
+        self.cart_z.setValue(params.get("ifopt_cart_coeff_z",   100.0))
+        self.cart_rx.setValue(params.get("ifopt_cart_coeff_rx",   0.0))
+        self.cart_ry.setValue(params.get("ifopt_cart_coeff_ry",   0.0))
+        self.cart_rz.setValue(params.get("ifopt_cart_coeff_rz",   0.0))
+
+        self.joint_cost_en.setChecked(params.get("ifopt_joint_cost_enable", True))
+        self.joint_coeff.setValue(params.get("ifopt_joint_cost_coeff", 5.0))
+
+        self.coll_cost_en.setChecked(params.get("ifopt_coll_cost_enable", True))
+        self.coll_constraint_en.setChecked(params.get("ifopt_coll_constraint_enable", False))
+        self.coll_margin.setValue(params.get("ifopt_coll_cost_margin",   0.02))
+        self.coll_coeff.setValue(params.get("ifopt_coll_cost_coeff",   500.0))
+        self.coll_buffer.setValue(params.get("ifopt_coll_margin_buffer",  0.02))
+        self.coll_eval_type.setCurrentIndex(params.get("ifopt_coll_eval_type", 0))
+        self.coll_lvs.setValue(params.get("ifopt_coll_lvs_length", 0.005))
+
+        self.smooth_vel_en.setChecked(params.get("ifopt_smooth_vel_enable",  True))
+        self.smooth_acc_en.setChecked(params.get("ifopt_smooth_acc_enable",  True))
+        self.smooth_jerk_en.setChecked(params.get("ifopt_smooth_jerk_enable", True))
+        self.smooth_vel.setValue(params.get("ifopt_smooth_vel_coeff",  0.1))
+        self.smooth_acc.setValue(params.get("ifopt_smooth_acc_coeff",  1.0))
+        self.smooth_jerk.setValue(params.get("ifopt_smooth_jerk_coeff", 1.0))
+
+        self.max_iter.setValue(int(params.get("ifopt_max_iter", 200)))
+        self.min_approx.setValue(params.get("ifopt_min_approx_improve",     1e-3))
+        self.min_trust.setValue(params.get("ifopt_min_trust_box_size",      1e-3))
+        self.init_trust.setValue(params.get("ifopt_initial_trust_box_size", 0.5))
+
+        self.ompl_enable.setChecked(params.get("use_ompl", False))
+        self.ompl_time.setValue(params.get("ompl_planning_time", 10.0))
+        self.ompl_max_sol.setValue(int(params.get("ompl_max_solutions", 5)))
+        self.ompl_simplify.setChecked(params.get("ompl_simplify", True))
+        self.ompl_rrt1.setValue(params.get("ompl_rrt_range_1", 0.05))
+        self.ompl_rrt2.setValue(params.get("ompl_rrt_range_2", 0.10))
+
+    # ── Helper ─────────────────────────────────────────────────────────────────────────────────────
 
     def _dspin(self, mn, mx, default, step, tip="", decimals=3):
         sb = ScientificDoubleSpinBox()
@@ -932,57 +1134,47 @@ class PlannerTuningTab(QWidget):
             sb.setToolTip(tip)
         return sb
 
-    # ------------------------------------------------
+    # ── Apply / result ────────────────────────────────────────────────────────────────────────────
 
     def apply_clicked(self):
 
         params = {
-            # Motion type
-            "move_instruction_type":      self.motion_type.currentText(),
-            # Runtime OMPL toggle
-            "use_ompl":                   self.ompl_enable.isChecked(),
-            # IFOPT enable flags
-            "ifopt_joint_cost_enable":    self.joint_cost_en.isChecked(),
-            "ifopt_cart_constraint_enable": self.cart_constraint_en.isChecked(),
-            "ifopt_cart_cost_enable":     self.cart_cost_en.isChecked(),
-            "ifopt_coll_constraint_enable": self.coll_constraint_en.isChecked(),
-            "ifopt_coll_cost_enable":     self.coll_cost_en.isChecked(),
-            "ifopt_smooth_vel_enable":    self.smooth_vel_en.isChecked(),
-            "ifopt_smooth_acc_enable":    self.smooth_acc_en.isChecked(),
-            "ifopt_smooth_jerk_enable":   self.smooth_jerk_en.isChecked(),
-            # Per-axis cartesian constraints
-            "ifopt_cart_coeff_x":         self.cart_x.value(),
-            "ifopt_cart_coeff_y":         self.cart_y.value(),
-            "ifopt_cart_coeff_z":         self.cart_z.value(),
-            "ifopt_cart_coeff_rx":        self.cart_rx.value(),
-            "ifopt_cart_coeff_ry":        self.cart_ry.value(),
-            "ifopt_cart_coeff_rz":        self.cart_rz.value(),
-            # Joint cost
-            "ifopt_joint_cost_coeff":     self.joint_coeff.value(),
-            # Collision
-            "ifopt_coll_cost_margin":     self.coll_margin.value(),
-            "ifopt_coll_cost_coeff":      self.coll_coeff.value(),
-            "ifopt_coll_margin_buffer":   self.coll_buffer.value(),
-            "ifopt_coll_eval_type":       self.coll_eval_type.currentIndex(),
-            "ifopt_coll_lvs_length":      self.coll_lvs.value(),
-            # Smoothing
-            "ifopt_smooth_vel_coeff":     self.smooth_vel.value(),
-            "ifopt_smooth_acc_coeff":     self.smooth_acc.value(),
-            "ifopt_smooth_jerk_coeff":    self.smooth_jerk.value(),
-            # SQP solver
-            "ifopt_max_iter":             self.max_iter.value(),
-            "ifopt_min_approx_improve":   self.min_approx.value(),
-            "ifopt_min_trust_box_size":   self.min_trust.value(),
-            "ifopt_initial_trust_box_size": self.init_trust.value(),
-            # Chunk planning
-            "planning_chunk_size":        self.chunk_size.value(),
-            "planning_parallel_chunks":   self.parallel_chunks.value(),
-            # OMPL tuning
-            "ompl_planning_time":         self.ompl_time.value(),
-            "ompl_max_solutions":         self.ompl_max_sol.value(),
-            "ompl_simplify":              self.ompl_simplify.isChecked(),
-            "ompl_rrt_range_1":           self.ompl_rrt1.value(),
-            "ompl_rrt_range_2":           self.ompl_rrt2.value(),
+            "move_instruction_type":          self.motion_type.currentText(),
+            "use_ompl":                       self.ompl_enable.isChecked(),
+            "ifopt_joint_cost_enable":        self.joint_cost_en.isChecked(),
+            "ifopt_cart_constraint_enable":   self.cart_constraint_en.isChecked(),
+            "ifopt_cart_cost_enable":         self.cart_cost_en.isChecked(),
+            "ifopt_coll_constraint_enable":   self.coll_constraint_en.isChecked(),
+            "ifopt_coll_cost_enable":         self.coll_cost_en.isChecked(),
+            "ifopt_smooth_vel_enable":        self.smooth_vel_en.isChecked(),
+            "ifopt_smooth_acc_enable":        self.smooth_acc_en.isChecked(),
+            "ifopt_smooth_jerk_enable":       self.smooth_jerk_en.isChecked(),
+            "ifopt_cart_coeff_x":             self.cart_x.value(),
+            "ifopt_cart_coeff_y":             self.cart_y.value(),
+            "ifopt_cart_coeff_z":             self.cart_z.value(),
+            "ifopt_cart_coeff_rx":            self.cart_rx.value(),
+            "ifopt_cart_coeff_ry":            self.cart_ry.value(),
+            "ifopt_cart_coeff_rz":            self.cart_rz.value(),
+            "ifopt_joint_cost_coeff":         self.joint_coeff.value(),
+            "ifopt_coll_cost_margin":         self.coll_margin.value(),
+            "ifopt_coll_cost_coeff":          self.coll_coeff.value(),
+            "ifopt_coll_margin_buffer":       self.coll_buffer.value(),
+            "ifopt_coll_eval_type":           self.coll_eval_type.currentIndex(),
+            "ifopt_coll_lvs_length":          self.coll_lvs.value(),
+            "ifopt_smooth_vel_coeff":         self.smooth_vel.value(),
+            "ifopt_smooth_acc_coeff":         self.smooth_acc.value(),
+            "ifopt_smooth_jerk_coeff":        self.smooth_jerk.value(),
+            "ifopt_max_iter":                 self.max_iter.value(),
+            "ifopt_min_approx_improve":       self.min_approx.value(),
+            "ifopt_min_trust_box_size":       self.min_trust.value(),
+            "ifopt_initial_trust_box_size":   self.init_trust.value(),
+            "planning_chunk_size":            self.chunk_size.value(),
+            "planning_parallel_chunks":       self.parallel_chunks.value(),
+            "ompl_planning_time":             self.ompl_time.value(),
+            "ompl_max_solutions":             self.ompl_max_sol.value(),
+            "ompl_simplify":                  self.ompl_simplify.isChecked(),
+            "ompl_rrt_range_1":               self.ompl_rrt1.value(),
+            "ompl_rrt_range_2":               self.ompl_rrt2.value(),
         }
 
         self._pending_future = self.node.set_planner_params(params)
@@ -996,8 +1188,6 @@ class PlannerTuningTab(QWidget):
             self.status_label.setText("\u23f3 Sending parameters to planning node...")
             self.status_label.setStyleSheet("color: #e67e00;")
             QTimer.singleShot(2000, self._check_result)
-
-    # ------------------------------------------------
 
     def _check_result(self):
 

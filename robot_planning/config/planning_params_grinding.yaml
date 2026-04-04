@@ -1,0 +1,76 @@
+###############################################################################
+#  planning_params_grinding.yaml
+#  Preset for GRINDING / SURFACE-FOLLOWING moves.
+#  Strategy: straight TCP (LINEAR) with constrained orientation, tight margin.
+#  Best for: grinding passes, surface finishing, welding beads.
+###############################################################################
+
+motomini_planning_node:
+  ros__parameters:
+
+    # ===========================================================================
+    #  MOTION INSTRUCTION TYPE
+    # ===========================================================================
+    move_instruction_type: "LINEAR"          # straight TCP line + constrained orientation
+
+    # ===========================================================================
+    #  OMPL — disabled; TrajOpt-IFOPT handles everything directly
+    # ===========================================================================
+    use_ompl: false
+
+    ompl_planning_time: 10.0
+    ompl_max_solutions: 5
+    ompl_simplify: true
+    ompl_longest_valid_segment: 0.005
+    ompl_rrt_range_1: 0.05
+    ompl_rrt_range_2: 0.10
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Enable / Disable Flags
+    # ===========================================================================
+    ifopt_joint_cost_enable: false         # disabled — prevents conflict with hard constraint
+    ifopt_cart_constraint_enable: true     # hard Cartesian constraint (position + full orientation)
+    ifopt_cart_cost_enable: false
+    ifopt_coll_constraint_enable: false
+    ifopt_coll_cost_enable: true           # soft collision avoidance
+    ifopt_smooth_vel_enable: false         # disabled for grinding — ISP handles time param
+    ifopt_smooth_acc_enable: true
+    ifopt_smooth_jerk_enable: true
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Cartesian Constraint Coefficients
+    #  All 6 DOF constrained (x y z rx ry, rz=0 → free tool spin around approach axis).
+    # ===========================================================================
+    ifopt_cart_coeff_x:  10.0
+    ifopt_cart_coeff_y:  10.0
+    ifopt_cart_coeff_z:  10.0
+    ifopt_cart_coeff_rx: 10.0
+    ifopt_cart_coeff_ry: 10.0
+    ifopt_cart_coeff_rz: 0.0            # free tool rotation around approach axis
+
+    ifopt_joint_cost_coeff: 5.0         # (unused since joint_cost disabled)
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Collision Avoidance
+    # ===========================================================================
+    ifopt_coll_cost_margin: 0.025       # 25 mm clearance
+    ifopt_coll_cost_coeff: 20.0         # light penalty — grinding is close to surface
+    ifopt_coll_margin_buffer: 0.02
+    ifopt_coll_eval_type: 0             # DISCRETE
+    ifopt_coll_lvs_length: 0.005
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Trajectory Smoothing
+    # ===========================================================================
+    ifopt_smooth_vel_coeff: 0.1
+    ifopt_smooth_acc_coeff: 1.0
+    ifopt_smooth_jerk_coeff: 1.0
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — SQP Solver
+    #  Tighter trust box for precision surface moves.
+    # ===========================================================================
+    ifopt_max_iter: 200
+    ifopt_min_approx_improve: 1.0e-3
+    ifopt_min_trust_box_size: 1.0e-3    # tighter than default for grinding precision
+    ifopt_initial_trust_box_size: 0.5

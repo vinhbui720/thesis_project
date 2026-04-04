@@ -1,0 +1,75 @@
+###############################################################################
+#  planning_params_longdistance.yaml
+#  Preset for LONG-DISTANCE / FREESPACE moves.
+#  Strategy: OMPL finds a collision-free seed → TrajOpt-IFOPT refines.
+#  Best for: large repositioning moves, homing, moving away from obstacles.
+###############################################################################
+
+motomini_planning_node:
+  ros__parameters:
+
+    # ===========================================================================
+    #  MOTION INSTRUCTION TYPE
+    # ===========================================================================
+    move_instruction_type: "FREESPACE"       # free joint path (orientation unconstrained)
+
+    # ===========================================================================
+    #  OMPL — enabled as the primary planner
+    # ===========================================================================
+    use_ompl: true
+
+    ompl_planning_time: 15.0            # more time for complex long-range moves
+    ompl_max_solutions: 5
+    ompl_simplify: true
+    ompl_longest_valid_segment: 0.005
+    ompl_rrt_range_1: 0.05
+    ompl_rrt_range_2: 0.10
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Enable / Disable Flags
+    # ===========================================================================
+    ifopt_joint_cost_enable: false         # no joint regularizer — OMPL already seeds
+    ifopt_cart_constraint_enable: true     # enforce Cartesian targets
+    ifopt_cart_cost_enable: false
+    ifopt_coll_constraint_enable: false
+    ifopt_coll_cost_enable: true           # soft collision avoidance still active
+    ifopt_smooth_vel_enable: true
+    ifopt_smooth_acc_enable: true
+    ifopt_smooth_jerk_enable: true
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Cartesian Constraint Coefficients
+    #  Allow free rotation — only enforce position.
+    # ===========================================================================
+    ifopt_cart_coeff_x:  100.0
+    ifopt_cart_coeff_y:  100.0
+    ifopt_cart_coeff_z:  100.0
+    ifopt_cart_coeff_rx: 0.0            # free rotation
+    ifopt_cart_coeff_ry: 0.0
+    ifopt_cart_coeff_rz: 0.0
+
+    ifopt_joint_cost_coeff: 5.0
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Collision Avoidance
+    # ===========================================================================
+    ifopt_coll_cost_margin: 0.025
+    ifopt_coll_cost_coeff: 50.0
+    ifopt_coll_margin_buffer: 0.02
+    ifopt_coll_eval_type: 0             # DISCRETE
+    ifopt_coll_lvs_length: 0.005
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — Trajectory Smoothing
+    # ===========================================================================
+    ifopt_smooth_vel_coeff: 0.1
+    ifopt_smooth_acc_coeff: 1.0
+    ifopt_smooth_jerk_coeff: 1.0
+
+    # ===========================================================================
+    #  TRAJOPT-IFOPT — SQP Solver
+    # ===========================================================================
+    ifopt_max_iter: 200
+    ifopt_min_approx_improve: 1.0e-3
+    ifopt_min_trust_box_size: 1.0e-5
+    ifopt_initial_trust_box_size: 0.5
