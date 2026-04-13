@@ -29,17 +29,16 @@ target_include_directories(modbus_hw_bridge
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
+    ${sensor_msgs_INCLUDE_DIRS}
+    ${trajectory_msgs_INCLUDE_DIRS}
     ${LIBMODBUS_INCLUDE_DIRS}
 )
 
 target_link_libraries(modbus_hw_bridge
+  rclcpp::rclcpp
+  ${sensor_msgs_LIBRARIES}
+  ${trajectory_msgs_LIBRARIES}
   ${LIBMODBUS_LIBRARIES}
-)
-
-ament_target_dependencies(modbus_hw_bridge
-  rclcpp
-  sensor_msgs
-  trajectory_msgs
 )
 
 # ────────────────────────────── Install ───────────────────────────────────────

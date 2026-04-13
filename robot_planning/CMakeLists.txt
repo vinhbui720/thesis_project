@@ -40,6 +40,25 @@ find_package(
 find_package(
   tesseract_time_parameterization REQUIRED COMPONENTS core isp)
 
+if(NOT COMMAND ament_target_dependencies)
+  function(ament_target_dependencies target)
+    foreach(pkg ${ARGN})
+      if(TARGET ${pkg}::${pkg})
+        target_link_libraries(${target} ${pkg}::${pkg})
+      endif()
+      if(TARGET ${pkg}::${pkg}_library)
+        target_link_libraries(${target} ${pkg}::${pkg}_library)
+      endif()
+      if(DEFINED ${pkg}_INCLUDE_DIRS AND NOT "${${pkg}_INCLUDE_DIRS}" STREQUAL "")
+        target_include_directories(${target} PUBLIC ${${pkg}_INCLUDE_DIRS})
+      endif()
+      if(DEFINED ${pkg}_LIBRARIES AND NOT "${${pkg}_LIBRARIES}" STREQUAL "")
+        target_link_libraries(${target} ${${pkg}_LIBRARIES})
+      endif()
+    endforeach()
+  endfunction()
+endif()
+
 if(NOT TARGET console_bridge::console_bridge)
   add_library(console_bridge::console_bridge INTERFACE IMPORTED)
   set_target_properties(console_bridge::console_bridge PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
@@ -95,6 +114,10 @@ add_executable(motomini_planning_node
   src/motomini_node_main.cpp        # main()
 )
 target_link_libraries(motomini_planning_node ${PROJECT_NAME})
+target_link_libraries(motomini_planning_node
+  tesseract_monitoring::tesseract_monitoring_environment
+  tesseract_monitoring::tesseract_monitoring_environment_interface
+)
 ament_target_dependencies(motomini_planning_node
   rclcpp
   std_msgs

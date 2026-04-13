@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument
 from launch.conditions import UnlessCondition, IfCondition
 from launch_ros.actions import Node
 from launch.substitutions import Command, FindExecutable, PathJoinSubstitution, LaunchConfiguration, PythonExpression
@@ -99,8 +99,9 @@ def generate_launch_description():
                 "z_start": 0.0,
                 "z_end": -0.05,
                 "steps": 28,
-                "publish_period_sec": 0.3,
-                "motion_time_sec": 0.3,
+                "publish_period_sec": 0.05,
+                "motion_time_sec": 0.12,
+                "loop_period_sec": 16.0,
             }],
             condition=gantry_mode_loop,
             output="screen"
@@ -192,38 +193,18 @@ def generate_launch_description():
         ),
 
         # -------------------------------
-        # Delay to ensure controller manager is ready
-        # -------------------------------
-        ExecuteProcess(
-            cmd=["sleep", "2"],
-            shell=True,
-            condition=UnlessCondition(real_robot)
-        ),
-
-        # -------------------------------
-        # Spawn controllers
+        # Spawn all controllers in one call to avoid lock contention.
+        # --controller-manager-timeout gives the CM time to start up.
         # -------------------------------
         Node(
             package="controller_manager",
             executable="spawner",
-            arguments=["joint_state_broadcaster"],
-            condition=UnlessCondition(real_robot),
-            output="screen"
-        ),
-
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            arguments=["motomini_controller"],
-            condition=UnlessCondition(real_robot),
-            output="screen"
-        ),
-
-        # OPTIONAL (only if you really need gantry)
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            arguments=["gantry_controller"],
+            arguments=[
+                "joint_state_broadcaster",
+                "motomini_controller",
+                "gantry_controller",
+                "--controller-manager-timeout", "30",
+            ],
             condition=UnlessCondition(real_robot),
             output="screen"
         ),

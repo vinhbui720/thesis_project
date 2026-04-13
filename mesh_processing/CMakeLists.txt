@@ -21,6 +21,25 @@ find_package(tf2 REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
+if(NOT COMMAND ament_target_dependencies)
+  function(ament_target_dependencies target)
+    foreach(pkg ${ARGN})
+      if(TARGET ${pkg}::${pkg})
+        target_link_libraries(${target} ${pkg}::${pkg})
+      endif()
+      if(TARGET ${pkg}::${pkg}_library)
+        target_link_libraries(${target} ${pkg}::${pkg}_library)
+      endif()
+      if(DEFINED ${pkg}_INCLUDE_DIRS AND NOT "${${pkg}_INCLUDE_DIRS}" STREQUAL "")
+        target_include_directories(${target} PUBLIC ${${pkg}_INCLUDE_DIRS})
+      endif()
+      if(DEFINED ${pkg}_LIBRARIES AND NOT "${${pkg}_LIBRARIES}" STREQUAL "")
+        target_link_libraries(${target} ${${pkg}_LIBRARIES})
+      endif()
+    endforeach()
+  endfunction()
+endif()
+
 include_directories(${PCL_INCLUDE_DIRS})
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
@@ -119,12 +138,20 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY
-  bags
+set(MESH_PROCESSING_INSTALL_DIRS
   config
   mesh
   launch
   data
+)
+
+# Some deployments do not track rosbag data in source control.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/bags)
+  list(APPEND MESH_PROCESSING_INSTALL_DIRS bags)
+endif()
+
+install(DIRECTORY
+  ${MESH_PROCESSING_INSTALL_DIRS}
   DESTINATION share/${PROJECT_NAME}
 )
 install(PROGRAMS

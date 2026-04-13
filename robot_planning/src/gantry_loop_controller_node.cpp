@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 class GantryLoopControllerNode : public rclcpp::Node
@@ -18,6 +19,7 @@ public:
         this->declare_parameter<int>("steps", 28);
         this->declare_parameter<double>("publish_period_sec", 0.3);
         this->declare_parameter<double>("motion_time_sec", 0.3);
+        this->declare_parameter<double>("loop_period_sec", 0.0);
 
         x_start_ = this->get_parameter("x_start").as_double();
         x_end_ = this->get_parameter("x_end").as_double();
@@ -27,6 +29,21 @@ public:
         steps_ = std::max(2, requested_steps);
         publish_period_sec_ = std::max(0.05, this->get_parameter("publish_period_sec").as_double());
         motion_time_sec_ = std::max(0.05, this->get_parameter("motion_time_sec").as_double());
+        loop_period_sec_ = this->get_parameter("loop_period_sec").as_double();
+
+        // Keep backward compatibility: if no explicit loop period is provided,
+        // derive it from the old stepped behavior.
+        if (loop_period_sec_ <= 0.0)
+        {
+            loop_period_sec_ = publish_period_sec_ * 2.0 * static_cast<double>(steps_ - 1);
+        }
+        loop_period_sec_ = std::max(loop_period_sec_, publish_period_sec_ * 4.0);
+
+        // Give the trajectory controller a horizon longer than one publish period
+        // so it can interpolate smoothly rather than stop-go each command.
+        motion_time_sec_ = std::max(motion_time_sec_, publish_period_sec_ * 1.5);
+
+        start_time_ = this->now();
 
         publisher_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
             "/gantry_controller/joint_trajectory", 10);
@@ -37,17 +54,25 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Gantry loop mode started: x %.3f->%.3f, z %.3f->%.3f, steps=%d",
-            x_start_, x_end_, z_start_, z_end_, steps_);
+            "Gantry loop mode started: x %.3f->%.3f, z %.3f->%.3f, loop_period=%.3fs, publish_period=%.3fs",
+            x_start_, x_end_, z_start_, z_end_, loop_period_sec_, publish_period_sec_);
     }
 
 private:
     void publishLoopPoint()
     {
-        const double phase = static_cast<double>(index_) / static_cast<double>(steps_ - 1);
+        constexpr double kTwoPi = 6.283185307179586;
+        const double elapsed_sec = (this->now() - start_time_).seconds();
+        const double cycle_phase = std::fmod(elapsed_sec, loop_period_sec_) / loop_period_sec_;
+        const double angle = kTwoPi * cycle_phase;
 
-        const double x_pos = x_start_ + phase * (x_end_ - x_start_);
-        const double z_pos = z_start_ + phase * (z_end_ - z_start_);
+        const double x_mid = 0.5 * (x_start_ + x_end_);
+        const double z_mid = 0.5 * (z_start_ + z_end_);
+        const double x_amp = 0.5 * (x_start_ - x_end_);
+        const double z_amp = 0.5 * (z_start_ - z_end_);
+
+        const double x_pos = x_mid + x_amp * std::cos(angle);
+        const double z_pos = z_mid + z_amp * std::cos(angle);
 
         trajectory_msgs::msg::JointTrajectory msg;
         msg.header.stamp = this->now();
@@ -59,31 +84,6 @@ private:
 
         msg.points.push_back(point);
         publisher_->publish(msg);
-
-        if (forward_)
-        {
-            if (index_ >= static_cast<std::size_t>(steps_ - 1))
-            {
-                forward_ = false; // Reach end, start going back
-                --index_;
-            }
-            else
-            {
-                ++index_;
-            }
-        }
-        else
-        {
-            if (index_ <= 0)
-            {
-                forward_ = true; // Reach start, start going forward
-                ++index_;
-            }
-            else
-            {
-                --index_;
-            }
-        }
     }
 
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr publisher_;
@@ -95,9 +95,9 @@ private:
     double z_end_{-0.06};
     double publish_period_sec_{0.3};
     double motion_time_sec_{0.3};
+    double loop_period_sec_{0.0};
     int steps_{28};
-    std::size_t index_{0};
-    bool forward_{true};
+    rclcpp::Time start_time_;
 };
 
 int main(int argc, char **argv)
