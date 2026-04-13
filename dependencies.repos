@@ -1,0 +1,64 @@
+repositories:
+  # ---------------------------------------------------------------
+  # Tesseract ROS 2 wrapper (monitoring, rosutils, rviz, msgs, etc.)
+  # ---------------------------------------------------------------
+  tesseract/src/tesseract_ros2:
+    type: git
+    url: https://github.com/tesseract-robotics/tesseract_ros2.git
+    version: 0.33.0
+
+  # ---------------------------------------------------------------
+  # Core Tesseract motion-planning libraries
+  # ---------------------------------------------------------------
+  tesseract/tesseract:
+    type: git
+    url: https://github.com/tesseract-robotics/tesseract.git
+    version: 0.33.0
+
+  tesseract/tesseract_planning:
+    type: git
+    url: https://github.com/tesseract-robotics/tesseract_planning.git
+    version: 0.33.0
+
+  tesseract/tesseract_qt:
+    type: git
+    url: https://github.com/tesseract-robotics/tesseract_qt.git
+    version: 0.33.0
+
+  tesseract/trajopt:
+    type: git
+    url: https://github.com/tesseract-robotics/trajopt.git
+    version: 0.33.0
+
+  # ---------------------------------------------------------------
+  # Supporting / utility libraries
+  # ---------------------------------------------------------------
+  tesseract/boost_plugin_loader:
+    type: git
+    url: https://github.com/tesseract-robotics/boost_plugin_loader.git
+    version: 0.4.2
+
+  tesseract/descartes_light:
+    type: git
+    url: https://github.com/swri-robotics/descartes_light.git
+    version: 0.4.9
+
+  tesseract/opw_kinematics:
+    type: git
+    url: https://github.com/Jmeyer1292/opw_kinematics.git
+    version: 0.5.2
+
+  tesseract/ifopt:
+    type: git
+    url: https://github.com/ethz-adrl/ifopt.git
+    version: 2.1.4
+
+  tesseract/taskflow:
+    type: git
+    url: https://github.com/taskflow/taskflow.git
+    version: v3.5.0
+
+  tesseract/ros_industrial_cmake_boilerplate:
+    type: git
+    url: https://github.com/ros-industrial/ros_industrial_cmake_boilerplate.git
+    version: 0.7.4
