@@ -6,6 +6,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -47,14 +48,17 @@ def generate_launch_description():
     # --------------------------------------------------
     # Generate robot_description from xacro
     # --------------------------------------------------
-    robot_description_content = Command([
-        "xacro ",
-        xacro_file,
-        " controllers_file:=",
-        controllers_file,
-        " tool_type:=",
-        tool_type
-    ])
+    robot_description_content = ParameterValue(
+        Command([
+            "xacro ",
+            xacro_file,
+            " controllers_file:=",
+            controllers_file,
+            " tool_type:=",
+            tool_type
+        ]),
+        value_type=str
+    )
 
     robot_description = {
         "robot_description": robot_description_content

@@ -1,76 +1,18 @@
+# ======================================================
+# thesis_project — .gitignore
+# ROS 2 (Humble/Iron) · C++ · Python · tesseract
+# ======================================================
+
 # ----------------------
 # OS Files
 # ----------------------
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ----------------------
-# Logs
-# ----------------------
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# ----------------------
-# Dependency directories
-# ----------------------
-node_modules/
-vendor/
-bower_components/
-
-# ----------------------
-# Environment variables
-# ----------------------
-.env
-.env.*
-*.env
-
-# ----------------------
-# Build output
-# ----------------------
-dist/
-build/
-out/
-coverage/
-.cache/
-.next/
-.nuxt/
-.svelte-kit/
-
-# ----------------------
-# Python
-# ----------------------
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.egg-info/
-.eggs/
-venv/
-.env/
-.venv/
-
-# ----------------------
-# Java
-# ----------------------
-*.class
-*.jar
-*.war
-*.ear
-target/
-
-# ----------------------
-# C / C++
-# ----------------------
-*.o
-*.obj
-*.exe
-*.dll
-*.so
-*.out
+.AppleDouble
+.LSOverride
+ehthumbs.db
+Icon?
 
 # ----------------------
 # IDE / Editor
@@ -80,23 +22,139 @@ target/
 *.swp
 *.swo
 *.iml
+*.code-workspace
+.history/
+.clangd/
 
 # ----------------------
-# Mac
+# Logs & Recordings
 # ----------------------
-.AppleDouble
-.LSOverride
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.bag
+*.db3
+*.mcap
+recording_*.bag
 
 # ----------------------
-# Windows
+# ROS 2 / Colcon build artifacts
 # ----------------------
-ehthumbs.db
-Icon?
+build/
+install/
+log/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+# Generated ROS message/service C++ headers (inside src tree)
+**/devel/
+**/msg/_*.py
+**/srv/_*.py
 
 # ----------------------
-# lib folder
+# C / C++ Compiled Output
 # ----------------------
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.out
+*.exe
+*.dll
+*.gch
+*.pch
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cbp
 
-tesseract
-moveit2
-recording_20260309_090850.bag
+# ----------------------
+# Python Virtual Environments
+# ----------------------
+venv/
+.venv/
+env/
+.env/
+ENV/
+# Named venvs common in this project
+*/venv/
+*/.venv/
+main_gui/venv/
+main_gui/.venv/
+
+# ----------------------
+# Python Package Artifacts
+# ----------------------
+*.egg-info/
+.eggs/
+dist/
+*.whl
+pip-wheel-metadata/
+.mypy_cache/
+.pytest_cache/
+.tox/
+htmlcov/
+.coverage
+coverage.xml
+
+# ----------------------
+# Environment Variables / Secrets
+# ----------------------
+.env
+.env.*
+*.env
+!.env.example
+
+# ----------------------
+# Node / JS (if any tooling is used)
+# ----------------------
+node_modules/
+bower_components/
+vendor/
+
+# ----------------------
+# Jupyter Notebooks
+# ----------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# ----------------------
+# Data / Bags / Heavy Assets
+# ----------------------
+mesh_processing/bags/
+mesh_processing/data/
+# Uncomment if you want to exclude large mesh files:
+# **/*.stl
+# **/*.dae
+# **/*.ply
+# **/*.obj
+
+# ----------------------
+# Tesseract & Third-Party Vendor Libraries
+# (these are cloned separately — see README for setup)
+# ----------------------
+tesseract/
+moveit2/
+
+# ----------------------
+# Generated UI Files (PyQt6 compiled from .ui)
+# ----------------------
+main_gui/thesis_gui/
+*_ui.py
+
+# ----------------------
+# Miscellaneous
+# ----------------------
+*.tmp
+*.bak
+*.orig
+*.rej
+*.patch
+.cache/

@@ -14,6 +14,7 @@
     <xacro:include filename="motoman_motomini_sensors.urdf.xacro" />
     <xacro:include filename="motoman_motomini_tool.xacro" />
     <xacro:include filename="2axis.urdf.xacro" />
+    <!-- <xacro:include filename="plate.urdf.xacro" /> -->
     <!-- ========= TOOLS ========= -->
     <xacro:motomini_tool
         parent_link="tool0"
@@ -31,6 +32,11 @@
         <child link="gantry_base_link" />
         <origin xyz="0.03 -0.46 0.0602" rpy="0 0 3.14" />
     </joint>
+    <!-- <joint name="world_to_plate" type="fixed">
+        <parent link="world" />
+        <child link="plate_body" />
+        <origin xyz="0.03 -0.46 0.0602" rpy="0 0 3.14" />
+    </joint> -->
     <gazebo reference="link_1_s">
         <turnGravityOff>true</turnGravityOff>
     </gazebo>

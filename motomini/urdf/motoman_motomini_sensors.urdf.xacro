@@ -45,7 +45,7 @@
     <joint name="world_depth_camera_joint" type="fixed">
         <parent link="workcell" />
         <child link="world_depth_camera_link" />
-        <origin xyz="0.225 -0.225 0.245" rpy="0 3.14159 3.14159" />
+        <origin xyz="0.212 -0.027 0.496" rpy="0 3.14159 3.14159" />
     </joint>
 
     <gazebo reference="world_depth_camera_link">
