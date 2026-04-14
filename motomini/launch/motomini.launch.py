@@ -7,6 +7,7 @@ from launch_ros.substitutions import FindPackageShare
 from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
+    # Use IfCondition with PythonExpression for combined conditions
     # 1. Path Helpers
     motomini_share = FindPackageShare("motomini")
     robot_planning_share = FindPackageShare("robot_planning")
@@ -19,6 +20,7 @@ def generate_launch_description():
     gantry_mode = LaunchConfiguration("gantry_mode")
     online_mode = LaunchConfiguration("online_mode")
     use_ompl = LaunchConfiguration("use_ompl")
+    vel_streaming = LaunchConfiguration("vel_streaming")
     tracking_rate_hz = LaunchConfiguration("tracking_rate_hz")
     planning_chunk_size = LaunchConfiguration("planning_chunk_size")
     planning_parallel_chunks = LaunchConfiguration("planning_parallel_chunks")
@@ -73,6 +75,36 @@ def generate_launch_description():
                 "planning_chunk_size": planning_chunk_size,
                 "planning_parallel_chunks": planning_parallel_chunks,
             }],
+            condition=UnlessCondition(vel_streaming),
+            output="screen"
+        ),
+
+        # JointState to Trajectory node no longer needed:
+        # motomini_vel_tracking now publishes JointTrajectory directly to /joint_path_command
+
+        Node(
+            package="robot_planning",
+            executable="motomini_vel_tracking",
+            parameters=[*common_params, {
+                "manipulator_group": "manipulator",
+                "base_link": "world",
+                "ee_link": concrete_ee_link,
+            }],
+            condition=IfCondition(vel_streaming),
+            output="screen"
+        ),
+
+        Node(
+            package="motomini",
+            executable="jogging_gui.py",
+            condition=IfCondition(vel_streaming),
+            output="screen"
+        ),
+
+        Node(
+            package="robot_planning",
+            executable="smooth_jogging_node",
+            condition=IfCondition(vel_streaming),
             output="screen"
         ),
 
@@ -110,7 +142,9 @@ def generate_launch_description():
         Node(
             package="motomini",
             executable="2axis_gui.py",
-            condition=gantry_mode_gui,
+            condition=IfCondition(PythonExpression([
+                "'", gantry_mode, "' == 'gui' and '", vel_streaming, "' == 'false'"
+            ])),
             output="screen"
         ),
 
@@ -205,7 +239,24 @@ def generate_launch_description():
                 "gantry_controller",
                 "--controller-manager-timeout", "30",
             ],
-            condition=UnlessCondition(real_robot),
+            condition=IfCondition(PythonExpression([
+                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'false'"
+            ])),
+            output="screen"
+        ),
+
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=[
+                "joint_state_broadcaster",
+                "motomini_controller",
+                "gantry_controller",
+                "--controller-manager-timeout", "30",
+            ],
+            condition=IfCondition(PythonExpression([
+                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'true'"
+            ])),
             output="screen"
         ),
 
@@ -296,6 +347,7 @@ def generate_launch_description():
         DeclareLaunchArgument("gantry_mode", default_value="loop"),
         DeclareLaunchArgument("online_mode", default_value="false"),
         DeclareLaunchArgument("use_ompl", default_value="true"),
+        DeclareLaunchArgument("vel_streaming", default_value="false"),
         DeclareLaunchArgument("tracking_rate_hz", default_value="3.0"),
         DeclareLaunchArgument("planning_chunk_size", default_value="5"),
         DeclareLaunchArgument("planning_parallel_chunks", default_value="2"),

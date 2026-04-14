@@ -12,6 +12,7 @@
 
   <depend>joint_state_publisher_gui</depend>
   <depend>ros_gz</depend>
+  <depend>rclpy</depend>
   <depend>rclcpp</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>

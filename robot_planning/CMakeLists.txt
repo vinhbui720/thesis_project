@@ -9,6 +9,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
@@ -156,6 +157,29 @@ ament_target_dependencies(gantry_loop_controller_node
   trajectory_msgs
 )
 
+add_executable(motomini_vel_tracking src/motomini_vel_tracking.cpp)
+ament_target_dependencies(motomini_vel_tracking
+  rclcpp
+  geometry_msgs
+  sensor_msgs
+  trajectory_msgs
+  std_srvs
+  tesseract_environment
+  tesseract_rosutils
+)
+
+add_executable(kb_jogging_node src/kb_jogging_node.cpp)
+ament_target_dependencies(kb_jogging_node
+  rclcpp
+  geometry_msgs
+)
+
+add_executable(smooth_jogging_node src/smooth_jogging_node.cpp)
+ament_target_dependencies(smooth_jogging_node
+  rclcpp
+  geometry_msgs
+)
+
 add_executable(online_collision_debugger src/collision_debugger_node.cpp)
 target_link_libraries(online_collision_debugger
   tesseract::tesseract_environment
@@ -199,7 +223,12 @@ ament_target_dependencies(grinding_task
   tesseract_common
   tesseract_rosutils
 )
-
+add_executable(joint_state_to_trajectory_node src/joint_state_to_trajectory_node.cpp)
+ament_target_dependencies(joint_state_to_trajectory_node
+  rclcpp
+  sensor_msgs
+  trajectory_msgs
+)
 install(
   DIRECTORY include/
   DESTINATION include
@@ -217,11 +246,15 @@ install(DIRECTORY
 install(TARGETS
   ${PROJECT_NAME}
   motomini_planning_node
+  motomini_vel_tracking
+  kb_jogging_node
+  smooth_jogging_node
   gantry_planning_node
   gantry_loop_controller_node
   online_collision_debugger
   enhanced_debug_node
   grinding_task
+  joint_state_to_trajectory_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

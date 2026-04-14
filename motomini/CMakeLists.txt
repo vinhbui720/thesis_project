@@ -115,6 +115,7 @@ install(PROGRAMS
   src/manual_controller.py
   src/2axis_controller.py
   src/2axis_gui.py
+  src/jogging_gui.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
