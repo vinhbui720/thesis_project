@@ -139,18 +139,29 @@ private:
         return true;
     }
 
-    void publishTrajectory(const std::vector<double> &positions, const std::vector<double> &velocities)
+    void publishTrajectory(const std::vector<double> &positions,
+                           const std::vector<double> &velocities,
+                           const std::vector<double> &next_positions)
     {
         trajectory_msgs::msg::JointTrajectory traj;
         traj.header.stamp = this->now();
         traj.joint_names = joint_names_;
 
-        trajectory_msgs::msg::JointTrajectoryPoint pt;
-        pt.positions = positions;
-        pt.velocities = velocities;
-        pt.time_from_start = rclcpp::Duration::from_seconds((this->now() - t_start_).seconds());
+        // Point 0: current position with computed velocity at t=0 (motion hint)
+        trajectory_msgs::msg::JointTrajectoryPoint pt0;
+        pt0.positions = positions;
+        pt0.velocities = velocities;
+        pt0.time_from_start = rclcpp::Duration::from_seconds(0.0);
 
-        traj.points.push_back(pt);
+        // Point 1: next integrated position with zero velocity at t=dt
+        // JointTrajectoryController requires zero velocity on the last point
+        trajectory_msgs::msg::JointTrajectoryPoint pt1;
+        pt1.positions = next_positions;
+        pt1.velocities.assign(joint_names_.size(), 0.0);
+        pt1.time_from_start = rclcpp::Duration::from_seconds(dt_);
+
+        traj.points.push_back(pt0);
+        traj.points.push_back(pt1);
         pub_traj_->publish(traj);
     }
 
@@ -159,7 +170,7 @@ private:
         if (tracked_positions_.empty())
             return;
         std::vector<double> zero_vel(joint_names_.size(), 0.0);
-        publishTrajectory(tracked_positions_, zero_vel);
+        publishTrajectory(tracked_positions_, zero_vel, tracked_positions_);
     }
 
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
@@ -250,12 +261,14 @@ private:
             }
         }
 
-        // Integrate velocity → position (same as ROS1 node)
+        // Compute next integrated positions (same as ROS1 node)
+        std::vector<double> current_positions = tracked_positions_;
         for (size_t i = 0; i < tracked_positions_.size(); ++i)
             tracked_positions_[i] += theta_d[i] * dt_;
 
         std::vector<double> velocities(theta_d.data(), theta_d.data() + theta_d.size());
-        publishTrajectory(tracked_positions_, velocities);
+        // Publish: pt0=current+vel, pt1=next+zero_vel (satisfies JointTrajectoryController constraint)
+        publishTrajectory(current_positions, velocities, tracked_positions_);
     }
 
     std::string urdf_xml_, srdf_xml_, manipulator_group_, base_link_, ee_link_;
