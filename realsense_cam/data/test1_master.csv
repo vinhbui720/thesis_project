@@ -1,0 +1,18 @@
+--- REQUIRED FILES ---
+Aligned STL Path,/home/vinbui/vinh_ws/src/realsense_cam/data/test1_aligned.stl
+Camera View PCD Path,/home/vinbui/vinh_ws/src/realsense_cam/data/test1_cam_view.pcd
+Trajectory Waypoints Path,/home/vinbui/vinh_ws/src/realsense_cam/data/test1_trajectory.csv
+
+--- PICK POINT COORDINATES ---
+Pick X (m),Pick Y (m),Pick Z (m)
+-0.000700819444122235,0.0009637470323582966,0.008
+
+--- CAMERA VIEW POSE MATRIX ---
+R11,R12,R13,Tx (m)
+R21,R22,R23,Ty (m)
+R31,R32,R33,Tz (m)
+0,0,0,1
+0.9999997971890507,-8.983587356057871e-07,0.0006368838595446843,-5.688475203600164e-05
+0.0,0.9999990051709442,0.0014105520628747926,-0.00012598671347687615
+-0.0006368844931358835,-0.0014105517767993897,0.9999988023601964,0.010682798667207699
+0.0,0.0,0.0,1.0

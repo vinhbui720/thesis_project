@@ -158,3 +158,5 @@ main_gui/thesis_gui/
 *.rej
 *.patch
 .cache/
+realsense_cam/data/video_1.mp4
+realsense_cam/data/video_2.mp4

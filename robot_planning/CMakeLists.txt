@@ -175,6 +175,7 @@ ament_target_dependencies(kb_jogging_node
 )
 
 add_executable(smooth_jogging_node src/smooth_jogging_node.cpp)
+target_link_libraries(smooth_jogging_node Eigen3::Eigen)
 ament_target_dependencies(smooth_jogging_node
   rclcpp
   geometry_msgs
