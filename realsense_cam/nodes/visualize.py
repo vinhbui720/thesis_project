@@ -68,7 +68,25 @@ class Visualize:
             icp_state = "READY" if data.get("icp_ready", False) else ("RUN" if data.get("icp_running", False) else "IDLE")
             cv2.putText(img, f"depth_px:{nz_depth} final_px:{nz_final} icp:{icp_state}", (10, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
+        # ===== TRACKING GATE LINES =====
+        gate = self.cfg.get("tracking_gate", {})
+        if gate.get("enabled", False):
+            sl = gate.get("start_line")
+            el = gate.get("stop_line")
+            if sl:
+                cv2.line(img, tuple(sl[0]), tuple(sl[1]), (0, 255, 0), 2)
+                cv2.putText(img, "START", (sl[0][0] + 4, sl[0][1] + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            if el:
+                cv2.line(img, tuple(el[0]), tuple(el[1]), (0, 0, 255), 2)
+                cv2.putText(img, "STOP", (el[0][0] + 4, el[0][1] + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            # show active/wait state
+            active = data.get("tracking_active", False)
+            label  = "TRACKING" if active else "WAIT"
+            color  = (0, 255, 0) if active else (0, 165, 255)
+            cv2.putText(img, label, (10, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         # ===== DEPTH BOX =====
         if self.cfg["vis"].get("show_depth_box", True):
             if "bbox_depth" in data:

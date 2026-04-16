@@ -71,7 +71,45 @@ CONFIG = {
     },
     # endregion
 
+    # =========================
+    # region TRACKING GATE (pixel space)
+    # =========================
+    "tracking_gate": {
+        # ── Zone gate ──────────────────────────────────────────────────────
+        "enabled":    True,
+        "start_line": [(150, 0), (150, 300)],  # green line  (object enters here)
+        "stop_line":  [(500, 0), (500, 300)],  # red   line  (object exits  here)
 
+        # ── Kalman process noise (Q matrix, diagonal) ─────────────────────
+        # process_noise_pos : trust on position model  (smaller → position smoother)
+        # process_noise_vel : trust on velocity model  (larger → velocity adapts faster)
+        # Rule: process_noise_vel >> process_noise_pos to make velocity responsive
+        "process_noise_pos": 1e-4,  # Q[x, y]   — keep small: position is stable
+        "process_noise_vel": 5e-2,  # Q[vx, vy] — keep large: velocity must learn fast
+
+        # ── Kalman measurement noise (R matrix) ───────────────────────────
+        # measure_noise : how much to trust the raw bbox centroid
+        # larger → smoother position, slower to react; smaller → jumpy but responsive
+        "measure_noise": 1e-2,
+
+        # ── 3-D centre smoothing ───────────────────────────────────────────
+        # ema_alpha: weight on OLD value (0.0 = no smoothing, 1.0 = frozen)
+        "ema_alpha": 0.2,
+
+        # ── Depth patch for robust Z lookup ───────────────────────────────
+        # depth_patch_k: half-size of median window in pixels (window = 2k+1 × 2k+1)
+        "depth_patch_k": 5,
+
+        # ── Direction enforcement (start → stop) ──────────────────────────
+        # init_velocity_hint : initial vx seed (px/s) in the start→stop direction
+        #   when object first enters the gate — prevents zero/reverse velocity cold start
+        "init_velocity_hint": 0.05,
+
+        # velocity_dampen_reverse : if True, clamp any velocity component that points
+        #   backwards (against start→stop direction) to zero inside the gate
+        "velocity_dampen_reverse": True,
+    },
+    # endregion
     # =========================
     # region OBJECT (FINAL FILTER)
     # =========================
@@ -117,7 +155,7 @@ CONFIG = {
     "debug": {
         "show_init_cloud": True,   # show cloud trước ICP
         "print_icp": True,         # log fitness + rmse
-        "print_fps": False,
+        "print_fps": True,
     },
     # endregion
 
@@ -129,10 +167,10 @@ CONFIG = {
 
         # window toggle
         "rgb": True,
-        "mask_bg": True,
-        "mask_depth": True,
-        "mask_final": True,
-        "crop": True,
+        "mask_bg": False,
+        "mask_depth": False,
+        "mask_final": False,
+        "crop": False,
 
         # overlays
         "show_roi": True,

@@ -1,3 +1,4 @@
+import rclpy          
 from thesis_project.realsense_cam.core.pipeline import Pipeline
 from thesis_project.realsense_cam.config import CONFIG
 
@@ -12,6 +13,8 @@ from thesis_project.realsense_cam.nodes.tracker import Tracker
 from thesis_project.realsense_cam.nodes.tracker_kalman import TrackerKalman
 from thesis_project.realsense_cam.nodes.pose_init_icp import PoseInitICPAsync
 from thesis_project.realsense_cam.nodes.pose_fusion import PoseFusion
+
+rclpy.init()    
 
 src_mode = CONFIG.get("source", {}).get("mode", "bag")
 bag_path = CONFIG.get("source", {}).get("bag_path", "data/20260408_203426.bag")
@@ -34,3 +37,4 @@ pipeline = Pipeline([
 ])
 
 pipeline.run()
+rclpy.shutdown()

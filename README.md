@@ -61,42 +61,42 @@ vinh_ws/
 
 ## Package Overview
 
-| Package | Lang | Description |
-|---|---|---|
-| `gantry_controller` | C++ | ROS 2 hardware bridge for the 2-axis gantry over **Modbus TCP** (`rclcpp`, `sensor_msgs`, `trajectory_msgs`) |
-| `main_gui` | Python / PyQt6 | Operator GUI — calibration, mesh loading, pick-pose editing, trajectory approval |
-| `mesh_processing` | C++ | Point-cloud filtering, surface reconstruction, pick-point extraction (Open3D, PCL) |
-| `motomini` | URDF/xacro | Motoman MotoMini robot description + Gazebo / RViz launch files |
-| `robot_model` | URDF/xacro | Shared robot model combining arm + gantry workcell |
-| `robot_planning` | C++ | **Tesseract**-based motion planner (TrajOpt / Descartes) exposed as a ROS 2 action server |
+| Package             | Lang           | Description                                                                                                  |
+| ------------------- | -------------- | ------------------------------------------------------------------------------------------------------------ |
+| `gantry_controller` | C++            | ROS 2 hardware bridge for the 2-axis gantry over **Modbus TCP** (`rclcpp`, `sensor_msgs`, `trajectory_msgs`) |
+| `main_gui`          | Python / PyQt6 | Operator GUI — calibration, mesh loading, pick-pose editing, trajectory approval                             |
+| `mesh_processing`   | C++            | Point-cloud filtering, surface reconstruction, pick-point extraction (Open3D, PCL)                           |
+| `motomini`          | URDF/xacro     | Motoman MotoMini robot description + Gazebo / RViz launch files                                              |
+| `robot_model`       | URDF/xacro     | Shared robot model combining arm + gantry workcell                                                           |
+| `robot_planning`    | C++            | **Tesseract**-based motion planner (TrajOpt / Descartes) exposed as a ROS 2 action server                    |
 
 ### Tesseract Vendor Library Map (v0.33.0)
 
-| Repo | Version | Provides |
-|---|---|---|
-| [`tesseract`](https://github.com/tesseract-robotics/tesseract) | 0.33.0 | Core: `tesseract_common`, `tesseract_collision`, `tesseract_environment`, `tesseract_kinematics`, `tesseract_scene_graph`, `tesseract_srdf`, `tesseract_urdf`, `tesseract_visualization`, `tesseract_geometry`, `tesseract_state_solver`, `tesseract_support` |
-| [`tesseract_planning`](https://github.com/tesseract-robotics/tesseract_planning) | 0.33.0 | `tesseract_command_language`, `tesseract_motion_planners`, `tesseract_task_composer`, `tesseract_time_parameterization`, `tesseract_examples` |
-| [`tesseract_qt`](https://github.com/tesseract-robotics/tesseract_qt) | 0.33.0 | Qt5-based visualisation widgets |
-| [`tesseract_ros2`](https://github.com/tesseract-robotics/tesseract_ros2) | 0.33.0 | ROS 2 wrappers: `tesseract_msgs`, `tesseract_rosutils`, `tesseract_rviz`, `tesseract_monitoring`, `tesseract_planning_server`, `tesseract_qt_ros`, `tesseract_ros_examples` |
-| [`trajopt`](https://github.com/tesseract-robotics/trajopt) | 0.33.0 | `trajopt`, `trajopt_ifopt`, `trajopt_sco`, `trajopt_sqp`, `trajopt_common` |
-| [`boost_plugin_loader`](https://github.com/tesseract-robotics/boost_plugin_loader) | 0.4.2 | Plugin-loader utility |
-| [`descartes_light`](https://github.com/swri-robotics/descartes_light) | 0.4.9 | Descartes Cartesian planner |
-| [`opw_kinematics`](https://github.com/Jmeyer1292/opw_kinematics) | 0.5.2 | Analytical IK for 6-DOF industrial robots |
-| [`ifopt`](https://github.com/ethz-adrl/ifopt) | 2.1.4 | Interface to Ipopt / OSQP NLP solvers |
-| [`taskflow`](https://github.com/taskflow/taskflow) | v3.5.0 | Parallel task-graph execution |
-| [`ros_industrial_cmake_boilerplate`](https://github.com/ros-industrial/ros_industrial_cmake_boilerplate) | 0.7.4 | Shared CMake macros |
+| Repo                                                                                                     | Version | Provides                                                                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`tesseract`](https://github.com/tesseract-robotics/tesseract)                                           | 0.33.0  | Core: `tesseract_common`, `tesseract_collision`, `tesseract_environment`, `tesseract_kinematics`, `tesseract_scene_graph`, `tesseract_srdf`, `tesseract_urdf`, `tesseract_visualization`, `tesseract_geometry`, `tesseract_state_solver`, `tesseract_support` |
+| [`tesseract_planning`](https://github.com/tesseract-robotics/tesseract_planning)                         | 0.33.0  | `tesseract_command_language`, `tesseract_motion_planners`, `tesseract_task_composer`, `tesseract_time_parameterization`, `tesseract_examples`                                                                                                                 |
+| [`tesseract_qt`](https://github.com/tesseract-robotics/tesseract_qt)                                     | 0.33.0  | Qt5-based visualisation widgets                                                                                                                                                                                                                               |
+| [`tesseract_ros2`](https://github.com/tesseract-robotics/tesseract_ros2)                                 | 0.33.0  | ROS 2 wrappers: `tesseract_msgs`, `tesseract_rosutils`, `tesseract_rviz`, `tesseract_monitoring`, `tesseract_planning_server`, `tesseract_qt_ros`, `tesseract_ros_examples`                                                                                   |
+| [`trajopt`](https://github.com/tesseract-robotics/trajopt)                                               | 0.33.0  | `trajopt`, `trajopt_ifopt`, `trajopt_sco`, `trajopt_sqp`, `trajopt_common`                                                                                                                                                                                    |
+| [`boost_plugin_loader`](https://github.com/tesseract-robotics/boost_plugin_loader)                       | 0.4.2   | Plugin-loader utility                                                                                                                                                                                                                                         |
+| [`descartes_light`](https://github.com/swri-robotics/descartes_light)                                    | 0.4.9   | Descartes Cartesian planner                                                                                                                                                                                                                                   |
+| [`opw_kinematics`](https://github.com/Jmeyer1292/opw_kinematics)                                         | 0.5.2   | Analytical IK for 6-DOF industrial robots                                                                                                                                                                                                                     |
+| [`ifopt`](https://github.com/ethz-adrl/ifopt)                                                            | 2.1.4   | Interface to Ipopt / OSQP NLP solvers                                                                                                                                                                                                                         |
+| [`taskflow`](https://github.com/taskflow/taskflow)                                                       | v3.5.0  | Parallel task-graph execution                                                                                                                                                                                                                                 |
+| [`ros_industrial_cmake_boilerplate`](https://github.com/ros-industrial/ros_industrial_cmake_boilerplate) | 0.7.4   | Shared CMake macros                                                                                                                                                                                                                                           |
 
 ---
 
 ## System Requirements
 
-| Item | Version |
-|---|---|
-| OS | Ubuntu 22.04 LTS (Jammy) |
-| ROS 2 | Humble Hawksbill |
-| CMake | ≥ 3.22 |
-| GCC | 11+ (default on 22.04) |
-| Python | 3.10 (system) |
+| Item   | Version                  |
+| ------ | ------------------------ |
+| OS     | Ubuntu 22.04 LTS (Jammy) |
+| ROS 2  | Humble Hawksbill         |
+| CMake  | ≥ 3.22                   |
+| GCC    | 11+ (default on 22.04)   |
+| Python | 3.10 (system)            |
 
 ---
 
@@ -254,19 +254,19 @@ vcs import < dependencies.repos
 
 > This clones the following repos (all relative to `thesis_project/`):
 >
-> | Cloned path | Repo | Version |
-> |---|---|---|
-> | `tesseract/tesseract` | tesseract-robotics/tesseract | 0.33.0 |
-> | `tesseract/tesseract_planning` | tesseract-robotics/tesseract_planning | 0.33.0 |
-> | `tesseract/tesseract_qt` | tesseract-robotics/tesseract_qt | 0.33.0 |
-> | `tesseract/trajopt` | tesseract-robotics/trajopt | 0.33.0 |
-> | `tesseract/src/tesseract_ros2` | tesseract-robotics/tesseract_ros2 | 0.33.0 |
-> | `tesseract/boost_plugin_loader` | tesseract-robotics/boost_plugin_loader | 0.4.2 |
-> | `tesseract/descartes_light` | swri-robotics/descartes_light | 0.4.9 |
-> | `tesseract/opw_kinematics` | Jmeyer1292/opw_kinematics | 0.5.2 |
-> | `tesseract/ifopt` | ethz-adrl/ifopt | 2.1.4 |
-> | `tesseract/taskflow` | taskflow/taskflow | v3.5.0 |
-> | `tesseract/ros_industrial_cmake_boilerplate` | ros-industrial/ros_industrial_cmake_boilerplate | 0.7.4 |
+> | Cloned path                                  | Repo                                            | Version |
+> | -------------------------------------------- | ----------------------------------------------- | ------- |
+> | `tesseract/tesseract`                        | tesseract-robotics/tesseract                    | 0.33.0  |
+> | `tesseract/tesseract_planning`               | tesseract-robotics/tesseract_planning           | 0.33.0  |
+> | `tesseract/tesseract_qt`                     | tesseract-robotics/tesseract_qt                 | 0.33.0  |
+> | `tesseract/trajopt`                          | tesseract-robotics/trajopt                      | 0.33.0  |
+> | `tesseract/src/tesseract_ros2`               | tesseract-robotics/tesseract_ros2               | 0.33.0  |
+> | `tesseract/boost_plugin_loader`              | tesseract-robotics/boost_plugin_loader          | 0.4.2   |
+> | `tesseract/descartes_light`                  | swri-robotics/descartes_light                   | 0.4.9   |
+> | `tesseract/opw_kinematics`                   | Jmeyer1292/opw_kinematics                       | 0.5.2   |
+> | `tesseract/ifopt`                            | ethz-adrl/ifopt                                 | 2.1.4   |
+> | `tesseract/taskflow`                         | taskflow/taskflow                               | v3.5.0  |
+> | `tesseract/ros_industrial_cmake_boilerplate` | ros-industrial/ros_industrial_cmake_boilerplate | 0.7.4   |
 
 ### Update to Latest Pinned Versions
 
@@ -317,17 +317,17 @@ deactivate
 
 **Dependencies installed** (`requirements.txt`):
 
-| Package | Purpose |
-|---|---|
-| `PyQt6==6.6.1` | GUI framework |
+| Package          | Purpose                           |
+| ---------------- | --------------------------------- |
+| `PyQt6==6.6.1`   | GUI framework                     |
 | `open3d==0.18.0` | 3-D point-cloud & mesh processing |
-| `numpy>=1.24` | Numerical arrays |
-| `scipy` | Scientific computing |
-| `trimesh` | Mesh loading & manipulation |
-| `pyvista` | 3-D visualisation |
-| `pyqtgraph` | Embedded plot widgets |
-| `pyyaml` | YAML config parsing |
-| `psutil` | System resource monitoring |
+| `numpy>=1.24`    | Numerical arrays                  |
+| `scipy`          | Scientific computing              |
+| `trimesh`        | Mesh loading & manipulation       |
+| `pyvista`        | 3-D visualisation                 |
+| `pyqtgraph`      | Embedded plot widgets             |
+| `pyyaml`         | YAML config parsing               |
+| `psutil`         | System resource monitoring        |
 
 > **Do not** `pip install rclpy` — use the system ROS 2 Python packages.
 > `run_gui.sh` adds the ROS 2 Python path automatically.
@@ -442,11 +442,13 @@ within any `colcon`-built C++ or Python node.
 
 ---
 
+PYTHONPATH=/home/vinbui/vinh_ws/src
+
 ## Remote Repositories
 
-| Remote | URL |
-|---|---|
-| `origin` | https://github.com/vinhbui720/thesis_project |
+| Remote            | URL                                          |
+| ----------------- | -------------------------------------------- |
+| `origin`          | https://github.com/vinhbui720/thesis_project |
 | `upstream` (team) | https://github.com/Vinhktn720/thesis_project |
 
 ```bash
@@ -457,4 +459,4 @@ git merge upstream/master
 
 ---
 
-*HCMUT Robotics Lab · April 2026*
+_HCMUT Robotics Lab · April 2026_
