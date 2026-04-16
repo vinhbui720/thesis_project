@@ -168,6 +168,18 @@ ament_target_dependencies(motomini_vel_tracking
   tesseract_rosutils
 )
 
+add_executable(motomini_feedback_stream src/motomini_feedback_stream.cpp)
+ament_target_dependencies(motomini_feedback_stream
+  rclcpp
+  geometry_msgs
+  sensor_msgs
+  trajectory_msgs
+  std_srvs
+  tesseract_environment
+  tesseract_kinematics
+  tesseract_rosutils
+)
+
 add_executable(kb_jogging_node src/kb_jogging_node.cpp)
 ament_target_dependencies(kb_jogging_node
   rclcpp
@@ -248,6 +260,7 @@ install(TARGETS
   ${PROJECT_NAME}
   motomini_planning_node
   motomini_vel_tracking
+  motomini_feedback_stream
   kb_jogging_node
   smooth_jogging_node
   gantry_planning_node

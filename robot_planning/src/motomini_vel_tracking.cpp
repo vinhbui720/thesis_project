@@ -183,11 +183,15 @@ private:
         latest_cart_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
             msg->angular.x, msg->angular.y, msg->angular.z;
         last_cmd_time_ = this->now();
+
         if (state_ == STATE_IDLE)
         {
             // Seed positions from real joint states at transition to active
             if (initTrackedPositions())
             {
+                if (ENABLE_SEED)
+                    seed();
+
                 t_start_ = this->now();
                 state_ = STATE_POSE_FOLLOW;
             }
@@ -289,6 +293,27 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_start_, srv_stop_;
     rclcpp::TimerBase::SharedPtr timer_;
     sensor_msgs::msg::JointState::SharedPtr last_joint_state_;
+
+    // Added ENABLE_SEED flag and seed() function for optional seeding
+    bool ENABLE_SEED = false;
+
+    void seed()
+    {
+        if (!last_joint_state_)
+            return;
+
+        trajectory_msgs::msg::JointTrajectory traj;
+        traj.header.stamp = this->now();
+        traj.joint_names = joint_names_;
+
+        trajectory_msgs::msg::JointTrajectoryPoint pt;
+        pt.positions = tracked_positions_; // Use current joint state
+        pt.velocities.resize(joint_names_.size(), 0.0);
+        pt.time_from_start = rclcpp::Duration::from_seconds(0.0);
+
+        traj.points.push_back(pt);
+        pub_traj_->publish(traj);
+    }
 };
 
 int main(int argc, char **argv)
