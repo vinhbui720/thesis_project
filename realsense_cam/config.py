@@ -145,6 +145,24 @@ CONFIG = {
         "async": True,
         "invert_rotation": True,
         "min_points_icp": 100,
+
+        # quality gate for retrigger service response
+        # ICP result is reported as FAIL if fitness < this threshold
+        "icp_min_fitness": 0.5,
+    },
+    # endregion
+
+
+    # =========================
+    # region ROS2 PUBLISHER
+    # =========================
+    "ros2_publisher": {
+        "frame_id": "camera_link",   # TF frame for all published messages
+
+        # Minimum ICP fitness to consider a retrigger successful.
+        # Mirrors init_pose.icp_min_fitness — override here if you want
+        # a different threshold for the service vs. the initial run.
+        "icp_min_fitness": 0.5,
     },
     # endregion
 
