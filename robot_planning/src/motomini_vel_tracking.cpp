@@ -18,6 +18,14 @@
 #include <tesseract_kinematics/core/kinematic_group.h>
 #include <tesseract_rosutils/utils.h>
 
+// Maximum allowed lead of command vs actual (rad). Prevents buffer runaway.
+static constexpr double MAX_LEAD_RAD = 0.10;
+
+// Seconds to wait before sending arm trigger (let roscore/bridge settle).
+static constexpr double ARM_PRE_DELAY_S = 0.5;
+// Seconds to wait after arm trigger before beginning stream.
+static constexpr double ARM_POST_DELAY_S = 1.0;
+
 class MotoMiniVelTrackingNode : public rclcpp::Node
 {
 public:
@@ -29,8 +37,7 @@ public:
         this->declare_parameter<std::string>("manipulator_group", "manipulator");
         this->declare_parameter<std::string>("base_link", "base_link");
         this->declare_parameter<std::string>("ee_link", "tool0");
-        this->declare_parameter<double>("rate_hz", 50.0);
-        this->declare_parameter<double>("cmd_vel_timeout", 0.5);
+        this->declare_parameter<double>("rate_hz", 25.0);
         this->declare_parameter<double>("theta_d_lim", 3.14);
         this->declare_parameter<double>("w0", 0.1);
         this->declare_parameter<double>("k0", 0.001);
@@ -41,7 +48,6 @@ public:
         base_link_ = this->get_parameter("base_link").as_string();
         ee_link_ = this->get_parameter("ee_link").as_string();
         rate_hz_ = this->get_parameter("rate_hz").as_double();
-        cmd_vel_timeout_ = this->get_parameter("cmd_vel_timeout").as_double();
         theta_d_limit_ = this->get_parameter("theta_d_lim").as_double();
         w0_ = this->get_parameter("w0").as_double();
         k0_ = this->get_parameter("k0").as_double();
@@ -50,14 +56,19 @@ public:
         if (!initializeKinematics())
             throw std::runtime_error("Failed to initialize Tesseract kinematics");
 
-        // Publish JointTrajectory directly to the controller topic
-        pub_traj_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
+        // Phase 1 publisher — arm trigger only.
+        pub_arm_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
             "/joint_path_command", 10);
+
+        // Phase 2 publisher — real-time streaming.
+        pub_stream_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
+            "/joint_command", 10);
 
         sub_cmd_vel_ = this->create_subscription<geometry_msgs::msg::Twist>(
             "/pose_following/cmd_vel", 10,
             std::bind(&MotoMiniVelTrackingNode::cmdVelCallback, this, std::placeholders::_1));
 
+        // Subscribe to the MotoPlus joint state topic.
         sub_joint_state_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 20,
             std::bind(&MotoMiniVelTrackingNode::jointStateCallback, this, std::placeholders::_1));
@@ -70,27 +81,33 @@ public:
             "/pose_following/stop",
             std::bind(&MotoMiniVelTrackingNode::stopCallback, this, std::placeholders::_1, std::placeholders::_2));
 
-        state_ = STATE_IDLE;
         latest_cart_vel_.setZero();
-        last_cmd_time_ = this->now();
-        t_start_ = this->now();
 
         auto period_ns = std::chrono::nanoseconds(static_cast<int64_t>(1e9 / std::max(1.0, rate_hz_)));
         timer_ = this->create_wall_timer(
             period_ns,
             std::bind(&MotoMiniVelTrackingNode::tick, this));
 
-        RCLCPP_INFO(this->get_logger(), "Node initialized. Group: %s", manipulator_group_.c_str());
+        RCLCPP_INFO(this->get_logger(),
+                    "Node initialized (%.0f Hz). Waiting for joint state on /motomini_joint_states ...",
+                    rate_hz_);
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // State machine
+    // -----------------------------------------------------------------------
     enum State
     {
-        STATE_IDLE,
-        STATE_POSE_FOLLOW,
-        STATE_STOP
+        STATE_WAIT_JOINT, // Phase 0 — waiting for first valid joint state.
+        STATE_ARMING,     // Phase 1 — arm trigger sent; waiting settle time.
+        STATE_STREAMING,  // Phase 2 — continuous stream to /joint_command.
+        STATE_STOPPED     // Permanently halted; only /start can restart.
     };
 
+    // -----------------------------------------------------------------------
+    // Kinematics
+    // -----------------------------------------------------------------------
     bool initializeKinematics()
     {
         auto locator = std::make_shared<tesseract_rosutils::ROSResourceLocator>();
@@ -121,15 +138,16 @@ private:
         q.resize(joint_names_.size());
         for (size_t i = 0; i < joint_names_.size(); ++i)
         {
-            auto it = std::find(last_joint_state_->name.begin(), last_joint_state_->name.end(), joint_names_[i]);
+            auto it = std::find(last_joint_state_->name.begin(),
+                                last_joint_state_->name.end(), joint_names_[i]);
             if (it == last_joint_state_->name.end())
                 return false;
-            q[i] = last_joint_state_->position[std::distance(last_joint_state_->name.begin(), it)];
+            q[static_cast<Eigen::Index>(i)] =
+                last_joint_state_->position[std::distance(last_joint_state_->name.begin(), it)];
         }
         return true;
     }
 
-    // Seed tracked_positions_ from current joint states (called once at start)
     bool initTrackedPositions()
     {
         Eigen::VectorXd q;
@@ -139,40 +157,60 @@ private:
         return true;
     }
 
-    void publishTrajectory(const std::vector<double> &positions,
-                           const std::vector<double> &velocities,
-                           const std::vector<double> &next_positions)
+    // -----------------------------------------------------------------------
+    // Phase 1 — arm trigger
+    // -----------------------------------------------------------------------
+    void sendArmTrigger()
     {
         trajectory_msgs::msg::JointTrajectory traj;
         traj.header.stamp = this->now();
         traj.joint_names = joint_names_;
 
-        // Point 0: current position with computed velocity at t=0 (motion hint)
-        trajectory_msgs::msg::JointTrajectoryPoint pt0;
-        pt0.positions = positions;
-        pt0.velocities = velocities;
-        pt0.time_from_start = rclcpp::Duration::from_seconds(0.0);
+        trajectory_msgs::msg::JointTrajectoryPoint pt;
+        pt.positions = tracked_positions_;
+        pt.velocities.assign(joint_names_.size(), 0.0);
+        pt.time_from_start = rclcpp::Duration::from_seconds(0.5);
 
-        // Point 1: next integrated position with zero velocity at t=dt
-        // JointTrajectoryController requires zero velocity on the last point
-        trajectory_msgs::msg::JointTrajectoryPoint pt1;
-        pt1.positions = next_positions;
-        pt1.velocities.assign(joint_names_.size(), 0.0);
-        pt1.time_from_start = rclcpp::Duration::from_seconds(dt_);
-
-        traj.points.push_back(pt0);
-        traj.points.push_back(pt1);
-        pub_traj_->publish(traj);
+        traj.points.push_back(pt);
+        pub_arm_->publish(traj);
+        RCLCPP_INFO(this->get_logger(), "Phase 1: arm trigger sent to /joint_path_command");
     }
 
-    void publishStop()
+    // -----------------------------------------------------------------------
+    // Phase 2 — streaming helpers
+    // -----------------------------------------------------------------------
+
+    // Publish exactly ONE point to /joint_command.
+    void publishStreamPoint(const std::vector<double> &positions,
+                            const std::vector<double> &velocities,
+                            double time_from_start)
     {
-        if (tracked_positions_.empty())
-            return;
-        std::vector<double> zero_vel(joint_names_.size(), 0.0);
-        publishTrajectory(tracked_positions_, zero_vel, tracked_positions_);
+        trajectory_msgs::msg::JointTrajectory traj;
+        traj.header.stamp = this->now();
+        traj.joint_names = joint_names_;
+
+        trajectory_msgs::msg::JointTrajectoryPoint pt;
+        pt.positions = positions;
+        pt.velocities = velocities;
+        pt.time_from_start = rclcpp::Duration::from_seconds(time_from_start);
+
+        traj.points.push_back(pt); // EXACTLY one point per spec.
+        pub_stream_->publish(traj);
     }
 
+    // Seed — first message of every streaming session (time = 0, vel = 0).
+    void sendSeed()
+    {
+        std::vector<double> zero_vel(joint_names_.size(), 0.0);
+        publishStreamPoint(tracked_positions_, zero_vel, 0.0);
+        stream_time_ = 0.0;
+        RCLCPP_INFO(this->get_logger(),
+                    "Phase 2: seed sent to /joint_command — streaming started");
+    }
+
+    // -----------------------------------------------------------------------
+    // Callbacks
+    // -----------------------------------------------------------------------
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
         last_joint_state_ = msg;
@@ -180,140 +218,191 @@ private:
 
     void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
     {
+        // Only update velocity; state transitions happen in tick().
         latest_cart_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
             msg->angular.x, msg->angular.y, msg->angular.z;
-        last_cmd_time_ = this->now();
-
-        if (state_ == STATE_IDLE)
-        {
-            // Seed positions from real joint states at transition to active
-            if (initTrackedPositions())
-            {
-                if (ENABLE_SEED)
-                    seed();
-
-                t_start_ = this->now();
-                state_ = STATE_POSE_FOLLOW;
-            }
-        }
     }
 
+    // /pose_following/start — re-arm from any stopped / initial state.
     void startCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
                        std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
-        state_ = STATE_IDLE;
+        if (state_ == STATE_ARMING || state_ == STATE_STREAMING)
+        {
+            res->success = false;
+            res->message = "Already active. Call /pose_following/stop first.";
+            return;
+        }
         tracked_positions_.clear();
+        latest_cart_vel_.setZero();
+        arm_trigger_sent_ = false;
+        state_ = STATE_WAIT_JOINT;
         res->success = true;
+        res->message = "Re-arming: waiting for joint state.";
+        RCLCPP_INFO(this->get_logger(), "Re-arm requested via /pose_following/start");
     }
 
+    // /pose_following/stop — the ONLY way to stop streaming.
     void stopCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
                       std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
-        state_ = STATE_STOP;
-        publishStop();
+        latest_cart_vel_.setZero();
+        state_ = STATE_STOPPED;
         res->success = true;
+        res->message = "Streaming stopped.";
+        RCLCPP_INFO(this->get_logger(), "Streaming stopped via /pose_following/stop");
     }
 
+    // -----------------------------------------------------------------------
+    // Main timer tick
+    // -----------------------------------------------------------------------
     void tick()
     {
-        if (state_ == STATE_IDLE)
+        switch (state_)
+        {
+        // ---- Completely stopped — do nothing. ----
+        case STATE_STOPPED:
             return;
 
-        if (state_ == STATE_STOP)
+        // ---- Phase 0: wait for first valid joint state. ----
+        case STATE_WAIT_JOINT:
         {
-            publishStop();
+            if (!last_joint_state_)
+                return;
+            if (!initTrackedPositions())
+                return;
+            arm_entry_time_ = this->now();
+            arm_trigger_sent_ = false;
+            state_ = STATE_ARMING;
+            RCLCPP_INFO(this->get_logger(),
+                        "Joint state acquired. Entering arming phase (pre-delay %.1fs).",
+                        ARM_PRE_DELAY_S);
             return;
         }
 
-        // Timeout: no new cmd_vel → go idle
-        if ((this->now() - last_cmd_time_).seconds() > cmd_vel_timeout_)
+        // ---- Phase 1: send arm trigger after pre-delay; wait post-delay. ----
+        case STATE_ARMING:
         {
-            state_ = STATE_IDLE;
-            publishStop();
+            double elapsed = (this->now() - arm_entry_time_).seconds();
+            if (!arm_trigger_sent_)
+            {
+                if (elapsed < ARM_PRE_DELAY_S)
+                    return;
+                sendArmTrigger();
+                arm_trigger_sent_ = true;
+                return;
+            }
+            // Wait post-delay after trigger was sent.
+            if (elapsed < ARM_PRE_DELAY_S + ARM_POST_DELAY_S)
+                return;
+            // Re-sync tracked positions to actual before seeding.
+            if (!initTrackedPositions())
+                return;
+            sendSeed();
+            state_ = STATE_STREAMING;
             return;
         }
 
+        // ---- Phase 2: continuous streaming — NEVER stop. ----
+        case STATE_STREAMING:
+            doStream();
+            return;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 streaming logic
+    // -----------------------------------------------------------------------
+    void doStream()
+    {
         if (!last_joint_state_)
             return;
 
-        // Seed tracked positions if not yet initialized
-        if (tracked_positions_.empty())
-        {
-            if (!initTrackedPositions())
-                return;
-        }
-
-        // Compute Jacobian from current real joint positions
         Eigen::VectorXd q;
         if (!currentManipulatorJointVector(q))
             return;
 
-        Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
-        double w = std::sqrt(std::max(0.0, (J * J.transpose()).determinant()));
-        Eigen::VectorXd theta_d = calcSrInverse(J, w, w0_, k0_) * latest_cart_vel_;
+        // Compute desired joint velocities from Cartesian cmd_vel.
+        // If no cmd_vel is active, hold current position (zero velocity).
+        Eigen::VectorXd theta_d(static_cast<Eigen::Index>(joint_names_.size()));
+        theta_d.setZero();
 
-        // Joint velocity limit check
-        for (int i = 0; i < theta_d.size(); ++i)
+        if (latest_cart_vel_.norm() > 0.0)
         {
-            if (std::abs(theta_d[i]) > theta_d_limit_)
+            Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
+            double w = std::sqrt(std::max(0.0, (J * J.transpose()).determinant()));
+            theta_d = calcSrInverse(J, w, w0_, k0_) * latest_cart_vel_;
+
+            // Hard-stop if any joint velocity exceeds limit.
+            for (Eigen::Index i = 0; i < theta_d.size(); ++i)
             {
-                RCLCPP_WARN(this->get_logger(),
-                            "Joint %d velocity %.3f exceeds limit %.3f — stopping.", i, theta_d[i], theta_d_limit_);
-                state_ = STATE_STOP;
-                publishStop();
-                return;
+                if (std::abs(theta_d[i]) > theta_d_limit_)
+                {
+                    RCLCPP_ERROR(this->get_logger(),
+                                 "Joint %ld velocity %.3f exceeds limit %.3f — STOPPING.",
+                                 static_cast<long>(i), theta_d[i], theta_d_limit_);
+                    latest_cart_vel_.setZero();
+                    state_ = STATE_STOPPED;
+                    return;
+                }
             }
         }
 
-        // Compute next integrated positions (same as ROS1 node)
-        std::vector<double> current_positions = tracked_positions_;
-        for (size_t i = 0; i < tracked_positions_.size(); ++i)
-            tracked_positions_[i] += theta_d[i] * dt_;
+        // Integrate command positions.
+        for (size_t i = 0; i < joint_names_.size(); ++i)
+            tracked_positions_[i] += theta_d[static_cast<Eigen::Index>(i)] * dt_;
+
+        // Latency safety: clamp lead against actual position.
+        for (size_t i = 0; i < joint_names_.size(); ++i)
+        {
+            double actual = q[static_cast<Eigen::Index>(i)];
+            double lead = tracked_positions_[i] - actual;
+            if (std::abs(lead) > MAX_LEAD_RAD)
+            {
+                tracked_positions_[i] = actual + std::copysign(MAX_LEAD_RAD, lead);
+                // Recompute velocity to reflect clamped position.
+                theta_d[static_cast<Eigen::Index>(i)] =
+                    (tracked_positions_[i] - (actual - std::copysign(MAX_LEAD_RAD, lead))) / dt_;
+            }
+        }
+
+        // Advance stream time (strictly monotonic).
+        stream_time_ += dt_;
 
         std::vector<double> velocities(theta_d.data(), theta_d.data() + theta_d.size());
-        // Publish: pt0=current+vel, pt1=next+zero_vel (satisfies JointTrajectoryController constraint)
-        publishTrajectory(current_positions, velocities, tracked_positions_);
+        publishStreamPoint(tracked_positions_, velocities, stream_time_);
     }
 
+    // -----------------------------------------------------------------------
+    // Members
+    // -----------------------------------------------------------------------
     std::string urdf_xml_, srdf_xml_, manipulator_group_, base_link_, ee_link_;
     std::vector<std::string> joint_names_;
-    double rate_hz_, cmd_vel_timeout_, theta_d_limit_, w0_, k0_, dt_;
-    State state_;
+    double rate_hz_{25.0};
+    double theta_d_limit_{3.14};
+    double w0_{0.1};
+    double k0_{0.001};
+    double dt_{0.04};
+
+    State state_{STATE_WAIT_JOINT};
     Eigen::Matrix<double, 6, 1> latest_cart_vel_;
-    rclcpp::Time last_cmd_time_;
-    rclcpp::Time t_start_;
+
+    rclcpp::Time arm_entry_time_{0, 0, RCL_ROS_TIME};
+    bool arm_trigger_sent_{false};
+    double stream_time_{0.0};
+
     tesseract_environment::Environment::Ptr env_;
     tesseract_kinematics::KinematicGroup::ConstPtr manip_;
 
-    std::vector<double> tracked_positions_; // integrated joint positions
+    std::vector<double> tracked_positions_;
+    sensor_msgs::msg::JointState::SharedPtr last_joint_state_;
 
-    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_traj_;
+    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_arm_;
+    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_stream_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_cmd_vel_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_joint_state_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_start_, srv_stop_;
     rclcpp::TimerBase::SharedPtr timer_;
-    sensor_msgs::msg::JointState::SharedPtr last_joint_state_;
-
-    // Added ENABLE_SEED flag and seed() function for optional seeding
-    bool ENABLE_SEED = false;
-
-    void seed()
-    {
-        if (!last_joint_state_)
-            return;
-
-        trajectory_msgs::msg::JointTrajectory traj;
-        traj.header.stamp = this->now();
-        traj.joint_names = joint_names_;
-
-        trajectory_msgs::msg::JointTrajectoryPoint pt;
-        pt.positions = tracked_positions_; // Use current joint state
-        pt.velocities.resize(joint_names_.size(), 0.0);
-        pt.time_from_start = rclcpp::Duration::from_seconds(0.0);
-
-        traj.points.push_back(pt);
-        pub_traj_->publish(traj);
-    }
 };
 
 int main(int argc, char **argv)
