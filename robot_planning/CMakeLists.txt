@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.8)
 project(robot_planning)
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_target_dependencies REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -13,6 +14,7 @@ find_package(std_srvs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_eigen REQUIRED)
+find_package(console_bridge REQUIRED)
 
 find_package(trajopt_sqp REQUIRED)
 find_package(trajopt_ifopt REQUIRED)
@@ -27,14 +29,15 @@ find_package(tesseract_monitoring REQUIRED)
 find_package(tesseract_scene_graph REQUIRED)
 find_package(tesseract_collision REQUIRED COMPONENTS core)
 find_package(tesseract_urdf REQUIRED)
+find_package(tesseract_kinematics REQUIRED)
 
-find_package(Taskflow REQUIRED HINTS /home/vinbui/vinh_ws/install/Taskflow/lib/cmake/Taskflow)
+find_package(Taskflow REQUIRED)
 
 find_package(
   tesseract_motion_planners REQUIRED
-  COMPONENTS core simple
-  OPTIONAL_COMPONENTS
-    descartes
+  COMPONENTS
+    core
+    simple
     ompl
     trajopt
     trajopt_ifopt)
@@ -88,7 +91,6 @@ target_link_libraries(
   ${PROJECT_NAME}
   tesseract::tesseract_environment
   tesseract::tesseract_motion_planners_core
-  tesseract::tesseract_motion_planners_ompl
   tesseract::tesseract_motion_planners_trajopt
   tesseract::tesseract_motion_planners_trajopt_ifopt
   trajopt::trajopt_sqp
@@ -103,6 +105,7 @@ target_link_libraries(
   console_bridge::console_bridge)
 
 target_compile_options(${PROJECT_NAME} PUBLIC ${TESSERACT_COMPILE_OPTIONS})
+target_link_libraries(${PROJECT_NAME} tesseract::tesseract_motion_planners_ompl)
 target_include_directories(${PROJECT_NAME} PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
                                                   "$<INSTALL_INTERFACE:include>")
 
@@ -178,6 +181,15 @@ ament_target_dependencies(motomini_feedback_stream
   tesseract_environment
   tesseract_kinematics
   tesseract_rosutils
+)
+
+add_executable(motomini_traj_streamer src/motomini_traj_streamer.cpp)
+ament_target_dependencies(motomini_traj_streamer
+  rclcpp
+  geometry_msgs
+  sensor_msgs
+  trajectory_msgs
+  std_srvs
 )
 
 add_executable(kb_jogging_node src/kb_jogging_node.cpp)
@@ -261,6 +273,7 @@ install(TARGETS
   motomini_planning_node
   motomini_vel_tracking
   motomini_feedback_stream
+  motomini_traj_streamer
   kb_jogging_node
   smooth_jogging_node
   gantry_planning_node

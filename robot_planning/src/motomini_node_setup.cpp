@@ -218,6 +218,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     // ---- Publishers ----
     pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
     pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
+    pub_tracking_stream_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_command", 10);
     pub_tracked_pose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
         "/motomini/tracked_tip_pose", 10);
     pub_online_cmd_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
@@ -298,6 +299,10 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / hz));
         tracking_timer_ = this->create_wall_timer(
             period, std::bind(&MotoMiniPlanningNode::trackingTick, this));
+            
+        tracking_stream_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(20), std::bind(&MotoMiniPlanningNode::trackingStreamTick, this));
+            
         startTfPolling();
         startJointStatePolling();
         RCLCPP_INFO(this->get_logger(),

@@ -6,6 +6,7 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -99,11 +100,19 @@ ament_target_dependencies(command_node
   tf2_geometry_msgs
 )
 
+add_executable(vel_to_controller src/vel_to_controller.cpp)
+ament_target_dependencies(vel_to_controller
+  rclcpp
+  trajectory_msgs
+  std_msgs
+)
+
 set(MOTOMINI_TARGETS
   object_controller
   object_tf_broadcaster
   env_tf_broadcaster
   command_node
+  vel_to_controller
 )
 
 if(TARGET object_pose)

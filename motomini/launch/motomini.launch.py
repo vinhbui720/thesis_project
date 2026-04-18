@@ -191,7 +191,13 @@ def generate_launch_description():
             package="motomini",
             executable="manual_controller.py",
             output="screen",
-            condition=IfCondition(debug)
+            # Evaluates to True only if debug is 'true' AND vel_streaming is 'false'
+            condition=IfCondition(
+                PythonExpression([
+                    "'", LaunchConfiguration('debug'), "' == 'true' and '", 
+                    LaunchConfiguration('vel_streaming'), "' == 'false'"
+                ])
+            )
         ),
         Node(
             package="motomini",
@@ -227,8 +233,9 @@ def generate_launch_description():
         ),
 
         # -------------------------------
-        # Spawn all controllers in one call to avoid lock contention.
-        # --controller-manager-timeout gives the CM time to start up.
+        # Spawn controllers based on mode
+        # Position mode: motomini_controller (JointTrajectoryController)
+        # Velocity mode: motomini_vel_controller (JointGroupVelocityController)
         # -------------------------------
         Node(
             package="controller_manager",
@@ -250,7 +257,7 @@ def generate_launch_description():
             executable="spawner",
             arguments=[
                 "joint_state_broadcaster",
-                "motomini_controller",
+                "motomini_vel_controller",
                 "gantry_controller",
                 "--controller-manager-timeout", "30",
             ],
@@ -261,7 +268,7 @@ def generate_launch_description():
         ),
 
         # -------------------------------
-        # 🔥 CRITICAL: Relay node (planner → controller)
+        # Relay/converter nodes for trajectory → controller
         # -------------------------------
         Node(
             package="topic_tools",
@@ -272,9 +279,20 @@ def generate_launch_description():
                 "/motomini_controller/joint_trajectory"
             ],
             output="screen",
-            condition=UnlessCondition(real_robot)
+            condition=IfCondition(PythonExpression([
+                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'false'"
+            ])),
         ),
-
+        # Velocity mode: extract velocities from trajectory and send to velocity controller
+        Node(
+            package="motomini",
+            executable="vel_to_controller",
+            name="vel_to_controller",
+            output="screen",
+            condition=IfCondition(PythonExpression([
+                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'true'"
+            ])),
+        ),
         Node(
             package="topic_tools",
             executable="relay",

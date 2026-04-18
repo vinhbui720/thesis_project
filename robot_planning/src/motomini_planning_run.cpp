@@ -143,7 +143,8 @@ namespace Vinhtesseract_examples
         profiles->addProfile("SimplePlannerTask", "DEFAULT",
                              std::make_shared<SimplePlannerLVSMoveProfile>());
 
-        if (use_ompl_)
+        const bool ompl_enabled = use_ompl_;
+        if (ompl_enabled)
         {
             profiles->addProfile("SimplePlannerTask", "DEFAULT",
                                  std::make_shared<SimplePlannerCompositeProfile>());
@@ -273,8 +274,8 @@ namespace Vinhtesseract_examples
         //    - The caller (startCallback) publishes full_traj once after run()
         //      returns so the controller receives one complete trajectory.
         // ================================================================
-        const std::string task_name = use_ompl_ ? "FreespacePipeline"
-                                                : (ifopt_ ? "TrajOptIfoptPipeline" : "TrajOptPipeline");
+        const std::string task_name = ompl_enabled ? "FreespacePipeline"
+                                                   : (ifopt_ ? "TrajOptIfoptPipeline" : "TrajOptPipeline");
 
         const size_t n_poses = target_poses_.size();
         const size_t C = static_cast<size_t>(chunk_size_);

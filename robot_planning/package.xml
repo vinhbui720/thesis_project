@@ -8,6 +8,7 @@
   <license>TODO: License declaration</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_target_dependencies</buildtool_depend>
 
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
@@ -33,6 +34,8 @@
   <depend>tesseract_scene_graph</depend>
   <depend>tesseract_urdf</depend>
   <depend>tesseract_monitoring</depend>
+  <depend>tesseract_kinematics</depend>
+  <depend>tesseract_time_parameterization</depend>
 
   <depend>trajopt_sqp</depend>
   <depend>trajopt_ifopt</depend>

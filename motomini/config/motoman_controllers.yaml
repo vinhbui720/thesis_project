@@ -12,7 +12,7 @@ controller_manager:
 
     # --- Motomini velocity controller (streaming mode only) ---
     motomini_vel_controller:
-      type: velocity_controllers/JointGroupVelocityController
+      type: position_controllers/JointGroupPositionController
 
     # --- Gantry controller ---
     gantry_controller:
@@ -39,7 +39,8 @@ motomini_controller:
 
 
 # ================================
-# Motomini Velocity Controller
+# Motomini Velocity Controller  
+# (Uses position commands for mock hardware compatibility)
 # ================================
 motomini_vel_controller:
   ros__parameters:
@@ -50,6 +51,11 @@ motomini_vel_controller:
       - joint_4_r
       - joint_5_b
       - joint_6_t
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
 
 
 # ================================

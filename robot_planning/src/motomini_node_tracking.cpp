@@ -288,8 +288,10 @@ void MotoMiniPlanningNode::trackingTick()
         return;
     }
 
-    // === PUBLISH THE TRAJECTORY ===
-    publishTrackingTrajectory(*traj_ptr, last_joint_state_->name);
+    // === START STREAMING ===
+    cached_tracking_traj_ = traj_ptr;
+    tracking_traj_start_time_ = this->now();
+    tracking_stream_time_ = 0.0;
     last_tracking_publish_time_ = this->now();
     last_published_target_ = target;
 
@@ -305,4 +307,91 @@ void MotoMiniPlanningNode::trackingTick()
     RCLCPP_INFO(this->get_logger(),
                 "Tracking: trajectory published (%.3f s horizon)",
                 traj_ptr->empty() ? 0.0 : traj_ptr->back().time);
+}
+
+// ---------------------------------------------------------------------------
+// trackingStreamTick — 50Hz continuous interpolation and streaming
+// ---------------------------------------------------------------------------
+void MotoMiniPlanningNode::trackingStreamTick()
+{
+    // Do not stream if not in tracking mode or if no cached trajectory exists
+    if (!tracking_enabled_ || !cached_tracking_traj_ || cached_tracking_traj_->empty() || !last_joint_state_)
+        return;
+
+    const std::vector<std::string> joint_names = {
+        "joint_1_s", "joint_2_l", "joint_3_u",
+        "joint_4_r", "joint_5_b", "joint_6_t"};
+
+    tracking_stream_time_ += 0.02; // 50 Hz = 0.02s
+
+    double elapsed = (this->now() - tracking_traj_start_time_).seconds();
+    
+    // Fall back to tracking_stream_time_ if elapsed is weird/negative
+    if (elapsed < 0) elapsed = tracking_stream_time_;
+
+    std::vector<double> target_pos;
+    std::vector<double> target_vel(joint_names.size(), 0.0);
+    std::vector<double> target_acc(joint_names.size(), 0.0);
+
+    const size_t n = cached_tracking_traj_->size();
+    const double t_end = cached_tracking_traj_->back().time;
+
+    if (elapsed >= t_end)
+    {
+        // Trajectory done: hold last point with 0 velocity
+        target_pos = std::vector<double>(
+            cached_tracking_traj_->back().position.data(),
+            cached_tracking_traj_->back().position.data() + cached_tracking_traj_->back().position.size()
+        );
+    }
+    else
+    {
+        // Interpolate
+        for (size_t i = 0; i < n - 1; ++i)
+        {
+            double t0 = cached_tracking_traj_->at(i).time;
+            double t1 = cached_tracking_traj_->at(i + 1).time;
+
+            if (elapsed >= t0 && elapsed <= t1)
+            {
+                double alpha = (elapsed - t0) / std::max(1e-6, t1 - t0);
+                const auto& p0 = cached_tracking_traj_->at(i);
+                const auto& p1 = cached_tracking_traj_->at(i + 1);
+
+                target_pos.resize(p0.position.size());
+                for (Eigen::Index j = 0; j < p0.position.size(); ++j)
+                {
+                    target_pos[j] = p0.position[j] + alpha * (p1.position[j] - p0.position[j]);
+                    
+                    if (p0.velocity.size() > 0 && p1.velocity.size() > 0)
+                        target_vel[j] = p0.velocity[j] + alpha * (p1.velocity[j] - p0.velocity[j]);
+                    
+                    if (p0.acceleration.size() > 0 && p1.acceleration.size() > 0)
+                        target_acc[j] = p0.acceleration[j] + alpha * (p1.acceleration[j] - p0.acceleration[j]);
+                }
+                break;
+            }
+        }
+    }
+
+    // Safety check against NaN or empty sizes
+    if (target_pos.empty() || target_pos.size() != joint_names.size())
+        return;
+
+    // Publish strict exactly 1 point to /joint_command
+    trajectory_msgs::msg::JointTrajectory ros_msg;
+    ros_msg.header.stamp = this->now();
+    ros_msg.header.frame_id = "world";
+    ros_msg.joint_names = joint_names;
+
+    trajectory_msgs::msg::JointTrajectoryPoint pt;
+    pt.positions = target_pos;
+    pt.velocities = target_vel;
+    pt.accelerations = target_acc;
+    pt.time_from_start = rclcpp::Duration::from_seconds(tracking_stream_time_);
+
+    ros_msg.points.push_back(pt);
+
+    if (pub_tracking_stream_)
+        pub_tracking_stream_->publish(ros_msg);
 }

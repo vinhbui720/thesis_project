@@ -2,20 +2,20 @@ import rclpy
 import threading
 from rclpy.executors import MultiThreadedExecutor
 
-from thesis_project.realsense_cam.core.pipeline import Pipeline
-from thesis_project.realsense_cam.config import CONFIG
+from core.pipeline import Pipeline
+from config import CONFIG
 
-from thesis_project.realsense_cam.nodes.source_bag import SourceBag
-from thesis_project.realsense_cam.nodes.preprocess import Preprocess
-from thesis_project.realsense_cam.nodes.background import Background
-from thesis_project.realsense_cam.nodes.depth import Depth
-from thesis_project.realsense_cam.nodes.fusion import Fusion
-from thesis_project.realsense_cam.nodes.detect import Detect
-from thesis_project.realsense_cam.nodes.visualize import Visualize
-from thesis_project.realsense_cam.nodes.tracker_kalman import TrackerKalman
-from thesis_project.realsense_cam.nodes.pose_init_icp import PoseInitICPAsync
-from thesis_project.realsense_cam.nodes.pose_fusion import PoseFusion
-from thesis_project.realsense_cam.nodes.ros2_publisher import ROS2Publisher
+from nodes.source_bag import SourceBag
+from nodes.preprocess import Preprocess
+from nodes.background import Background
+from nodes.depth import Depth
+from nodes.fusion import Fusion
+from nodes.detect import Detect
+from nodes.visualize import Visualize
+from nodes.tracker_kalman import TrackerKalman
+from nodes.pose_init_icp import PoseInitICPAsync
+from nodes.pose_fusion import PoseFusion
+from nodes.ros2_publisher import ROS2Publisher
 
 rclpy.init()
 
@@ -29,10 +29,9 @@ intr = (src.fx, src.fy, src.cx, src.cy, src.width, src.height)
 icp_node = PoseInitICPAsync(CONFIG, "data/test1_cam_view.pcd", (src.fx, src.fy, src.cx, src.cy))
 ros2_pub  = ROS2Publisher(CONFIG, icp_node)
 
-# Spin the ROS 2 nodes (source_bag + ros2_publisher) in a background thread
+# Spin the ROS 2 node (ros2_publisher) in a background thread
 # so the service handler can block without stalling the pipeline.
 executor = MultiThreadedExecutor()
-executor.add_node(src)
 executor.add_node(ros2_pub)
 spin_thread = threading.Thread(target=executor.spin, daemon=True)
 spin_thread.start()

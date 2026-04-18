@@ -18,9 +18,9 @@ CONFIG = {
     # region GPU
     # =========================
     "gpu": {
-        "enable": True,
-        "opencv_cuda": True,
-        "open3d_cuda": True,
+        "enable": False,
+        "opencv_cuda": False,
+        "open3d_cuda": False,
     },
     # endregion
 
@@ -157,8 +157,9 @@ CONFIG = {
     # region ROS2 PUBLISHER
     # =========================
     "ros2_publisher": {
-        "frame_id": "camera_link",   # TF frame for all published messages
-
+        "frame_id": "world_depth_camera_link",   # Parent TF frame for published messages
+        "tracking_frame_id": "tracking_task",     # Child TF frame representing tracked object
+        
         # Minimum ICP fitness to consider a retrigger successful.
         # Mirrors init_pose.icp_min_fitness — override here if you want
         # a different threshold for the service vs. the initial run.

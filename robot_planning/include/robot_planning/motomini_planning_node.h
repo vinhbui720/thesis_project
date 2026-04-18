@@ -87,6 +87,7 @@ private:
     // ---- Publishers ----
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_trajectory_;
+    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_tracking_stream_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pub_online_cmd_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_ee_path_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_tracked_pose_;
@@ -94,6 +95,7 @@ private:
     // ---- Timers ----
     rclcpp::TimerBase::SharedPtr monitor_timer_;
     rclcpp::TimerBase::SharedPtr tracking_timer_;
+    rclcpp::TimerBase::SharedPtr tracking_stream_timer_;
     rclcpp::TimerBase::SharedPtr wp_tf_timer_;
 
     // ---- Execution Monitoring ----
@@ -145,6 +147,12 @@ private:
     std::vector<double> last_trajectory_end_state_; // Joint positions at end of last published trajectory
     double trajectory_completion_tolerance_{0.15};  // Increased from 0.1 to 0.15 rad (~8.6 deg) for relaxed completion detection
     bool last_trajectory_completed_{true};          // Flag to check if trajectory has been reached
+
+    // Continuous streaming integration
+    std::shared_ptr<tesseract_common::JointTrajectory> cached_tracking_traj_;
+    rclcpp::Time tracking_traj_start_time_{0, 0, RCL_ROS_TIME};
+    double tracking_stream_time_{0.0};
+    void trackingStreamTick();
 
     // ---- Private Methods ----
 

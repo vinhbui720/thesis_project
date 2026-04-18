@@ -1,4 +1,4 @@
-numpy>=1.23
-opencv-python>=4.8
-open3d==0.18.0
+numpy>=1.23,<1.28
+opencv-python>=4.8,<4.10
+open3d>=0.18.0
 pyrealsense2>=2.54

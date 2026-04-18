@@ -4,9 +4,10 @@ import threading
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import PoseStamped, TwistStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped, TransformStamped
 from std_msgs.msg import String, Bool
 from std_srvs.srv import Trigger
+from tf2_ros import TransformBroadcaster
 
 
 class ROS2Publisher(Node):
@@ -31,13 +32,17 @@ class ROS2Publisher(Node):
         super().__init__('object_tracker')
         self.cfg = cfg
         self.icp_node = icp_node          # reference to PoseInitICPAsync
-        self.frame_id = cfg.get("ros2_publisher", {}).get("frame_id", "camera_link")
+        self.frame_id = cfg.get("ros2_publisher", {}).get("frame_id", "world_depth_camera_link")
+        self.tracking_frame_id = cfg.get("ros2_publisher", {}).get("tracking_frame_id", "tracking_task")
 
         # ── Publishers ────────────────────────────────────────────────────
         self._pub_pose     = self.create_publisher(PoseStamped,    '/object/pose',            10)
         self._pub_vel      = self.create_publisher(TwistStamped,   '/object/velocity',        10)
         self._pub_status   = self.create_publisher(String,          '/object/tracking_status', 10)
         self._pub_active   = self.create_publisher(Bool,            '/object/tracking_active', 10)
+        
+        # ── TF2 Broadcaster ───────────────────────────────────────────────
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         # ── Service ───────────────────────────────────────────────────────
         self._srv_icp = self.create_service(
@@ -157,6 +162,9 @@ class ROS2Publisher(Node):
         ps.pose.orientation.z = float(quat[2])
         ps.pose.orientation.w = float(quat[3])
         self._pub_pose.publish(ps)
+        
+        # ── Publish TF Transform ──────────────────────────────────────────
+        self._publish_transform(stamp, t, quat)
 
         # ── Publish TwistStamped (linear velocity only) ───────────────────
         velocity = data.get("velocity", None)
@@ -183,6 +191,24 @@ class ROS2Publisher(Node):
     # ======================================================================
     # HELPERS
     # ======================================================================
+    def _publish_transform(self, stamp, translation, quaternion):
+        """Publish TF transform from frame_id to tracking_frame_id."""
+        t = TransformStamped()
+        t.header.stamp = stamp
+        t.header.frame_id = self.frame_id
+        t.child_frame_id = self.tracking_frame_id
+        
+        t.transform.translation.x = float(translation[0])
+        t.transform.translation.y = float(translation[1])
+        t.transform.translation.z = float(translation[2])
+        
+        t.transform.rotation.x = float(quaternion[0])
+        t.transform.rotation.y = float(quaternion[1])
+        t.transform.rotation.z = float(quaternion[2])
+        t.transform.rotation.w = float(quaternion[3])
+        
+        self._tf_broadcaster.sendTransform(t)
+    
     def _publish_status(self, stamp, data):
         icp_state = ("READY"   if data.get("icp_ready",   False) else
                      "RUNNING" if data.get("icp_running", False) else "IDLE")
