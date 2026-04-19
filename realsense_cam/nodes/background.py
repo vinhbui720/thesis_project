@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 class Background:
-    def __init__(self, config, width, height):
+    def __init__(self, config, width, height, initial_bg=None):
         self.cfg = config
         u1, v1, u2, v2 = self.cfg["roi"]
         self.roi = (
@@ -22,8 +22,15 @@ class Background:
             and cv2.cuda.getCudaEnabledDeviceCount() > 0
         )
 
-        bg = cv2.imread(config["bg"]["path"])
-        bg = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+        if initial_bg is not None:
+            bg = initial_bg
+            if len(bg.shape) == 3:
+                bg = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+        else:
+            bg = cv2.imread(config["bg"]["path"])
+            if bg is None:
+                raise FileNotFoundError(f"Could not load background image from {config['bg']['path']}")
+            bg = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
 
         if bg.shape != (height, width):
             bg = cv2.resize(bg, (width, height))

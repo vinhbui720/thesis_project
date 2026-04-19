@@ -18,9 +18,9 @@ CONFIG = {
     # region GPU
     # =========================
     "gpu": {
-        "enable": False,
-        "opencv_cuda": False,
-        "open3d_cuda": False,
+        "enable": True,
+        "opencv_cuda": True,
+        "open3d_cuda": True,
     },
     # endregion
 

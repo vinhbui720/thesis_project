@@ -1,11 +1,12 @@
 import rclpy
 import threading
+import argparse
 from rclpy.executors import MultiThreadedExecutor
 
 from core.pipeline import Pipeline
 from config import CONFIG
 
-from nodes.source_bag import SourceBag
+# Source nodes will be imported conditionally
 from nodes.preprocess import Preprocess
 from nodes.background import Background
 from nodes.depth import Depth
@@ -19,10 +20,33 @@ from nodes.ros2_publisher import ROS2Publisher
 
 rclpy.init()
 
-src_mode = CONFIG.get("source", {}).get("mode", "bag")
-bag_path = CONFIG.get("source", {}).get("bag_path", "data/20260408_203426.bag")
+# --- Argument Parsing ---
+parser = argparse.ArgumentParser()
+parser.add_argument("--realcam", action="store_true", help="Enable real camera (live stream)")
+parser.add_argument("--bag", type=str, help="Path to the bag file (overrides config)")
+args = parser.parse_args()
 
-src = SourceBag(path=bag_path, mode=src_mode)
+# --- Source Selection ---
+initial_bg = None
+if args.realcam:
+    print("[INFO] Initializing Real Camera source...")
+    from nodes.source_realcam import SourceRealCam
+    src = SourceRealCam()
+    
+    # Capture first frame as background after warmup
+    print("[INFO] Capturing initial background frame...")
+    bg_data = src.process({})
+    if bg_data and "color" in bg_data:
+        initial_bg = bg_data["color"]
+        print("[INFO] background is ready for user when the image is ready")
+    else:
+        print("[WARNING] Failed to capture initial background frame!")
+else:
+    src_mode = CONFIG.get("source", {}).get("mode", "bag")
+    bag_path = args.bag if args.bag else CONFIG.get("source", {}).get("bag_path", "data/20260408_203426.bag")
+    print(f"[INFO] Initializing Bag source: {bag_path}")
+    from nodes.source_bag import SourceBag
+    src = SourceBag(path=bag_path, mode=src_mode)
 
 intr = (src.fx, src.fy, src.cx, src.cy, src.width, src.height)
 
@@ -39,7 +63,7 @@ spin_thread.start()
 pipeline = Pipeline([
     src,
     Preprocess(CONFIG),
-    Background(CONFIG, src.width, src.height),
+    Background(CONFIG, src.width, src.height, initial_bg=initial_bg),
     Depth(CONFIG, intr),
     Fusion(),
     Detect(CONFIG),

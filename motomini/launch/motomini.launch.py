@@ -75,7 +75,7 @@ def generate_launch_description():
                 "planning_chunk_size": planning_chunk_size,
                 "planning_parallel_chunks": planning_parallel_chunks,
             }],
-            condition=UnlessCondition(vel_streaming),
+            condition=IfCondition(vel_streaming),
             output="screen"
         ),
 
@@ -89,11 +89,17 @@ def generate_launch_description():
                 "manipulator_group": "manipulator",
                 "base_link": "world",
                 "ee_link": concrete_ee_link,
+                "vel_streaming": vel_streaming,
             }],
             condition=IfCondition(vel_streaming),
             output="screen"
         ),
-
+        Node(
+            package="robot_planning",
+            executable="motomini_traj_streamer",
+            condition=IfCondition(vel_streaming),
+            output="screen"
+        ),
         Node(
             package="motomini",
             executable="jogging_gui.py",
@@ -195,7 +201,7 @@ def generate_launch_description():
             condition=IfCondition(
                 PythonExpression([
                     "'", LaunchConfiguration('debug'), "' == 'true' and '", 
-                    LaunchConfiguration('vel_streaming'), "' == 'false'"
+                    LaunchConfiguration('vel_streaming'), "' == 'true'"
                 ])
             )
         ),
@@ -242,7 +248,6 @@ def generate_launch_description():
             executable="spawner",
             arguments=[
                 "joint_state_broadcaster",
-                "motomini_controller",
                 "gantry_controller",
                 "--controller-manager-timeout", "30",
             ],
@@ -254,11 +259,32 @@ def generate_launch_description():
             package="controller_manager",
             executable="spawner",
             arguments=[
-                "motomini_vel_controller",
+                "motomini_controller",
                 "--inactive",
                 "--controller-manager-timeout", "30",
             ],
-            condition=UnlessCondition(real_robot),
+            condition=IfCondition(
+                PythonExpression([
+                    "'", LaunchConfiguration('real_robot'), "' == 'false' and '", 
+                    LaunchConfiguration('vel_streaming'), "' == 'false'"
+                ])
+            ),
+            output="screen"
+        ),
+
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=[
+                "motomini_vel_controller",
+                "--controller-manager-timeout", "30",
+            ],
+            condition=IfCondition(
+                PythonExpression([
+                    "'", LaunchConfiguration('real_robot'), "' == 'false' and '", 
+                    LaunchConfiguration('vel_streaming'), "' == 'true'"
+                ])
+            ),
             output="screen"
         ),
 
@@ -362,5 +388,5 @@ def generate_launch_description():
         DeclareLaunchArgument("planning_parallel_chunks", default_value="2"),
         *nodes,
         *control_nodes,
-        *mesh_nodes
+        # *mesh_nodes
     ])

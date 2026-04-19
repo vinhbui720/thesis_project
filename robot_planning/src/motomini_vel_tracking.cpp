@@ -41,6 +41,7 @@ public:
         this->declare_parameter<double>("theta_d_lim", 3.14);
         this->declare_parameter<double>("w0", 0.1);
         this->declare_parameter<double>("k0", 0.001);
+        this->declare_parameter<bool>("vel_streaming", false);
 
         this->get_parameter("robot_description", urdf_xml_);
         this->get_parameter("robot_description_semantic", srdf_xml_);
@@ -52,6 +53,10 @@ public:
         w0_ = this->get_parameter("w0").as_double();
         k0_ = this->get_parameter("k0").as_double();
         dt_ = 1.0 / std::max(1.0, rate_hz_);
+
+        bool vel_streaming = this->get_parameter("vel_streaming").as_bool();
+
+        std::string joint_state_topic = vel_streaming ? "/joint_states" : "/motomini_joint_states";
 
         if (!initializeKinematics())
             throw std::runtime_error("Failed to initialize Tesseract kinematics");
@@ -68,9 +73,8 @@ public:
             "/pose_following/cmd_vel", 10,
             std::bind(&MotoMiniVelTrackingNode::cmdVelCallback, this, std::placeholders::_1));
 
-        // Subscribe to the MotoPlus joint state topic.
         sub_joint_state_ = this->create_subscription<sensor_msgs::msg::JointState>(
-            "/joint_states", 20,
+            joint_state_topic, 20,
             std::bind(&MotoMiniVelTrackingNode::jointStateCallback, this, std::placeholders::_1));
 
         srv_start_ = this->create_service<std_srvs::srv::Trigger>(
