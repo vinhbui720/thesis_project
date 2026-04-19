@@ -246,9 +246,7 @@ def generate_launch_description():
                 "gantry_controller",
                 "--controller-manager-timeout", "30",
             ],
-            condition=IfCondition(PythonExpression([
-                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'false'"
-            ])),
+            condition=UnlessCondition(real_robot),
             output="screen"
         ),
 
@@ -256,14 +254,11 @@ def generate_launch_description():
             package="controller_manager",
             executable="spawner",
             arguments=[
-                "joint_state_broadcaster",
                 "motomini_vel_controller",
-                "gantry_controller",
+                "--inactive",
                 "--controller-manager-timeout", "30",
             ],
-            condition=IfCondition(PythonExpression([
-                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'true'"
-            ])),
+            condition=UnlessCondition(real_robot),
             output="screen"
         ),
 
@@ -279,9 +274,7 @@ def generate_launch_description():
                 "/motomini_controller/joint_trajectory"
             ],
             output="screen",
-            condition=IfCondition(PythonExpression([
-                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'false'"
-            ])),
+            condition=UnlessCondition(real_robot),
         ),
         # Velocity mode: extract velocities from trajectory and send to velocity controller
         Node(
@@ -289,9 +282,7 @@ def generate_launch_description():
             executable="vel_to_controller",
             name="vel_to_controller",
             output="screen",
-            condition=IfCondition(PythonExpression([
-                "'", real_robot, "' == 'false' and '", vel_streaming, "' == 'true'"
-            ])),
+            condition=UnlessCondition(real_robot),
         ),
         Node(
             package="topic_tools",
