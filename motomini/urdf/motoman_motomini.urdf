@@ -7,7 +7,7 @@
       <!--visual_world_/Body.-->
       <origin rpy="0 0 0" xyz="0.0 0.0 0.0" />
       <geometry>
-        <mesh filename="package://motomini/meshes/workcell.stl" scale="0.001 0.001 0.001" />
+        <mesh filename="package://motomini/meshes/motomini_workcell-Body.stl" scale="0.001 0.001 0.001" />
       </geometry>
     </visual>
     <!-- <collision>

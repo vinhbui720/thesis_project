@@ -27,7 +27,7 @@ CONFIG = {
     # =========================
     # region ROI (pixel space)
     # =========================
-    "roi": (0, 0, 640, 300),
+    "roi": (0, 0, 1000, 300),
     # endregion
 
 
@@ -35,7 +35,7 @@ CONFIG = {
     # region DEPTH FILTER
     # =========================
     "depth": {
-        "z_low": 0.02,        # bỏ điểm quá gần
+        "z_low": 0.2,        # bỏ điểm quá gần
         "height": 0.04,      # object = z_min + height
         "median_ksize": 5,
     },
@@ -114,7 +114,7 @@ CONFIG = {
     # region OBJECT (FINAL FILTER)
     # =========================
     "object": {
-        "min_area": 300,     # contour sau fusion
+        "min_area": 500,     # contour sau fusion
         "pad_meter": 0.01,   # padding bbox (m → pixel)
     },
     # endregion

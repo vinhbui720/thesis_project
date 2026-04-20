@@ -43,9 +43,8 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
     tesseract_common::JointTrajectory forward(tess_traj);
 
     // === MINIMAL PROCESSING ===
-    // Ensure first point is static (no velocity jump)
-    forward.front().velocity.setZero();
-    forward.front().acceleration.setZero();
+    // In tracking mode, we DO NOT force the first point to be static, 
+    // because that would constantly stop the robot when tracking updates arrive continuously.
 
     // Re-base time to start at t=0
     const double t_offset = forward.front().time;

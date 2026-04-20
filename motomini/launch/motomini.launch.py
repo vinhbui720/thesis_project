@@ -24,6 +24,7 @@ def generate_launch_description():
     tracking_rate_hz = LaunchConfiguration("tracking_rate_hz")
     planning_chunk_size = LaunchConfiguration("planning_chunk_size")
     planning_parallel_chunks = LaunchConfiguration("planning_parallel_chunks")
+    jogging = LaunchConfiguration("jogging")
     gantry_mode_tesser = IfCondition(PythonExpression(["'", gantry_mode, "' == 'tesser'"]))
     gantry_mode_loop = IfCondition(PythonExpression(["'", gantry_mode, "' == 'loop'"]))
     gantry_mode_gui = IfCondition(PythonExpression(["'", gantry_mode, "' == 'gui'"]))
@@ -91,26 +92,33 @@ def generate_launch_description():
                 "ee_link": concrete_ee_link,
                 "vel_streaming": vel_streaming,
             }],
-            condition=IfCondition(vel_streaming),
+            condition=IfCondition(PythonExpression([
+                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+            ])),
             output="screen"
         ),
         Node(
             package="robot_planning",
             executable="motomini_traj_streamer",
-            condition=IfCondition(vel_streaming),
+            condition=IfCondition(PythonExpression([
+                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'false'"
+            ])),
             output="screen"
         ),
         Node(
             package="motomini",
             executable="jogging_gui.py",
-            condition=IfCondition(vel_streaming),
+            condition=IfCondition(PythonExpression([
+                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+            ])),
             output="screen"
         ),
-
         Node(
             package="robot_planning",
             executable="smooth_jogging_node",
-            condition=IfCondition(vel_streaming),
+            condition=IfCondition(PythonExpression([
+                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+            ])),
             output="screen"
         ),
 
@@ -383,6 +391,7 @@ def generate_launch_description():
         DeclareLaunchArgument("online_mode", default_value="false"),
         DeclareLaunchArgument("use_ompl", default_value="true"),
         DeclareLaunchArgument("vel_streaming", default_value="false"),
+        DeclareLaunchArgument("jogging", default_value="false"),
         DeclareLaunchArgument("tracking_rate_hz", default_value="3.0"),
         DeclareLaunchArgument("planning_chunk_size", default_value="5"),
         DeclareLaunchArgument("planning_parallel_chunks", default_value="2"),

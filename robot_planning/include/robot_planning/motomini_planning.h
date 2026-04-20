@@ -185,6 +185,8 @@ namespace Vinhtesseract_examples
         ToolpathCallback toolpath_cb_;
         ChunkReadyCallback chunk_ready_cb_;
         Eigen::VectorXd last_tracking_command_;
+        Eigen::VectorXd last_tracking_velocity_;
+        Eigen::VectorXd last_tracking_acceleration_;
         bool has_last_tracking_command_{false};
         // --- Runtime-tunable planning config (loaded from YAML) ---
         PlanningConfig planning_cfg_;

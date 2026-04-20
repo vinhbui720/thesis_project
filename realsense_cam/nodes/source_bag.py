@@ -10,7 +10,7 @@ class SourceBag:
         if mode == "bag":
             if not path:
                 raise ValueError("Bag mode requires a valid .bag path")
-            config.enable_device_from_file(path, repeat_playback=False)
+            config.enable_device_from_file(path, repeat_playback=True)
 
         config.enable_stream(rs.stream.depth)
         config.enable_stream(rs.stream.color)
@@ -32,9 +32,11 @@ class SourceBag:
 
     def process(self, data):
         try:
+            # With repeat_playback=True, this will seamlessly loop to the start.
             frames = self.pipeline.wait_for_frames()
         except RuntimeError:
-            # Bag playback ends here.
+            # Bag playback ended unexpectedly or timed out.
+            print("[INFO] Bag playback ended or timed out.")
             return None
 
         frames = self.align.process(frames)

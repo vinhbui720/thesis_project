@@ -40,14 +40,27 @@ class Depth:
         depth_scale = depth_frame.get_units()  # usually 0.001
         depth_image = depth_u16.astype(np.float32) * depth_scale
 
-        # Keep invalid pixels at zero and smooth only valid depths.
+        # Temporal smoothing: blend current frame with previous.
+        # Key: do NOT zero out pixels that flicker to invalid — keep their
+        # last known good value so the z_low filter doesn't reject them
+        # for multiple frames after a single-frame dropout.
         valid_now = depth_image > 0
         if self.prev_depth is None:
             depth_smooth = depth_image.copy()
         else:
-            depth_smooth = self.prev_depth.copy()
-            depth_smooth[valid_now] = 0.8 * self.prev_depth[valid_now] + 0.2 * depth_image[valid_now]
-            depth_smooth[~valid_now] = 0.0
+            depth_smooth = self.prev_depth.copy()  # start from previous (keeps last-known-good)
+
+            # Pixels that are valid now AND had a valid previous value → EMA blend
+            prev_valid = self.prev_depth > 0
+            blend = valid_now & prev_valid
+            depth_smooth[blend] = 0.8 * self.prev_depth[blend] + 0.2 * depth_image[blend]
+
+            # Pixels valid now but had NO previous value → use current directly
+            new_valid = valid_now & ~prev_valid
+            depth_smooth[new_valid] = depth_image[new_valid]
+
+            # Pixels invalid now → keep prev value (do nothing, already copied)
+            # This is the critical fix: we do NOT zero them out
 
         self.prev_depth = depth_smooth
 
