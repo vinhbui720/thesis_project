@@ -146,8 +146,15 @@ namespace Vinhtesseract_examples
         void setToolpathCallback(ToolpathCallback cb);
         void setChunkReadyCallback(ChunkReadyCallback cb) { chunk_ready_cb_ = std::move(cb); }
 
-        // Lightweight tracking planner (collision check only, no optimization yet)
-        bool runTrackingPlanner(const Eigen::Isometry3d &target_pose);
+        // Lightweight tracking planner (collision check only, no optimization yet).
+        // hw_velocity: live joint velocities from /joint_states (6-element vector).
+        // If empty or wrong size, falls back to the MPC lookahead cache.
+        bool runTrackingPlanner(const Eigen::Isometry3d &target_pose,
+                                const Eigen::VectorXd &hw_velocity = Eigen::VectorXd{});
+
+        // Set the planner’s own period so lookahead is correctly computed.
+        // Call once after configureTracking(), before the first tick.
+        void setPlannerPeriod(double period_s) { planner_period_s_ = period_s; }
 
         // Configure tracking parameters from ROS node
         void configureTracking(bool use_trajopt, bool enable_collision,
@@ -199,6 +206,7 @@ namespace Vinhtesseract_examples
         int tracking_num_steps_{5};             // interpolation steps
         int tracking_trajopt_max_iter_{5};      // max SQP iterations
         double tracking_max_joint_step_{0.15};  // rad per tick
+        double planner_period_s_{0.033};        // 1/tracking_rate_hz — set via setPlannerPeriod()
 
         // --- Cached objects for fast repeated tracking calls ---
         tesseract_kinematics::KinematicGroup::ConstPtr tracking_manip_;

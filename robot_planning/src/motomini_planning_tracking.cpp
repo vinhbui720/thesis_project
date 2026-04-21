@@ -97,7 +97,8 @@ namespace Vinhtesseract_examples
     // ---------------------------------------------------------------------------
     // runTrackingPlanner — Ruckig-smoothed real-time MPC tracking
     // ---------------------------------------------------------------------------
-    bool MotoMiniPlanning::runTrackingPlanner(const Eigen::Isometry3d &target_pose)
+    bool MotoMiniPlanning::runTrackingPlanner(const Eigen::Isometry3d &target_pose,
+                                              const Eigen::VectorXd &hw_velocity)
     {
         // ========================================================================
         // Step 0 — Guard checks
@@ -124,38 +125,86 @@ namespace Vinhtesseract_examples
         const int n_dof = static_cast<int>(joint_names.size());
         CONSOLE_BRIDGE_logInform("[Tracking][Step 0] n_dof=%d", n_dof);
 
-        Eigen::VectorXd start_pos = env_->getCurrentJointValues(joint_names);
-        CONSOLE_BRIDGE_logInform("[Tracking][Step 0] start_pos.size()=%d", (int)start_pos.size());
+        // ========================================================================
+        // Step 1 — Seed state: plan from COMMITTED command (MPC-correct), not
+        //           from plant state. Plant state lags tracked_pos_ in the streamer
+        //           by the inner-loop delay, so planning from it produces a
+        //           trajectory whose points[0] is BEHIND tracked_pos_ → backward
+        //           jump on every splice.
+        //
+        //           Fall back to actual only on:
+        //             (a) cold start (no commit yet), or
+        //             (b) commit-plant error > threshold (robot fell behind).
+        // ========================================================================
+        static constexpr double MAX_COMMIT_TRACKING_ERROR = 0.15;  // ~8.5° total
 
-        if (static_cast<int>(start_pos.size()) != n_dof)
+        const Eigen::VectorXd actual_pos = env_->getCurrentJointValues(joint_names);
+        CONSOLE_BRIDGE_logInform("[Tracking][Step 1] actual_pos.size()=%d", (int)actual_pos.size());
+        if (static_cast<int>(actual_pos.size()) != n_dof)
         {
-            CONSOLE_BRIDGE_logError("[Tracking][Step 0] start_pos size mismatch: got %d, expected %d",
-                                    (int)start_pos.size(), n_dof);
+            CONSOLE_BRIDGE_logError("[Tracking][Step 1] actual_pos size mismatch: got %d, expected %d",
+                                    (int)actual_pos.size(), n_dof);
             return false;
         }
 
-        // ========================================================================
-        // Step 1 — Seed state (MPC continuity from last output)
-        // ========================================================================
         CONSOLE_BRIDGE_logInform("[Tracking][Step 1] Setting IK seed and velocity boundary.");
-        Eigen::VectorXd ik_seed = start_pos;
+        Eigen::VectorXd start_pos;
         Eigen::VectorXd current_vel = Eigen::VectorXd::Zero(n_dof);
         Eigen::VectorXd current_acc = Eigen::VectorXd::Zero(n_dof);
 
-        if (has_last_tracking_command_ &&
-            static_cast<int>(last_tracking_command_.size()) == n_dof)
+        const bool have_commit =
+            has_last_tracking_command_ &&
+            static_cast<int>(last_tracking_command_.size()) == n_dof &&
+            static_cast<int>(last_tracking_velocity_.size()) == n_dof;
+
+        if (have_commit)
         {
-            ik_seed = last_tracking_command_;
-            if (static_cast<int>(last_tracking_velocity_.size()) == n_dof)
+            const double commit_err = (last_tracking_command_ - actual_pos).norm();
+            if (commit_err < MAX_COMMIT_TRACKING_ERROR)
+            {
+                // Normal case: plan from the last committed state.
+                // points[0] of the new trajectory will ≈ tracked_pos_ in the
+                // streamer → Hermite blend collapses to a near-no-op.
+                start_pos   = last_tracking_command_;
                 current_vel = last_tracking_velocity_;
-            if (static_cast<int>(last_tracking_acceleration_.size()) == n_dof)
-                current_acc = last_tracking_acceleration_;
-            CONSOLE_BRIDGE_logInform("[Tracking][Step 1] Cached seed loaded. |vel|=%.4f", current_vel.norm());
+                if (static_cast<int>(last_tracking_acceleration_.size()) == n_dof)
+                    current_acc = last_tracking_acceleration_;
+                CONSOLE_BRIDGE_logInform(
+                    "[Tracking][Step 1] Committed seed. err=%.4f |vel|=%.4f",
+                    commit_err, current_vel.norm());
+            }
+            else
+            {
+                // Robot fell too far behind the commit — resync to reality.
+                CONSOLE_BRIDGE_logWarn(
+                    "[Tracking] commit-plant err=%.3f rad > %.3f, resyncing to actual",
+                    commit_err, MAX_COMMIT_TRACKING_ERROR);
+                start_pos = actual_pos;
+                has_last_tracking_command_ = false;
+            }
         }
         else
         {
-            CONSOLE_BRIDGE_logInform("[Tracking][Step 1] No cache — using start_pos as seed.");
+            // Cold start — no commit yet, plan from the actual joint state.
+            start_pos = actual_pos;
+            CONSOLE_BRIDGE_logInform("[Tracking][Step 1] Cold start: using actual_pos.");
         }
+
+        // hw_velocity is only useful on a cold start (when we have no commit).
+        // Once MPC is running, the commit’s velocity is more accurate than HW.
+        if (!have_commit && static_cast<int>(hw_velocity.size()) == n_dof)
+        {
+            Eigen::VectorXd clamped = hw_velocity;
+            for (Eigen::Index i = 0; i < clamped.size() && i < tracking_velocity_limits_.rows(); ++i)
+                clamped[i] = std::clamp(clamped[i],
+                                        tracking_velocity_limits_(i, 0),
+                                        tracking_velocity_limits_(i, 1));
+            current_vel = clamped;
+            CONSOLE_BRIDGE_logInform("[Tracking][Step 1] Cold-start: using hw_vel. |hw_vel|=%.4f",
+                                     current_vel.norm());
+        }
+
+        Eigen::VectorXd ik_seed = start_pos;
 
         // ========================================================================
         // Step 2 — FK: get current EE orientation (position-only tracking)
@@ -358,14 +407,20 @@ namespace Vinhtesseract_examples
                                  trajectory.size(), trajectory.back().time);
 
         // ========================================================================
-        // Step 10 — MPC lookahead cache update (seed next tick's boundary)
+        // Step 10 — MPC lookahead cache update (seed next tick’s boundary)
+        //
+        // lookahead = 1 planner period + 5 ms IPC/streamer latency.
+        // Using a fixed 50 ms was wrong at 30 Hz (only 33 ms per tick) and
+        // caused overshoot. Now tied to the actual planner rate.
         // ========================================================================
-        CONSOLE_BRIDGE_logInform("[Tracking][Step 10] Updating MPC state cache (lookahead=0.05 s)...");
-        const double lookahead_time = 0.05;
+        const double lookahead_time =
+            (planner_period_s_ > 0.0) ? (planner_period_s_ + 0.005) : 0.038;
+        CONSOLE_BRIDGE_logInform("[Tracking][Step 10] Updating MPC cache (lookahead=%.3f s)...",
+                                 lookahead_time);
         has_last_tracking_command_ = true;
         last_tracking_command_ = target_joints;
 
-        // Default: use very first point's vel/acc
+        // Default: use first point’s vel/acc (in case trajectory is too short)
         last_tracking_velocity_ = (static_cast<int>(trajectory.front().velocity.size()) == n_dof)
                                       ? trajectory.front().velocity
                                       : Eigen::VectorXd::Zero(n_dof);
@@ -373,8 +428,8 @@ namespace Vinhtesseract_examples
                                           ? trajectory.front().acceleration
                                           : Eigen::VectorXd::Zero(n_dof);
 
-        // Advance to the lookahead point for smoother MPC seeding
-        for (const auto &state : trajectory)
+        // Advance to the lookahead point
+        for (const auto& state : trajectory)
         {
             if (state.time >= lookahead_time)
             {

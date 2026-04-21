@@ -82,6 +82,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         this->get_parameter("tracking_num_steps").as_int(),
         this->get_parameter("tracking_trajopt_max_iter").as_int(),
         this->get_parameter("tracking_max_joint_step").as_double());
+    planner_->setPlannerPeriod(1.0 / std::max(1.0, tracking_rate_hz_));
 
     // ---- Offline chunked planning parameters ----
     this->declare_parameter<int>("planning_chunk_size", 20);

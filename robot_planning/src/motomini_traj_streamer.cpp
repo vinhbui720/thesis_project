@@ -104,9 +104,10 @@ public:
     MotoMiniTrajStreamer() : rclcpp::Node("motomini_traj_streamer")
     {
         this->declare_parameter<double>("rate_hz",        50.0);
-        // blend_ticks: how many control ticks the Hermite velocity blend lasts
-        // (2 ticks = 40 ms at 50 Hz — just enough for a smooth vel merge)
-        this->declare_parameter<int>   ("blend_ticks",    2);
+        // blend_ticks: Hermite blend duration in control ticks.
+        // 1 tick = 20 ms at 50 Hz. With Fix 1 (plan-from-commit) in place the
+        // blend is usually skipped entirely (gap < 2 mrad), so 1 tick suffices.
+        this->declare_parameter<int>   ("blend_ticks",    1);
 
         rate_hz_    = this->get_parameter("rate_hz").as_double();
         dt_         = 1.0 / std::max(1.0, rate_hz_);
@@ -200,6 +201,11 @@ private:
     {
         if (msg->points.size() <= 1) return;   // arm-trigger — ignore
 
+        // Only accept during streaming — drop silently before arm completes.
+        // Must be checked BEFORE debounce so arming-phase messages don't
+        // poison last_traj_accept_time_ and delay the first real trajectory.
+        if (state_ != STATE_STREAMING) return;
+
         // Debounce: reject if too soon after last accepted trajectory
         const double since_last = (this->now() - last_traj_accept_time_).seconds();
         if (last_traj_accept_time_.nanoseconds() > 0 &&
@@ -209,9 +215,6 @@ private:
             return;
         }
         last_traj_accept_time_ = this->now();
-
-        // Only accept during streaming — ignore before arm completes
-        if (state_ != STATE_STREAMING) return;
 
         // Build joint-order mapping: canonical → msg column
         std::vector<int> src_idx(n_joints_, -1);
@@ -223,14 +226,35 @@ private:
         }
 
         // -----------------------------------------------------------------------
-        // Start Hermite blend from current commanded state → first waypoint of new traj
-        // This guarantees velocity continuity at the join point.
-        // Duration is very short (blend_ticks control ticks) — just enough to
-        // smooth the velocity, not so long that it delays following.
+        // Hermite blend: tracked_pos_ → points[0] of new trajectory.
+        //
+        // With Fix 1 (plan-from-commit), points[0] ≈ tracked_pos_ almost always,
+        // so the blend is skipped when the gap is negligible (< BLEND_SKIP_THRESHOLD).
+        // When a blend IS needed (e.g. first few ticks, or after a resync), it
+        // lasts only 1 tick (20 ms) instead of 2.
+        //
+        // v1 now trusts the trajectory velocity directly because the planner seeds
+        // points[0].velocities from last_tracking_velocity_ (the committed vel),
+        // which matches the streamer's current command. No fallback needed.
         // -----------------------------------------------------------------------
+        static constexpr double BLEND_SKIP_THRESHOLD = 0.002;  // 2 mrad (~0.11°)
+
+        double max_gap = 0.0;
         if (!tracked_pos_.empty())
         {
-            const auto& wp0  = msg->points.front();
+            const auto& wp0_check = msg->points.front();
+            for (size_t i = 0; i < n_joints_; ++i)
+            {
+                int s = src_idx[i];
+                if (s < 0 || static_cast<size_t>(s) >= wp0_check.positions.size()) continue;
+                max_gap = std::max(max_gap,
+                    std::abs(tracked_pos_[i] - wp0_check.positions[static_cast<size_t>(s)]));
+            }
+        }
+
+        if (!tracked_pos_.empty() && max_gap > BLEND_SKIP_THRESHOLD)
+        {
+            const auto& wp0 = msg->points.front();
             hermite_.resize(n_joints_);
             for (size_t i = 0; i < n_joints_; ++i)
             {
@@ -239,25 +263,35 @@ private:
                 hermite_[i].v0 = est_vel_[i];
                 hermite_[i].p1 = (s >= 0 && static_cast<size_t>(s) < wp0.positions.size())
                                      ? wp0.positions[static_cast<size_t>(s)] : tracked_pos_[i];
+                // Trust trajectory velocity — planner seeds it from committed vel.
                 hermite_[i].v1 = (s >= 0 && static_cast<size_t>(s) < wp0.velocities.size())
-                                     ? wp0.velocities[static_cast<size_t>(s)] : 0.0;
-                hermite_[i].T  = blend_dur_;
+                                     ? wp0.velocities[static_cast<size_t>(s)] : est_vel_[i];
+                hermite_[i].T = blend_dur_;
             }
             blend_state_      = BLEND_ACTIVE;
             blend_start_time_ = this->now();
+            // traj_start_time_ set in doStream() after blend finishes.
+            RCLCPP_DEBUG(this->get_logger(),
+                         "Blend needed: max_gap=%.4f rad", max_gap);
+        }
+        else
+        {
+            // Positions aligned (common case after Fix 1) or first trajectory.
+            // Skip the blend entirely — just retime from now.
+            blend_state_     = BLEND_IDLE;
+            traj_start_time_ = this->now();
+            RCLCPP_DEBUG(this->get_logger(),
+                         "Blend skipped: max_gap=%.4f rad", max_gap);
         }
 
-        // Accept the new trajectory — starts from t=0 NOW
-        // (The MPC planner seeds each trajectory from the current state, so
-        //  this is always correct regardless of when the trajectory was planned.)
+        // Accept the new trajectory.
         cached_traj_      = msg;
         cached_src_idx_   = src_idx;
-        traj_start_time_  = this->now();
 
         const double t_end = rclcpp::Duration(msg->points.back().time_from_start).seconds();
         RCLCPP_DEBUG(this->get_logger(),
                      "New traj accepted: %zu pts, t_end=%.3fs", msg->points.size(), t_end);
-    }
+    }  // end trajectoryCallback
 
     // =========================================================================
     // Service callbacks
@@ -377,7 +411,8 @@ private:
             const double be = (this->now() - blend_start_time_).seconds();
             if (be >= blend_dur_)
             {
-                blend_state_ = BLEND_IDLE;
+                blend_state_     = BLEND_IDLE;
+                traj_start_time_ = this->now();  // start traj clock AFTER blend finishes
                 RCLCPP_DEBUG(this->get_logger(), "Hermite blend complete.");
             }
             else
@@ -448,8 +483,6 @@ private:
             else
             {
                 // Single-point trajectory — hold it
-                const int s0 = (n >= 1 && !cached_src_idx_.empty()) ? 0 : -1;
-                (void)s0;
                 const auto& pt0 = pts.front();
                 for (size_t i = 0; i < n_joints_; ++i)
                 {
@@ -575,6 +608,7 @@ private:
 
     // Active trajectory reference time — reset to NOW on every new trajectory
     rclcpp::Time traj_start_time_{0, 0, RCL_ROS_TIME};
+
 
     // Cached trajectory + pre-computed joint-order mapping
     trajectory_msgs::msg::JointTrajectory::SharedPtr cached_traj_;

@@ -198,8 +198,28 @@ void MotoMiniPlanningNode::trackingTick()
     // === Get target tracking pose ===
     const Eigen::Isometry3d target = getLatestTipPose();
 
+    // === Extract live joint velocities from /joint_states for Ruckig seeding ===
+    // If the driver doesn't publish velocities (js.velocity is empty) hw_vel stays
+    // zero-sized — runTrackingPlanner() will silently fall back to the lookahead cache.
+    Eigen::VectorXd hw_vel;
+    {
+        const auto js = getLatestJointState();
+        if (js.velocity.size() == joint_names.size())
+        {
+            hw_vel.resize(static_cast<Eigen::Index>(joint_names.size()));
+            for (size_t i = 0; i < joint_names.size(); ++i)
+            {
+                auto it = std::find(js.name.begin(), js.name.end(), joint_names[i]);
+                hw_vel[static_cast<Eigen::Index>(i)] =
+                    (it != js.name.end())
+                        ? js.velocity[static_cast<size_t>(std::distance(js.name.begin(), it))]
+                        : 0.0;
+            }
+        }
+    }
+
     // === CALL TRACKING PLANNER ===
-    if (!planner_->runTrackingPlanner(target))
+    if (!planner_->runTrackingPlanner(target, hw_vel))
     {
         RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed — skipping");
         return;
