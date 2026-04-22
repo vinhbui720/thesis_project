@@ -7,7 +7,7 @@ controller_manager:
       type: joint_state_broadcaster/JointStateBroadcaster
 
     # 1. Position Trajectory Controller
-    # Use this for /joint_path_command input
+    # Use this for /path_command input
     joint_trajectory_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 

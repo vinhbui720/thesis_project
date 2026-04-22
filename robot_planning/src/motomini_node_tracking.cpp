@@ -1,15 +1,11 @@
 /**
  * @file motomini_node_tracking.cpp
- * @brief MotoMiniPlanningNode — high-frequency TF polling thread + planning tick.
+ * @brief MotoMiniPlanningNode — TF polling + predictive target + tracking tick.
  *
- * Architecture:
- *   tfPollLoop()   — runs in a dedicated thread at ~200 Hz, continuously caches
- *                    the working_tip pose from TF.  This decouples TF freshness
- *                    from the (slower) planning tick rate.
- *   trackingTick() — called by the tracking timer (default 30 Hz).  Reads the
- *                    cached pose (lock-free fast), syncs env, calls planner.
- *
- * @author Bùi Quang Vinh
+ * v4 additions:
+ *   - EMA velocity estimation in tfPollLoop()
+ *   - Predictive target (lead-compensated pose) fed to planner
+ *   - tip_velocity passed through to runTrackingPlanner for Jacobian FF
  */
 
 #include <robot_planning/motomini_planning_node.h>
@@ -28,18 +24,16 @@
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::startTfPolling()
 {
-    if (tf_poll_running_)
-        return;
+    if (tf_poll_running_) return;
     tf_poll_running_ = true;
-    tf_poll_thread_ = std::thread(&MotoMiniPlanningNode::tfPollLoop, this);
+    tf_poll_thread_  = std::thread(&MotoMiniPlanningNode::tfPollLoop, this);
     RCLCPP_INFO(this->get_logger(), "TF poll thread started (%.0f Hz)", tf_poll_rate_hz_);
 }
 
 void MotoMiniPlanningNode::stopTfPolling()
 {
     tf_poll_running_ = false;
-    if (tf_poll_thread_.joinable())
-        tf_poll_thread_.join();
+    if (tf_poll_thread_.joinable()) tf_poll_thread_.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -47,22 +41,21 @@ void MotoMiniPlanningNode::stopTfPolling()
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::startJointStatePolling()
 {
-    if (joint_state_poll_running_)
-        return;
+    if (joint_state_poll_running_) return;
     joint_state_poll_running_ = true;
-    joint_state_poll_thread_ = std::thread(&MotoMiniPlanningNode::jointStatePollLoop, this);
-    RCLCPP_INFO(this->get_logger(), "Joint state poll thread started (%.0f Hz)", joint_state_poll_rate_hz_);
+    joint_state_poll_thread_  = std::thread(&MotoMiniPlanningNode::jointStatePollLoop, this);
+    RCLCPP_INFO(this->get_logger(), "Joint state poll thread started (%.0f Hz)",
+                joint_state_poll_rate_hz_);
 }
 
 void MotoMiniPlanningNode::stopJointStatePolling()
 {
     joint_state_poll_running_ = false;
-    if (joint_state_poll_thread_.joinable())
-        joint_state_poll_thread_.join();
+    if (joint_state_poll_thread_.joinable()) joint_state_poll_thread_.join();
 }
 
 // ---------------------------------------------------------------------------
-// getLatestJointState — thread-safe read of cached joint state
+// Thread-safe getters
 // ---------------------------------------------------------------------------
 sensor_msgs::msg::JointState MotoMiniPlanningNode::getLatestJointState() const
 {
@@ -70,17 +63,32 @@ sensor_msgs::msg::JointState MotoMiniPlanningNode::getLatestJointState() const
     return latest_polled_joint_state_;
 }
 
-// ---------------------------------------------------------------------------
-// getLatestTipPose — thread-safe read of cached pose
-// ---------------------------------------------------------------------------
 Eigen::Isometry3d MotoMiniPlanningNode::getLatestTipPose() const
 {
     std::lock_guard<std::mutex> lock(tip_pose_mutex_);
     return latest_working_tip_world_;
 }
 
+// NEW — lead-compensated predicted pose
+Eigen::Isometry3d MotoMiniPlanningNode::getLatestTipPosePredicted() const
+{
+    std::lock_guard<std::mutex> lock(tip_pose_mutex_);
+    // Lead = one planner period + half a streamer period (IPC latency estimate)
+    const double lead = plan_latency_ + exec_latency_;
+    Eigen::Isometry3d predicted = latest_working_tip_world_;
+    predicted.translation() += tip_velocity_ * lead;
+    return predicted;
+}
+
+// NEW — smoothed Cartesian velocity of the gantry tip
+Eigen::Vector3d MotoMiniPlanningNode::getLatestTipVelocity() const
+{
+    std::lock_guard<std::mutex> lock(tip_pose_mutex_);
+    return tip_vel_initialized_ ? tip_velocity_ : Eigen::Vector3d::Zero();
+}
+
 // ---------------------------------------------------------------------------
-// jointStatePollLoop — runs in its own thread, continuously caches joint state
+// jointStatePollLoop
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::jointStatePollLoop()
 {
@@ -89,7 +97,6 @@ void MotoMiniPlanningNode::jointStatePollLoop()
 
     while (joint_state_poll_running_ && rclcpp::ok())
     {
-        // Read the latest joint state from callback cache
         if (last_joint_state_)
         {
             std::lock_guard<std::mutex> lock(joint_state_poll_mutex_);
@@ -97,13 +104,12 @@ void MotoMiniPlanningNode::jointStatePollLoop()
             if (!joint_state_poll_initialized_)
                 joint_state_poll_initialized_ = true;
         }
-
         std::this_thread::sleep_for(period);
     }
 }
 
 // ---------------------------------------------------------------------------
-// tfPollLoop — runs in its own thread, continuously caches the working_tip pose
+// tfPollLoop — position EMA + velocity EMA + predictive target
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::tfPollLoop()
 {
@@ -120,57 +126,88 @@ void MotoMiniPlanningNode::tfPollLoop()
                 tracking_gantry_base_frame_, tracking_tip_frame_, tf2::TimePointZero);
 
             const Eigen::Isometry3d T_world_base = tf2::transformToEigen(world_to_base.transform);
-            const Eigen::Isometry3d T_base_tip = tf2::transformToEigen(base_to_tip.transform);
-            const Eigen::Isometry3d measured = T_world_base * T_base_tip;
+            const Eigen::Isometry3d T_base_tip   = tf2::transformToEigen(base_to_tip.transform);
+            const Eigen::Isometry3d measured      = T_world_base * T_base_tip;
 
             {
                 std::lock_guard<std::mutex> lock(tip_pose_mutex_);
+
                 if (!tracking_pose_initialized_)
                 {
-                    latest_working_tip_world_ = measured;
+                    // Cold start — accept raw measurement directly
+                    latest_working_tip_world_  = measured;
+                    tip_prev_measured_         = measured;
+                    tip_prev_time_             = this->now();
                     tracking_pose_initialized_ = true;
+                    tip_vel_initialized_       = false;
+                    tip_velocity_.setZero();
                 }
                 else
                 {
-                    // EMA low-pass filter — alpha closer to 1.0 = faster response
+                    // ── Position EMA (unchanged) ──────────────────────────────
                     const double alpha = tracking_ema_alpha_;
                     latest_working_tip_world_.translation() =
                         (1.0 - alpha) * latest_working_tip_world_.translation() +
-                        alpha * measured.translation();
+                               alpha  * measured.translation();
                     latest_working_tip_world_.linear() = measured.linear();
+
+                    // ── Velocity EMA ──────────────────────────────────────────
+                    // Finite-difference on RAW measurement (not EMA filtered pos)
+                    // so we get a responsive velocity estimate. The EMA below
+                    // provides noise smoothing on top.
+                    const double dt_tf =
+                        (this->now() - tip_prev_time_).seconds();
+
+                    if (dt_tf > 1e-4 && dt_tf < 0.05)  // skip stale / bogus TF
+                    {
+                        const Eigen::Vector3d raw_vel =
+                            (measured.translation() -
+                             tip_prev_measured_.translation()) / dt_tf;
+
+                        if (!tip_vel_initialized_)
+                        {
+                            tip_velocity_       = raw_vel;
+                            tip_vel_initialized_ = true;
+                        }
+                        else
+                        {
+                            // Lower alpha than position — derivative is noisier
+                            tip_velocity_ = tf_vel_alpha_ * raw_vel
+                                          + (1.0 - tf_vel_alpha_) * tip_velocity_;
+                        }
+                    }
+
+                    tip_prev_measured_ = measured;
+                    tip_prev_time_     = this->now();
                 }
             }
 
-            // Debug: publish the cached pose as PoseStamped
+            // Debug publish
             if (pub_tracked_pose_)
             {
                 geometry_msgs::msg::PoseStamped ps;
-                ps.header.stamp = this->now();
+                ps.header.stamp    = this->now();
                 ps.header.frame_id = tracking_world_frame_;
-                ps.pose = tf2::toMsg(measured);
+                ps.pose            = tf2::toMsg(measured);
                 pub_tracked_pose_->publish(ps);
             }
         }
-        catch (const tf2::TransformException &)
-        {
-            // TF not ready yet — silently retry next iteration
-        }
+        catch (const tf2::TransformException &) {}  // TF not ready — retry
 
         std::this_thread::sleep_for(period);
     }
 }
 
 // ---------------------------------------------------------------------------
-// trackingTick — called by the tracking timer (optimized continuous tracking)
+// trackingTick — planning tick at tracking_rate_hz_
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::trackingTick()
 {
     RCLCPP_DEBUG(this->get_logger(), "[trackingTick] entered.");
 
-    // === GUARD: Check preconditions ===
     if (!last_joint_state_ || last_joint_state_->position.empty())
     {
-        RCLCPP_DEBUG(this->get_logger(), "[trackingTick] No joint state yet — skipping.");
+        RCLCPP_DEBUG(this->get_logger(), "[trackingTick] No joint state — skipping.");
         return;
     }
     if (!tracking_enabled_ || !tracking_pose_initialized_)
@@ -181,26 +218,15 @@ void MotoMiniPlanningNode::trackingTick()
         return;
     }
 
-    RCLCPP_DEBUG(this->get_logger(), "[trackingTick] Guards passed.");
-
-    // NOTE: DO NOT call updateEnvironmentState() here.
-    // The Tesseract environment is continuously updated by the ROSEnvironmentMonitor
-    // (via startStateMonitor('/joint_states')). Calling setState() from this thread
-    // while the monitor's own update thread is also writing to env_ creates a
-    // data race on Tesseract's internal unordered_map, corrupting its memory
-    // layout → SIGSEGV -11. The planner reads env_ under its own shared_lock,
-    // which is sufficient since the monitor uses a write lock.
-
     const std::vector<std::string> joint_names = {
         "joint_1_s", "joint_2_l", "joint_3_u",
         "joint_4_r", "joint_5_b", "joint_6_t"};
 
-    // === Get target tracking pose ===
-    const Eigen::Isometry3d target = getLatestTipPose();
+    // ── Predicted target (lead-compensated) ───────────────────────────────
+    const Eigen::Isometry3d target   = getLatestTipPosePredicted();  // ← key change
+    const Eigen::Vector3d   tip_vel  = getLatestTipVelocity();       // ← for Jac FF
 
-    // === Extract live joint velocities from /joint_states for Ruckig seeding ===
-    // If the driver doesn't publish velocities (js.velocity is empty) hw_vel stays
-    // zero-sized — runTrackingPlanner() will silently fall back to the lookahead cache.
+    // ── HW joint velocities (cold-start fallback only) ────────────────────
     Eigen::VectorXd hw_vel;
     {
         const auto js = getLatestJointState();
@@ -212,30 +238,27 @@ void MotoMiniPlanningNode::trackingTick()
                 auto it = std::find(js.name.begin(), js.name.end(), joint_names[i]);
                 hw_vel[static_cast<Eigen::Index>(i)] =
                     (it != js.name.end())
-                        ? js.velocity[static_cast<size_t>(std::distance(js.name.begin(), it))]
+                        ? js.velocity[static_cast<size_t>(
+                              std::distance(js.name.begin(), it))]
                         : 0.0;
             }
         }
     }
 
-    // === CALL TRACKING PLANNER ===
-    if (!planner_->runTrackingPlanner(target, hw_vel))
+    // ── Call planner ──────────────────────────────────────────────────────
+    if (!planner_->runTrackingPlanner(target, hw_vel, tip_vel))
     {
-        RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed — skipping");
+        RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed — skipping.");
         return;
     }
 
     auto traj_ptr = planner_->getTrajectory();
     if (!traj_ptr || traj_ptr->empty())
     {
-        RCLCPP_DEBUG(this->get_logger(), "Tracking: empty trajectory — skipping");
+        RCLCPP_DEBUG(this->get_logger(), "Tracking: empty trajectory — skipping.");
         return;
     }
 
-    // === PUBLISH FULL TRAJECTORY DIRECTLY → traj_streamer splices it ===
-    // The traj_streamer finds the nearest point to the current robot position
-    // and smooth-merges into the new trajectory, so there is no need for a
-    // completion gate here.  Just send every new plan immediately.
     const std::vector<std::string> traj_joint_names = {
         "joint_1_s", "joint_2_l", "joint_3_u",
         "joint_4_r", "joint_5_b", "joint_6_t"};
@@ -243,17 +266,11 @@ void MotoMiniPlanningNode::trackingTick()
     publishTrackingTrajectory(*traj_ptr, traj_joint_names);
 
     RCLCPP_INFO(this->get_logger(),
-                "Tracking: sent %.3f s trajectory (%zu pts) to traj_streamer",
-                traj_ptr->back().time, traj_ptr->size());
+                "Tracking: sent %.3f s traj (%zu pts), tip_vel=%.3f m/s",
+                traj_ptr->back().time, traj_ptr->size(), tip_vel.norm());
 }
 
 // ---------------------------------------------------------------------------
-// trackingStreamTick — 50Hz continuous interpolation and streaming
+// trackingStreamTick — no-op (handled by motomini_traj_streamer)
 // ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::trackingStreamTick()
-{
-    // No-op: trajectory streaming is now handled entirely by motomini_traj_streamer.
-    // The traj_streamer receives the full Ruckig-smoothed trajectory on /joint_path_command,
-    // splices it from the nearest point to the current robot state, and publishes
-    // interpolated single-point commands to /joint_command at 50 Hz.
-}
+void MotoMiniPlanningNode::trackingStreamTick() {}

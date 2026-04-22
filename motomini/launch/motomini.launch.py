@@ -81,7 +81,7 @@ def generate_launch_description():
         ),
 
         # JointState to Trajectory node no longer needed:
-        # motomini_vel_tracking now publishes JointTrajectory directly to /joint_path_command
+        # motomini_vel_tracking now publishes JointTrajectory directly to /path_command
 
         Node(
             package="robot_planning",
@@ -304,7 +304,7 @@ def generate_launch_description():
             executable="relay",
             name="trajectory_relay",
             arguments=[
-                "/joint_path_command",
+                "/path_command",
                 "/motomini_controller/joint_trajectory"
             ],
             output="screen",

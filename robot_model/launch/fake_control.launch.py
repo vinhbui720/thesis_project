@@ -45,7 +45,7 @@ def generate_launch_description():
         parameters=[robot_description, robot_controllers],
         output="both",
         remappings=[
-            ("/joint_trajectory_controller/joint_trajectory", "/joint_path_command"),
+            ("/joint_trajectory_controller/joint_trajectory", "/path_command"),
         ]
     )
 

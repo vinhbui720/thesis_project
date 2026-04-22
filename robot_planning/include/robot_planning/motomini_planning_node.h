@@ -129,6 +129,17 @@ private:
     double tf_poll_rate_hz_{200.0};
     double tracking_ema_alpha_{0.6};
 
+    // EMA Cartesian velocity of the gantry tip (estimated in tfPollLoop)
+    Eigen::Vector3d   tip_velocity_{0.0, 0.0, 0.0};
+    Eigen::Isometry3d tip_prev_measured_{Eigen::Isometry3d::Identity()};
+    rclcpp::Time      tip_prev_time_{0, 0, RCL_ROS_TIME};
+    bool              tip_vel_initialized_{false};
+
+    // Latency estimates for predictive (lead-compensated) target
+    double tf_vel_alpha_{0.15};   // EMA weight for tip velocity (0.1=smooth, 0.3=responsive)
+    double plan_latency_{0.033};  // one planner period (1/tracking_rate_hz_)
+    double exec_latency_{0.010};  // streamer half-period + IPC estimate
+
     // Joint state polling thread — fast, continuous joint state caching
     std::thread joint_state_poll_thread_;
     std::atomic<bool> joint_state_poll_running_{false};
@@ -164,6 +175,8 @@ private:
     void startTfPolling();
     void stopTfPolling();
     Eigen::Isometry3d getLatestTipPose() const;
+    Eigen::Isometry3d getLatestTipPosePredicted() const;  // lead-compensated
+    Eigen::Vector3d   getLatestTipVelocity() const;
 
     void jointStatePollLoop(); // runs in joint_state_poll_thread_
     void startJointStatePolling();

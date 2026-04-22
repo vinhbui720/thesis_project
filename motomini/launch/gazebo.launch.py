@@ -190,7 +190,7 @@ def generate_launch_description():
     # --------------------------------------------------
     topic_relay = Node(
         package="topic_tools", executable="relay", name="joint_command_relay",
-        arguments=["/joint_path_command", "/joint_trajectory_controller/joint_trajectory"],
+        arguments=["/path_command", "/joint_trajectory_controller/joint_trajectory"],
         parameters=[{"use_sim_time": use_sim_time}]
     )
 

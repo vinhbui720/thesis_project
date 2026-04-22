@@ -149,8 +149,9 @@ namespace Vinhtesseract_examples
         // Lightweight tracking planner (collision check only, no optimization yet).
         // hw_velocity: live joint velocities from /joint_states (6-element vector).
         // If empty or wrong size, falls back to the MPC lookahead cache.
-        bool runTrackingPlanner(const Eigen::Isometry3d &target_pose,
-                                const Eigen::VectorXd &hw_velocity = Eigen::VectorXd{});
+        bool runTrackingPlanner(const Eigen::Isometry3d& target_pose,
+                                const Eigen::VectorXd&   hw_velocity = Eigen::VectorXd{},
+                                const Eigen::Vector3d&   tip_velocity = Eigen::Vector3d::Zero());
 
         // Set the planner’s own period so lookahead is correctly computed.
         // Call once after configureTracking(), before the first tick.
@@ -214,6 +215,17 @@ namespace Vinhtesseract_examples
         Eigen::MatrixX2d tracking_velocity_limits_;
         bool tracking_caches_valid_{false};
         void ensureTrackingCaches();
+
+        // --- Cartesian-domain tracking state (v4 DLS planner) ---
+        // Low-pass filtered Cartesian target (position) — removes TF jitter that
+        // causes joint oscillation and cube-interference alarms.
+        Eigen::Isometry3d last_tracking_target_{ Eigen::Isometry3d::Identity() };
+        bool              tracking_target_initialized_{ false };
+
+        // When false (default): position-only tracking — orientation is held at
+        // the current FK value.  Setting to true adds wrist orientation control
+        // but risks cube alarms near the wrist singularity.
+        bool              tracking_track_orientation_{ false };
     };
 
 } // namespace Vinhtesseract_examples

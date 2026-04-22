@@ -1,6 +1,6 @@
 // This node subscribes to sensor_msgs/msg/JointState (velocity commands)
 // and /joint_states (current positions), integrates velocity to position,
-// and publishes a trajectory_msgs/msg/JointTrajectory to /joint_path_command.
+// and publishes a trajectory_msgs/msg/JointTrajectory to /path_command.
 // Only active when vel_streaming is true and real_robot is false.
 
 #include <rclcpp/rclcpp.hpp>
@@ -24,7 +24,7 @@ public:
             "/joint_states", 10,
             std::bind(&JointStateToTrajectoryNode::jointStateCallback, this, std::placeholders::_1));
         traj_pub_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
-            "/joint_path_command", 10);
+            "/path_command", 10);
 
         timer_ = this->create_wall_timer(
             std::chrono::duration_cast<std::chrono::milliseconds>(

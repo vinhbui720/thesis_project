@@ -1,0 +1,97 @@
+/* Modern Dark Theme for TaskGUI */
+QWidget {
+    background-color: #121212;
+    color: #E0E0E0;
+    font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+}
+
+/* Header Bar */
+#HeaderBar {
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1F1F1F, stop:1 #2D2D2D);
+    border-bottom: 2px solid #3d3d3d;
+    min-height: 70px;
+}
+
+#ProjectTitle {
+    font-size: 20px;
+    font-weight: bold;
+    color: #4CAF50;
+}
+
+#MSSVLabel {
+    color: #888888;
+    font-style: italic;
+}
+
+/* Panels */
+#ControlPanel, #MonitorPanel, #TimelinePanel {
+    background-color: #1E1E1E;
+    border-radius: 12px;
+    border: 1px solid #333333;
+    padding: 15px;
+    margin: 5px;
+}
+
+/* Buttons */
+QPushButton {
+    background-color: #333333;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-weight: 600;
+    min-width: 80px;
+}
+
+QPushButton:hover {
+    background-color: #444444;
+}
+
+QPushButton:pressed {
+    background-color: #222222;
+}
+
+#RecordButton {
+    background-color: #D32F2F;
+    color: white;
+}
+#RecordButton:hover { background-color: #E53935; }
+
+#StopButton {
+    background-color: #616161;
+}
+
+#PlaybackButton {
+    background-color: #2E7D32;
+    color: white;
+}
+#PlaybackButton:hover { background-color: #388E3C; }
+
+/* Table / Timeline */
+QTableWidget {
+    background-color: #1A1A1A;
+    gridline-color: #333333;
+    border: none;
+    border-radius: 8px;
+}
+
+QHeaderView::section {
+    background-color: #252525;
+    padding: 6px;
+    border: 1px solid #333333;
+    font-weight: bold;
+}
+
+/* Labels & Status */
+#StatusLabel {
+    font-family: 'Consolas', 'Courier New', monospace;
+    background-color: #000000;
+    border-radius: 4px;
+    padding: 4px 8px;
+    color: #00FF00;
+}
+
+#MonitorValue {
+    color: #64B5F6;
+    font-weight: bold;
+}

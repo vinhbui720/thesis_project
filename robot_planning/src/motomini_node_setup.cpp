@@ -218,7 +218,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 
     // ---- Publishers ----
     pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
-    pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
+    pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/path_command", 10);
     pub_tracking_stream_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_command", 10);
     pub_tracked_pose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
         "/motomini/tracked_tip_pose", 10);
