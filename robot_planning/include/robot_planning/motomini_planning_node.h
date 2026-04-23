@@ -49,6 +49,7 @@
 
 // STL
 #include <atomic>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -132,6 +133,7 @@ private:
     // EMA Cartesian velocity of the gantry tip (estimated in tfPollLoop)
     Eigen::Vector3d   tip_velocity_{0.0, 0.0, 0.0};
     Eigen::Isometry3d tip_prev_measured_{Eigen::Isometry3d::Identity()};
+    Eigen::Vector3d   prev_ema_translation_{0.0, 0.0, 0.0};  // for EMA-derived velocity
     rclcpp::Time      tip_prev_time_{0, 0, RCL_ROS_TIME};
     bool              tip_vel_initialized_{false};
 
@@ -164,6 +166,10 @@ private:
     rclcpp::Time tracking_traj_start_time_{0, 0, RCL_ROS_TIME};
     double tracking_stream_time_{0.0};
     void trackingStreamTick();
+
+    // Async tracking planner worker (prevents blocking 30 Hz timer)
+    std::future<void>      tracking_worker_future_;
+    std::atomic<bool>      tracking_worker_busy_{false};
 
     // ---- Private Methods ----
 

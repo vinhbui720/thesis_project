@@ -49,6 +49,8 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<int>("tracking_num_steps", 5);
     this->declare_parameter<int>("tracking_trajopt_max_iter", 5);
     this->declare_parameter<double>("tracking_max_joint_step", 0.15);
+    this->declare_parameter<double>("tracking_lookahead_mult", 1.5);   // lookahead = period * mult
+    this->declare_parameter<bool>("tracking_obstacle_avoid", false);   // TrajOpt collision avoidance
     this->declare_parameter<double>("tf_poll_rate_hz", 200.0);
     this->declare_parameter<double>("tracking_ema_alpha", 0.6);
 
@@ -81,7 +83,9 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         this->get_parameter("tracking_enable_collision").as_bool(),
         this->get_parameter("tracking_num_steps").as_int(),
         this->get_parameter("tracking_trajopt_max_iter").as_int(),
-        this->get_parameter("tracking_max_joint_step").as_double());
+        this->get_parameter("tracking_max_joint_step").as_double(),
+        this->get_parameter("tracking_lookahead_mult").as_double(),
+        this->get_parameter("tracking_obstacle_avoid").as_bool());
     planner_->setPlannerPeriod(1.0 / std::max(1.0, tracking_rate_hz_));
 
     // ---- Offline chunked planning parameters ----

@@ -51,11 +51,16 @@ void MotoMiniPlanningNode::publishTrackingTrajectory(
     for (auto &state : forward)
         state.time = std::max(0.0, state.time - t_offset);
 
-    // === Timing delays and minimum spacing ===
-    const double start_delay = 0.003; // 3ms delay to account for publishing overhead
-    const double min_step_dt = 0.001; // 1ms minimum between trajectory points
+    // ✅ Bug 4 Fix: clamp first point to at least one streamer tick (20ms).
+    // A near-zero first interval causes Hermite interpolation velocity spikes
+    // in motomini_traj_streamer because it computes: vel ≈ Δpos / Δt ≈ ∞.
+    static constexpr double MIN_FIRST_DT = 0.020;
+    if (!forward.empty() && forward.front().time < MIN_FIRST_DT)
+        forward.front().time = MIN_FIRST_DT;
 
     // === CALL STANDARD PUBLISH ===
+    const double start_delay = 0.003; // 3ms delay for publishing overhead
+    const double min_step_dt = 0.001; // 1ms minimum between trajectory points
     publishTrajectory(forward, joint_names, start_delay, min_step_dt);
 }
 

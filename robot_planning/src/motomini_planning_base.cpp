@@ -73,13 +73,17 @@ namespace Vinhtesseract_examples
 
     void MotoMiniPlanning::configureTracking(bool use_trajopt, bool enable_collision,
                                              int num_steps, int trajopt_max_iter,
-                                             double max_joint_step)
+                                             double max_joint_step,
+                                             double lookahead_mult,
+                                             bool obstacle_avoid)
     {
         tracking_use_trajopt_ = use_trajopt;
         tracking_enable_collision_ = enable_collision;
         tracking_num_steps_ = num_steps;
         tracking_trajopt_max_iter_ = trajopt_max_iter;
         tracking_max_joint_step_ = max_joint_step;
+        tracking_lookahead_mult_ = std::max(0.5, lookahead_mult);  // clamp: at least 0.5x period
+        tracking_obstacle_avoid_ = obstacle_avoid;
     }
 
 } // namespace Vinhtesseract_examples

@@ -137,6 +137,7 @@ void MotoMiniPlanningNode::tfPollLoop()
                     // Cold start — accept raw measurement directly
                     latest_working_tip_world_  = measured;
                     tip_prev_measured_         = measured;
+                    prev_ema_translation_      = measured.translation();  // init EMA velocity basis
                     tip_prev_time_             = this->now();
                     tracking_pose_initialized_ = true;
                     tip_vel_initialized_       = false;
@@ -152,17 +153,16 @@ void MotoMiniPlanningNode::tfPollLoop()
                     latest_working_tip_world_.linear() = measured.linear();
 
                     // ── Velocity EMA ──────────────────────────────────────────
-                    // Finite-difference on RAW measurement (not EMA filtered pos)
-                    // so we get a responsive velocity estimate. The EMA below
-                    // provides noise smoothing on top.
+                    // ✅ Bug 3 Fix: finite-diff on EMA-filtered position (not raw)
+                    // so velocity stays phase-aligned with the target fed to planner.
                     const double dt_tf =
                         (this->now() - tip_prev_time_).seconds();
 
                     if (dt_tf > 1e-4 && dt_tf < 0.05)  // skip stale / bogus TF
                     {
                         const Eigen::Vector3d raw_vel =
-                            (measured.translation() -
-                             tip_prev_measured_.translation()) / dt_tf;
+                            (latest_working_tip_world_.translation() -
+                             prev_ema_translation_) / dt_tf;
 
                         if (!tip_vel_initialized_)
                         {
@@ -177,6 +177,7 @@ void MotoMiniPlanningNode::tfPollLoop()
                         }
                     }
 
+                    prev_ema_translation_ = latest_working_tip_world_.translation();
                     tip_prev_measured_ = measured;
                     tip_prev_time_     = this->now();
                 }
@@ -245,17 +246,14 @@ void MotoMiniPlanningNode::trackingTick()
         }
     }
 
-    // ── Call planner ──────────────────────────────────────────────────────
-    if (!planner_->runTrackingPlanner(target, hw_vel, tip_vel))
+    // ── Call planner (async — non-blocking) ───────────────────────────────
+    // CAS guard: drop this tick gracefully if previous planning call still running.
+    bool expected = false;
+    if (!tracking_worker_busy_.compare_exchange_strong(expected, true,
+                                                       std::memory_order_acq_rel))
     {
-        RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed — skipping.");
-        return;
-    }
-
-    auto traj_ptr = planner_->getTrajectory();
-    if (!traj_ptr || traj_ptr->empty())
-    {
-        RCLCPP_DEBUG(this->get_logger(), "Tracking: empty trajectory — skipping.");
+        RCLCPP_DEBUG(this->get_logger(),
+                     "[trackingTick] previous planning still running — dropping tick.");
         return;
     }
 
@@ -263,11 +261,24 @@ void MotoMiniPlanningNode::trackingTick()
         "joint_1_s", "joint_2_l", "joint_3_u",
         "joint_4_r", "joint_5_b", "joint_6_t"};
 
-    publishTrackingTrajectory(*traj_ptr, traj_joint_names);
-
-    RCLCPP_INFO(this->get_logger(),
-                "Tracking: sent %.3f s traj (%zu pts), tip_vel=%.3f m/s",
-                traj_ptr->back().time, traj_ptr->size(), tip_vel.norm());
+    tracking_worker_future_ = std::async(
+        std::launch::async,
+        [this, target, tip_vel, hw_vel, traj_joint_names]()
+        {
+            if (planner_->runTrackingPlanner(target, hw_vel, tip_vel))
+            {
+                auto traj_ptr = planner_->getTrajectory();
+                if (traj_ptr && !traj_ptr->empty())
+                    publishTrackingTrajectory(*traj_ptr, traj_joint_names);
+                else
+                    RCLCPP_DEBUG(this->get_logger(), "Tracking: empty trajectory.");
+            }
+            else
+            {
+                RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed.");
+            }
+            tracking_worker_busy_.store(false, std::memory_order_release);
+        });
 }
 
 // ---------------------------------------------------------------------------

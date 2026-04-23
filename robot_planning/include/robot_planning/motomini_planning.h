@@ -160,7 +160,9 @@ namespace Vinhtesseract_examples
         // Configure tracking parameters from ROS node
         void configureTracking(bool use_trajopt, bool enable_collision,
                                int num_steps, int trajopt_max_iter,
-                               double max_joint_step);
+                               double max_joint_step,
+                               double lookahead_mult = 1.5,
+                               bool obstacle_avoid = false);
 
         // Configure offline chunked planning
         void configureChunking(int chunk_size, int parallel_chunks)
@@ -208,6 +210,8 @@ namespace Vinhtesseract_examples
         int tracking_trajopt_max_iter_{5};      // max SQP iterations
         double tracking_max_joint_step_{0.15};  // rad per tick
         double planner_period_s_{0.033};        // 1/tracking_rate_hz — set via setPlannerPeriod()
+        double tracking_lookahead_mult_{1.5};    // lookahead = period * mult
+        bool   tracking_obstacle_avoid_{false};  // use TrajOpt collision avoidance
 
         // --- Cached objects for fast repeated tracking calls ---
         tesseract_kinematics::KinematicGroup::ConstPtr tracking_manip_;

@@ -61,6 +61,21 @@ TESSERACT_COMMON_IGNORE_WARNINGS_POP
 #include <tesseract_time_parameterization/ruckig/ruckig_trajectory_smoothing.h>
 #include <tesseract_time_parameterization/ruckig/ruckig_trajectory_smoothing_profiles.h>
 
+// Resource locator (needed for TaskComposer plugin config path)
+#include <tesseract_common/resource_locator.h>
+
+// TrajOpt profiles (for optional obstacle avoidance in tracking mode)
+#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_default_composite_profile.h>
+#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_default_move_profile.h>
+#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_osqp_solver_profile.h>
+#include <tesseract_task_composer/core/task_composer_context.h>
+#include <tesseract_task_composer/core/task_composer_data_storage.h>
+#include <tesseract_task_composer/core/task_composer_plugin_factory.h>
+#include <tesseract_task_composer/core/task_composer_node.h>
+#include <tesseract_task_composer/core/task_composer_executor.h>
+#include <tesseract_task_composer/core/task_composer_future.h>
+#include <filesystem>
+
 // std
 #include <algorithm>
 #include <limits>
@@ -413,8 +428,14 @@ namespace Vinhtesseract_examples
         }
 
         // ── Step 8: build CompositeInstruction for Ruckig ─────────────────────
+        // Derive num_pts from lookahead time and a fixed 50 Hz streamer step.
+        // This avoids a separate param: more lookahead → more dense waypoints.
+        static constexpr double STREAMER_DT = 0.020;  // 1 / 50 Hz
+        const double lookahead = planner_period_s_ * tracking_lookahead_mult_;
+        const int num_pts = std::max(2, static_cast<int>(std::ceil(lookahead / STREAMER_DT)));
+
         // Compute a kinematically-valid time horizon from the joint displacements.
-        double total_time = 0.08;  // 80 ms minimum
+        double total_time = lookahead;  // minimum = one full lookahead window
         for (Eigen::Index j = 0; j < static_cast<Eigen::Index>(n_dof); ++j)
         {
             const double vmax  = std::max(1e-6, tracking_velocity_limits_(j, 1));
@@ -423,7 +444,7 @@ namespace Vinhtesseract_examples
         }
         total_time *= 1.3;  // 30 % margin so Ruckig rarely needs to extend
 
-        const int num_steps = std::max(2, tracking_num_steps_);
+        const int num_steps = std::max(2, num_pts);
         CompositeInstruction ci(
             "DEFAULT",
             tesseract_common::ManipulatorInfo(manipulator_group_, base_link_, ee_link_));
@@ -445,7 +466,95 @@ namespace Vinhtesseract_examples
             ci.push_back(MoveInstruction(swp, MoveInstructionType::FREESPACE, "FREESPACE"));
         }
 
-        // ── Step 9: Ruckig smoothing ───────────────────────────────────────────
+        // ── Step 9: Optional TrajOpt collision avoidance ───────────────────────
+        // When tracking_obstacle_avoid_ is true, run a fast TrajOpt pass on the
+        // Ruckig-smoothed CompositeInstruction to push joints away from obstacles.
+        // Falls back silently to Ruckig-only output on any TrajOpt failure.
+        if (tracking_obstacle_avoid_)
+        {
+            try
+            {
+                // Reuse the same TaskComposer path as offline planning, but with:
+                //   - max tracking_trajopt_max_iter_ SQP iterations
+                //   - collision COST only (no constraint = never infeasible)
+                //   - cloned env so the shared env_ is not mutated
+                std::shared_lock<std::shared_mutex> env_lock(env_mutex_);
+                auto env_c = std::shared_ptr<tesseract_environment::Environment>(env_->clone());
+                env_c->setState(joint_names, start_pos);
+                env_lock.unlock();
+
+                auto obs_profiles = std::make_shared<tesseract_common::ProfileDictionary>();
+
+                auto tio_move = std::make_shared<TrajOptIfoptDefaultMoveProfile>();
+                tio_move->cartesian_constraint_config.enabled = false;
+                tio_move->cartesian_cost_config.enabled = false;
+                tio_move->joint_cost_config.enabled = true;
+                tio_move->joint_cost_config.coeff = Eigen::VectorXd::Ones(n_dof) * 1.0;
+
+                auto tio_comp = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
+                tio_comp->smooth_velocities     = true;
+                tio_comp->smooth_accelerations  = true;
+                tio_comp->smooth_jerks          = false;
+                tio_comp->velocity_coeff        = Eigen::VectorXd::Ones(1) * 0.5;
+                tio_comp->acceleration_coeff    = Eigen::VectorXd::Ones(1) * 1.0;
+                tio_comp->collision_cost_config  =
+                    trajopt_common::TrajOptCollisionConfig(0.02, 200.0);
+                tio_comp->collision_cost_config.enabled = true;
+
+                auto tio_solver = std::make_shared<TrajOptIfoptOSQPSolverProfile>();
+                tio_solver->opt_params.max_iterations = tracking_trajopt_max_iter_;
+
+                static const std::string TRAJ_NS = "TrajOptIfoptMotionPlannerTask";
+                obs_profiles->addProfile(TRAJ_NS, "DEFAULT", tio_move);
+                obs_profiles->addProfile(TRAJ_NS, "FREESPACE", tio_move);
+                obs_profiles->addProfile(TRAJ_NS, "DEFAULT", tio_comp);
+                obs_profiles->addProfile(TRAJ_NS, "DEFAULT", tio_solver);
+
+                // Locate the TaskComposer config file from the env's resource locator
+                std::filesystem::path cfg_path(
+                    env_c->getResourceLocator()
+                         ->locateResource(
+                             "package://tesseract_task_composer/config/task_composer_plugins.yaml")
+                         ->getFilePath());
+                TaskComposerPluginFactory factory(cfg_path, *env_c->getResourceLocator());
+
+                TaskComposerNode::UPtr tc_task =
+                    factory.createTaskComposerNode("TrajOptIfoptPipeline");
+                const std::string out_key = tc_task->getOutputKeys().get("program");
+
+                auto ds = std::make_unique<TaskComposerDataStorage>();
+                ds->setData("planning_input", ci);
+                ds->setData("environment",
+                    std::shared_ptr<const tesseract_environment::Environment>(env_c));
+                ds->setData("profiles", obs_profiles);
+
+                auto tc_exec = factory.createTaskComposerExecutor("TaskflowExecutor");
+                auto tc_ctx  = std::make_shared<TaskComposerContext>(
+                    tc_task->getName(), std::move(ds));
+                auto fut = tc_exec->run(*tc_task, std::move(tc_ctx));
+                fut->wait();
+
+                if (fut->context->isSuccessful())
+                {
+                    ci = fut->context->data_storage->getData(out_key)
+                             .as<CompositeInstruction>();
+                    CONSOLE_BRIDGE_logDebug(
+                        "[Tracking][Step 9] TrajOpt collision pass applied.");
+                }
+                else
+                {
+                    CONSOLE_BRIDGE_logWarn(
+                        "[Tracking][Step 9] TrajOpt collision pass failed — using Ruckig-only.");
+                }
+            }
+            catch (const std::exception& e)
+            {
+                CONSOLE_BRIDGE_logWarn(
+                    "[Tracking][Step 9] TrajOpt threw: %s — using Ruckig-only.", e.what());
+            }
+        }
+
+        // ── Step 10: Ruckig smoothing ──────────────────────────────────────────
         auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
         auto rp = std::make_shared<RuckigTrajectorySmoothingCompositeProfile>();
         rp->max_duration_extension_factor = 20.0;
@@ -464,34 +573,44 @@ namespace Vinhtesseract_examples
             return false;
         }
 
-        // ── Step 10: convert + update MPC cache ───────────────────────────────
+        // ── Step 11: convert + update MPC cache ───────────────────────────────
         tesseract_common::JointTrajectory trajectory = toJointTrajectory(ci);
         if (trajectory.empty())
         {
-            CONSOLE_BRIDGE_logWarn("[Tracking][Step 10] toJointTrajectory() returned empty.");
+            CONSOLE_BRIDGE_logWarn("[Tracking][Step 11] toJointTrajectory() returned empty.");
             return false;
         }
 
-        const double lookahead =
-            (planner_period_s_ > 0.0) ? (planner_period_s_ + 0.005) : 0.038;
-
-        // Seed for next tick: the lookahead point along the Ruckig-smoothed traj.
-        has_last_tracking_command_  = true;
-        last_tracking_command_      = target_joints;
-        last_tracking_velocity_     = Eigen::VectorXd::Zero(n_dof);
-        last_tracking_acceleration_ = Eigen::VectorXd::Zero(n_dof);
-
+        // Lookahead: seed for next tick — pick point at lookahead time
+        // ✅ FIX Bug 1: commit velocity INSIDE the loop, never pre-zero.
+        //    Fallback to last trajectory point if no lookahead point found.
+        bool found_lookahead = false;
         for (const auto& st : trajectory)
         {
             if (st.time >= lookahead)
             {
-                last_tracking_command_ = st.position;
-                if (static_cast<int>(st.velocity.size()) == n_dof)
-                    last_tracking_velocity_ = st.velocity;
-                if (static_cast<int>(st.acceleration.size()) == n_dof)
-                    last_tracking_acceleration_ = st.acceleration;
+                has_last_tracking_command_  = true;
+                last_tracking_command_      = st.position;
+                last_tracking_velocity_     =
+                    (static_cast<int>(st.velocity.size()) == n_dof)
+                        ? st.velocity : Eigen::VectorXd::Zero(n_dof);
+                last_tracking_acceleration_ =
+                    (static_cast<int>(st.acceleration.size()) == n_dof)
+                        ? st.acceleration : Eigen::VectorXd::Zero(n_dof);
+                found_lookahead = true;
                 break;
             }
+        }
+        if (!found_lookahead)
+        {
+            // Trajectory shorter than lookahead — commit the last point
+            const auto& last_st = trajectory.back();
+            has_last_tracking_command_  = true;
+            last_tracking_command_      = last_st.position;
+            last_tracking_velocity_     =
+                (static_cast<int>(last_st.velocity.size()) == n_dof)
+                    ? last_st.velocity : Eigen::VectorXd::Zero(n_dof);
+            last_tracking_acceleration_ = Eigen::VectorXd::Zero(n_dof);
         }
 
         last_trajectory_ =
@@ -501,8 +620,8 @@ namespace Vinhtesseract_examples
             plotter_->plotTrajectory(trajectory, *env_->getStateSolver());
 
         CONSOLE_BRIDGE_logInform(
-            "[Tracking] OK — %zu pts, %.3f s, |dq|=%.4f w=%.3f λ=%.3f",
-            trajectory.size(), trajectory.back().time, dq.norm(), w, lambda);
+            "[Tracking] OK — %zu pts, %.3f s, lookahead=%.3fs, |dq|=%.4f w=%.3f λ=%.3f",
+            trajectory.size(), trajectory.back().time, lookahead, dq.norm(), w, lambda);
 
         return true;
     }
