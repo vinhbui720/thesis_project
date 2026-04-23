@@ -55,17 +55,32 @@ class JoggingGuiNode(Node):
         self.get_logger().info(f"Speed scale: {self.speed_scale:.2f}")
 
     def _publish_cmd(self) -> None:
+        import math
         msg = Twist()
         lin = self.max_linear_speed * self.speed_scale
         ang = self.max_angular_speed * self.speed_scale
 
-        msg.linear.x = self.pressed["x"] * lin
-        msg.linear.y = self.pressed["y"] * lin
-        msg.linear.z = self.pressed["z"] * lin
+        # Build linear and angular vectors from pressed keys
+        linear_vec = [self.pressed["x"], self.pressed["y"], self.pressed["z"]]
+        angular_vec = [self.pressed["roll"], self.pressed["pitch"], self.pressed["yaw"]]
 
-        msg.angular.x = self.pressed["roll"] * ang
-        msg.angular.y = self.pressed["pitch"] * ang
-        msg.angular.z = self.pressed["yaw"] * ang
+        # Normalize linear vector if needed
+        linear_norm = math.sqrt(sum(v**2 for v in linear_vec))
+        if linear_norm > 1.0:
+            linear_vec = [v / linear_norm for v in linear_vec]
+
+        # Normalize angular vector if needed
+        angular_norm = math.sqrt(sum(v**2 for v in angular_vec))
+        if angular_norm > 1.0:
+            angular_vec = [v / angular_norm for v in angular_vec]
+
+        msg.linear.x = linear_vec[0] * lin
+        msg.linear.y = linear_vec[1] * lin
+        msg.linear.z = linear_vec[2] * lin
+
+        msg.angular.x = angular_vec[0] * ang
+        msg.angular.y = angular_vec[1] * ang
+        msg.angular.z = angular_vec[2] * ang
         self.cmd_pub.publish(msg)
 
 
