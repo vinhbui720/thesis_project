@@ -247,7 +247,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 
     // ---- Publishers ----
     pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
-    pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
+    pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/path_command", 10);
     pub_tracking_stream_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_command", 10);
     pub_tracked_pose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
         "/motomini/tracked_tip_pose", 10);
@@ -315,10 +315,14 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     }
 
     // ---- Execution monitor timer (10 Hz) ----
-    // ---- Execution monitor timer (10 Hz) ----
     monitor_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(100),
         std::bind(&MotoMiniPlanningNode::monitorExecution, this));
+
+    // ---- MPC Tracking Timer ----
+    mpc_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(static_cast<int>(mpc_dt_ * 1000.0)),
+        std::bind(&MotoMiniPlanningNode::mpcTimerCallback, this));
 
     RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready.");
     RCLCPP_INFO(this->get_logger(),

@@ -132,7 +132,17 @@ Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(const Eigen::Vecto
 
 void MotoMiniPlanningNode::mpcTimerCallback()
 {
-    if (!tracking_enabled_ || !target_initialized_) return;
+    if (!tracking_enabled_)
+    {
+        return;
+    }
+    
+    if (!target_initialized_)
+    {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+                             "mpcTimerCallback: skipping, target_initialized_ is false");
+        return;
+    }
 
     auto start_time = this->now();
 
@@ -150,11 +160,20 @@ void MotoMiniPlanningNode::mpcTimerCallback()
     auto qp_problem = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
     const int n_dof = manip_->numJoints();
 
+    // Check if manip is valid
+    if (!manip_)
+    {
+        RCLCPP_ERROR_ONCE(this->get_logger(), "mpcTimerCallback: manip_ is null!");
+        return;
+    }
+
     std::vector<trajopt_ifopt::JointPosition::Ptr> vars;
+    Eigen::MatrixX2d joint_limits = manip_->getLimits().joint_limits;
     for (int k = 0; k < mpc_horizon_n_; ++k)
     {
         auto var = std::make_shared<trajopt_ifopt::JointPosition>(
             horizon_joints_[k], manip_->getJointNames(), "step_" + std::to_string(k));
+        var->SetBounds(joint_limits);
         vars.push_back(var);
         qp_problem->addVariableSet(var);
     }
@@ -189,13 +208,14 @@ void MotoMiniPlanningNode::mpcTimerCallback()
             // Cartesian tracking penalty (k > 0)
             Eigen::Isometry3d P_k = predictTargetPose(k);
             trajopt_ifopt::CartPosInfo cp_info(manip_, ee_link_, base_link_, Eigen::Isometry3d::Identity(), P_k);
-            auto cart_cnt = std::make_shared<trajopt_ifopt::CartPosConstraint>(cp_info, vars[k]);
+            auto cart_cnt = std::make_shared<trajopt_ifopt::CartPosConstraint>(
+                cp_info, vars[k], Eigen::VectorXd::Ones(6) * mpc_w_cart_);
             qp_problem->addCostSet(cart_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
 
             // Joint Velocity smoothing cost
             auto vel_cnt = std::make_shared<trajopt_ifopt::JointVelConstraint>(
                 Eigen::VectorXd::Zero(n_dof), std::vector<trajopt_ifopt::JointPosition::ConstPtr>{vars[k - 1], vars[k]},
-                Eigen::VectorXd::Ones(n_dof));
+                Eigen::VectorXd::Ones(n_dof) * mpc_w_vel_);
             qp_problem->addCostSet(vel_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
 
 
@@ -203,12 +223,8 @@ void MotoMiniPlanningNode::mpcTimerCallback()
 
         if (k > 0 && k < mpc_horizon_n_ - 1)
         {
-            // Joint Acceleration smoothing cost
-            auto acc_cnt = std::make_shared<trajopt_ifopt::JointAccelConstraint>(
-                Eigen::VectorXd::Zero(n_dof),
-                std::vector<trajopt_ifopt::JointPosition::ConstPtr>{vars[k - 1], vars[k], vars[k + 1]},
-                Eigen::VectorXd::Ones(n_dof));
-            qp_problem->addCostSet(acc_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
+            // Joint Acceleration smoothing cost (commented out because it requires 4 variables)
+            // auto acc_cnt = std::make_shared<trajopt_ifopt::JointAccelConstraint>(...);
         }
 
         // Discrete Collision setup
@@ -232,9 +248,71 @@ void MotoMiniPlanningNode::mpcTimerCallback()
     solver.solve(qp_problem);
 
     // ---- Step E: Extract results ----
+    std::vector<Eigen::Vector3d> horizon_path;
     for (int k = 0; k < mpc_horizon_n_; ++k)
     {
         horizon_joints_[k] = vars[k]->GetValues();
+
+        if (pub_ee_path_)
+        {
+            auto fk = manip_->calcFwdKin(horizon_joints_[k]);
+            if (fk.find(ee_link_) != fk.end())
+            {
+                horizon_path.push_back(fk.at(ee_link_).translation());
+            }
+        }
+    }
+
+    if (pub_ee_path_ && !horizon_path.empty())
+    {
+        visualization_msgs::msg::Marker marker;
+        marker.header.frame_id = base_link_;
+        marker.header.stamp = this->now();
+        marker.ns = "mpc_horizon_path";
+        marker.id = 1;
+        marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        marker.action = visualization_msgs::msg::Marker::ADD;
+        marker.scale.x = 0.005;
+        // Orange for the MPC horizon path
+        marker.color.r = 1.0f;
+        marker.color.g = 0.5f;
+        marker.color.b = 0.0f;
+        marker.color.a = 1.0f;
+
+        for (const auto &pt : horizon_path)
+        {
+            geometry_msgs::msg::Point p;
+            p.x = pt.x();
+            p.y = pt.y();
+            p.z = pt.z();
+            marker.points.push_back(p);
+        }
+        pub_ee_path_->publish(marker);
+
+        // Also plot the TARGET prediction path
+        visualization_msgs::msg::Marker target_marker;
+        target_marker.header.frame_id = base_link_;
+        target_marker.header.stamp = this->now();
+        target_marker.ns = "mpc_target_path";
+        target_marker.id = 2;
+        target_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        target_marker.action = visualization_msgs::msg::Marker::ADD;
+        target_marker.scale.x = 0.003;
+        // Cyan for target predictions
+        target_marker.color.r = 0.0f;
+        target_marker.color.g = 1.0f;
+        target_marker.color.b = 1.0f;
+        target_marker.color.a = 1.0f;
+        for (int k = 0; k < mpc_horizon_n_; ++k)
+        {
+            Eigen::Isometry3d P_k = predictTargetPose(k);
+            geometry_msgs::msg::Point p;
+            p.x = P_k.translation().x();
+            p.y = P_k.translation().y();
+            p.z = P_k.translation().z();
+            target_marker.points.push_back(p);
+        }
+        pub_ee_path_->publish(target_marker);
     }
 
     buildAndPublishTrajectory();

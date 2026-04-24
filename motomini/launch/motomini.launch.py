@@ -209,7 +209,8 @@ def generate_launch_description():
             condition=IfCondition(
                 PythonExpression([
                     "'", LaunchConfiguration('debug'), "' == 'true' and '", 
-                    LaunchConfiguration('vel_streaming'), "' == 'false'"
+                    LaunchConfiguration('vel_streaming'), "' == 'true' and '",
+                    LaunchConfiguration('jogging'), "' == 'false'"
                 ])
             )
         ),
