@@ -53,16 +53,30 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<bool>("tracking_obstacle_avoid", false);   // TrajOpt collision avoidance
     this->declare_parameter<double>("tf_poll_rate_hz", 200.0);
     this->declare_parameter<double>("tracking_ema_alpha", 0.6);
+    
+    // MPC Receding Horizon parameters
+    this->declare_parameter<int>("mpc_horizon_n", 10);
+    this->declare_parameter<double>("mpc_dt", 0.02);
+    this->declare_parameter<double>("mpc_w_cart", 10.0);
+    this->declare_parameter<double>("mpc_w_vel", 1.0);
+    this->declare_parameter<double>("mpc_w_acc", 0.5);
+    this->declare_parameter<double>("mpc_d_safe", 0.01);
+    this->declare_parameter<int>("mpc_max_iter", 3);
 
-    tracking_rate_hz_ = this->get_parameter("tracking_rate_hz").as_double();
-    tf_poll_rate_hz_ = this->get_parameter("tf_poll_rate_hz").as_double();
-    tracking_ema_alpha_ = this->get_parameter("tracking_ema_alpha").as_double();
+    mpc_horizon_n_ = this->get_parameter("mpc_horizon_n").as_int();
+    mpc_dt_ = this->get_parameter("mpc_dt").as_double();
+    mpc_w_cart_ = this->get_parameter("mpc_w_cart").as_double();
+    mpc_w_vel_ = this->get_parameter("mpc_w_vel").as_double();
+    mpc_w_acc_ = this->get_parameter("mpc_w_acc").as_double();
+    mpc_d_safe_ = this->get_parameter("mpc_d_safe").as_double();
+    mpc_max_iter_ = this->get_parameter("mpc_max_iter").as_int();
+
     bool online_mode = this->get_parameter("online_mode").as_bool();
     bool debug = this->get_parameter("debug").as_bool();
     bool use_ompl = this->get_parameter("use_ompl").as_bool();
     std::string manipulator_group = this->get_parameter("manipulator_group").as_string();
-    std::string base_link = this->get_parameter("base_link").as_string();
-    std::string ee_link = this->get_parameter("ee_link").as_string();
+    base_link_ = this->get_parameter("base_link").as_string();
+    ee_link_ = this->get_parameter("ee_link").as_string();
     this->get_parameter("robot_description", urdf_xml_);
     this->get_parameter("robot_description_semantic", srdf_xml_);
 
@@ -76,17 +90,24 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     // ---- Planner ----
     planner_ = std::make_shared<MotoMiniPlanning>(
         env_, plotter_,
-        manipulator_group, base_link, ee_link,
+        manipulator_group, base_link_, ee_link_,
         debug, /*ifopt=*/true, use_ompl, online_mode);
-    planner_->configureTracking(
-        this->get_parameter("tracking_use_trajopt").as_bool(),
-        this->get_parameter("tracking_enable_collision").as_bool(),
-        this->get_parameter("tracking_num_steps").as_int(),
-        this->get_parameter("tracking_trajopt_max_iter").as_int(),
-        this->get_parameter("tracking_max_joint_step").as_double(),
-        this->get_parameter("tracking_lookahead_mult").as_double(),
-        this->get_parameter("tracking_obstacle_avoid").as_bool());
-    planner_->setPlannerPeriod(1.0 / std::max(1.0, tracking_rate_hz_));
+
+    // ---- Setup MPC State for Tracking Mode ----
+    manip_ = env_->getKinematicGroup(manipulator_group);
+    if (!manip_)
+    {
+        RCLCPP_WARN(this->get_logger(), "Failed to find KinematicGroup %s", manipulator_group.c_str());
+    }
+    else
+    {
+        int n_dof = manip_->numJoints();
+        horizon_joints_.assign(static_cast<size_t>(mpc_horizon_n_), Eigen::VectorXd::Zero(n_dof));
+        current_joints_ = Eigen::VectorXd::Zero(n_dof);
+    }
+    current_target_pose_ = Eigen::Isometry3d::Identity();
+    target_velocity_linear_.setZero();
+    target_velocity_angular_.setZero();
 
     // ---- Offline chunked planning parameters ----
     this->declare_parameter<int>("planning_chunk_size", 20);
@@ -174,7 +195,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         cfg.ifopt_smooth_vel_enable = this->get_parameter("ifopt_smooth_vel_enable").as_bool();
         cfg.ifopt_smooth_acc_enable = this->get_parameter("ifopt_smooth_acc_enable").as_bool();
         cfg.ifopt_smooth_jerk_enable = this->get_parameter("ifopt_smooth_jerk_enable").as_bool();
-        planner_->configurePlanningParams(cfg);
+
         RCLCPP_INFO(this->get_logger(),
                     "Planning config: mode=%s  ompl=%s  chunk=%d  parallel=%d  "
                     "cart=[%.0f,%.0f,%.0f,%.0f,%.0f,%.0f]  coll_margin=%.3f  eval=%d  lvs=%.4f",
@@ -208,6 +229,10 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         "/target_poses", 10,
         std::bind(&MotoMiniPlanningNode::targetPosesCallback, this, std::placeholders::_1));
 
+    sub_tracking_target_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+        "/tracking_target_pose", 10,
+        std::bind(&MotoMiniPlanningNode::targetPoseCallback, this, std::placeholders::_1));
+
     sub_start_ = this->create_subscription<std_msgs::msg::Bool>(
         "/start", 10,
         std::bind(&MotoMiniPlanningNode::startCallback, this, std::placeholders::_1));
@@ -222,7 +247,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 
     // ---- Publishers ----
     pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
-    pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/path_command", 10);
+    pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
     pub_tracking_stream_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_command", 10);
     pub_tracked_pose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
         "/motomini/tracked_tip_pose", 10);
@@ -255,13 +280,13 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 
         // Toolpath marker: bright green LINE_STRIP of EE positions
         planner_->setToolpathCallback(
-            [this, base_link](const std::vector<Eigen::Vector3d> &path)
+            [this](const std::vector<Eigen::Vector3d> &path)
             {
                 if (path.empty())
                     return;
 
                 visualization_msgs::msg::Marker marker;
-                marker.header.frame_id = base_link;
+                marker.header.frame_id = base_link_;
                 marker.header.stamp = this->now();
                 marker.ns = "online_planner_path";
                 marker.id = 0;
@@ -290,31 +315,10 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     }
 
     // ---- Execution monitor timer (10 Hz) ----
+    // ---- Execution monitor timer (10 Hz) ----
     monitor_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(100),
         std::bind(&MotoMiniPlanningNode::monitorExecution, this));
-
-    // ---- TF listener ----
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
-    // ---- Tracking timer + TF poll thread + Joint state poll thread (always active; mode switched at runtime) ----
-    {
-        const double hz = std::max(0.1, tracking_rate_hz_);
-        const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / hz));
-        tracking_timer_ = this->create_wall_timer(
-            period, std::bind(&MotoMiniPlanningNode::trackingTick, this));
-            
-        tracking_stream_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(20), std::bind(&MotoMiniPlanningNode::trackingStreamTick, this));
-            
-        startTfPolling();
-        startJointStatePolling();
-        RCLCPP_INFO(this->get_logger(),
-                    "Tracking ready: %.0f Hz planner, %.0f Hz TF poll, %.0f Hz joint poll, EMA=%.2f — "
-                    "publish /tracking_control true to activate",
-                    hz, tf_poll_rate_hz_, joint_state_poll_rate_hz_, tracking_ema_alpha_);
-    }
 
     RCLCPP_INFO(this->get_logger(), "MotoMini Planning Node Ready.");
     RCLCPP_INFO(this->get_logger(),
@@ -327,12 +331,10 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 }
 
 // ---------------------------------------------------------------------------
-// Destructor — clean up TF poll thread and joint state poll thread
+// Destructor
 // ---------------------------------------------------------------------------
 MotoMiniPlanningNode::~MotoMiniPlanningNode()
 {
-    stopTfPolling();
-    stopJointStatePolling();
 }
 
 // ---------------------------------------------------------------------------

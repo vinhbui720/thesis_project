@@ -88,3 +88,5 @@ motomini_planning_node:
     ifopt_min_approx_improve: 1.0e-3       # stop if cost improvement < this
     ifopt_min_trust_box_size: 1.0e-5       # stop if trust region shrinks below this
     ifopt_initial_trust_box_size: 0.5      # initial SQP step size
+
+    tracking_num_steps: 2                     # number of steps in the trajectory to track (including start)

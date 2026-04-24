@@ -28,43 +28,6 @@ void MotoMiniPlanningNode::publishStatus(const std::string &status)
 }
 
 // ---------------------------------------------------------------------------
-// publishTrackingTrajectory
-//   Publishes the complete trajectory with all waypoints from start to end.
-//   The motoman controller validates that trajectories start at the current position.
-//   ISP ensures proper velocities and accelerations are included for smooth motion.
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::publishTrackingTrajectory(
-    const tesseract_common::JointTrajectory &tess_traj,
-    const std::vector<std::string> &joint_names)
-{
-    if (tess_traj.empty())
-        return;
-
-    tesseract_common::JointTrajectory forward(tess_traj);
-
-    // === MINIMAL PROCESSING ===
-    // In tracking mode, we DO NOT force the first point to be static, 
-    // because that would constantly stop the robot when tracking updates arrive continuously.
-
-    // Re-base time to start at t=0
-    const double t_offset = forward.front().time;
-    for (auto &state : forward)
-        state.time = std::max(0.0, state.time - t_offset);
-
-    // ✅ Bug 4 Fix: clamp first point to at least one streamer tick (20ms).
-    // A near-zero first interval causes Hermite interpolation velocity spikes
-    // in motomini_traj_streamer because it computes: vel ≈ Δpos / Δt ≈ ∞.
-    static constexpr double MIN_FIRST_DT = 0.020;
-    if (!forward.empty() && forward.front().time < MIN_FIRST_DT)
-        forward.front().time = MIN_FIRST_DT;
-
-    // === CALL STANDARD PUBLISH ===
-    const double start_delay = 0.003; // 3ms delay for publishing overhead
-    const double min_step_dt = 0.001; // 1ms minimum between trajectory points
-    publishTrajectory(forward, joint_names, start_delay, min_step_dt);
-}
-
-// ---------------------------------------------------------------------------
 // publishTrajectory
 //   Maps a Tesseract JointTrajectory onto the six controller joints by name,
 //   enforces a minimum inter-point time spacing, and stamps the message

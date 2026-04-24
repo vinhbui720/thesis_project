@@ -1,287 +1,283 @@
 /**
  * @file motomini_node_tracking.cpp
- * @brief MotoMiniPlanningNode — TF polling + predictive target + tracking tick.
+ * @brief MotoMiniPlanningNode — MPC Receding Horizon Planner tracking mode.
  *
- * v4 additions:
- *   - EMA velocity estimation in tfPollLoop()
- *   - Predictive target (lead-compensated pose) fed to planner
- *   - tip_velocity passed through to runTrackingPlanner for Jacobian FF
+ * Replaces the old DLS tracking with the high-performance micro-NLP solver directly
+ * inside the node per Phase 1-3 requirements.
+ *
+ * @author Bùi Quang Vinh
  */
 
 #include <robot_planning/motomini_planning_node.h>
 
+#include <tesseract_rosutils/utils.h>
+#include <tesseract_kinematics/core/utils.h>
+#include <tesseract_common/joint_state.h>
+#include <tesseract_environment/environment.h>
+
+// TrajOpt SQP formulation
+#include <trajopt_sqp/trajopt_qp_problem.h>
+#include <trajopt_sqp/trust_region_sqp_solver.h>
+#include <trajopt_sqp/osqp_eigen_solver.h>
+#include <trajopt_common/collision_types.h>
+
+// TrajOpt Ifopt constraints and costs
+#include <trajopt_ifopt/variable_sets/joint_position_variable.h>
+#include <trajopt_ifopt/constraints/cartesian_position_constraint.h>
+#include <trajopt_ifopt/constraints/joint_position_constraint.h>
+#include <trajopt_ifopt/constraints/joint_velocity_constraint.h>
+#include <trajopt_ifopt/constraints/joint_acceleration_constraint.h>
+#include <trajopt_ifopt/constraints/collision/discrete_collision_evaluators.h>
+#include <trajopt_ifopt/constraints/collision/discrete_collision_constraint.h>
+#include <trajopt_ifopt/costs/squared_cost.h>
+
+// TF/Math
+#include <tf2/LinearMath/Quaternion.h>
 #include <tf2_eigen/tf2_eigen.hpp>
-#include <tf2/exceptions.hpp>
-#include <geometry_msgs/msg/transform_stamped.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
 
-#include <Eigen/Geometry>
-#include <chrono>
-#include <thread>
+// =========================================================================
+// PHASE 1: ASYNC CALLBACKS
+// =========================================================================
 
-// ---------------------------------------------------------------------------
-// TF polling thread — start / stop
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::startTfPolling()
+void MotoMiniPlanningNode::targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
 {
-    if (tf_poll_running_) return;
-    tf_poll_running_ = true;
-    tf_poll_thread_  = std::thread(&MotoMiniPlanningNode::tfPollLoop, this);
-    RCLCPP_INFO(this->get_logger(), "TF poll thread started (%.0f Hz)", tf_poll_rate_hz_);
+    std::lock_guard<std::mutex> lock(_mpc_target_mutex);
+    
+    Eigen::Isometry3d new_pose;
+    tf2::fromMsg(msg->pose, new_pose);
+
+    if (target_initialized_)
+    {
+        rclcpp::Time current_time(msg->header.stamp);
+        double dt = (current_time - last_target_time_).seconds();
+        
+        if (dt > 1e-4) // Prevent div by zero
+        {
+            // Estimate target velocities via finite differencing
+            target_velocity_linear_ = (new_pose.translation() - current_target_pose_.translation()) / dt;
+            
+            Eigen::AngleAxisd diff(new_pose.linear() * current_target_pose_.linear().inverse());
+            target_velocity_angular_ = diff.axis() * diff.angle() / dt;
+        }
+    }
+    else
+    {
+        target_velocity_linear_.setZero();
+        target_velocity_angular_.setZero();
+        target_initialized_ = true;
+    }
+
+    current_target_pose_ = new_pose;
+    last_target_time_ = msg->header.stamp;
 }
 
-void MotoMiniPlanningNode::stopTfPolling()
-{
-    tf_poll_running_ = false;
-    if (tf_poll_thread_.joinable()) tf_poll_thread_.join();
-}
 
-// ---------------------------------------------------------------------------
-// Joint state polling thread — start / stop
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::startJointStatePolling()
-{
-    if (joint_state_poll_running_) return;
-    joint_state_poll_running_ = true;
-    joint_state_poll_thread_  = std::thread(&MotoMiniPlanningNode::jointStatePollLoop, this);
-    RCLCPP_INFO(this->get_logger(), "Joint state poll thread started (%.0f Hz)",
-                joint_state_poll_rate_hz_);
-}
+// =========================================================================
+// MATH HELPERS
+// =========================================================================
 
-void MotoMiniPlanningNode::stopJointStatePolling()
+Eigen::Isometry3d MotoMiniPlanningNode::predictTargetPose(int step_k)
 {
-    joint_state_poll_running_ = false;
-    if (joint_state_poll_thread_.joinable()) joint_state_poll_thread_.join();
-}
+    // Step B: Target Projection (constant-velocity model)
+    // P_k = P_tgt(t) ⊕ (k · Δt · v_tgt(t))
+    std::lock_guard<std::mutex> lock(_mpc_target_mutex);
+    
+    double lead_time = step_k * mpc_dt_;
+    Eigen::Isometry3d predicted = current_target_pose_;
+    predicted.translation() += target_velocity_linear_ * lead_time;
 
-// ---------------------------------------------------------------------------
-// Thread-safe getters
-// ---------------------------------------------------------------------------
-sensor_msgs::msg::JointState MotoMiniPlanningNode::getLatestJointState() const
-{
-    std::lock_guard<std::mutex> lock(joint_state_poll_mutex_);
-    return latest_polled_joint_state_;
-}
-
-Eigen::Isometry3d MotoMiniPlanningNode::getLatestTipPose() const
-{
-    std::lock_guard<std::mutex> lock(tip_pose_mutex_);
-    return latest_working_tip_world_;
-}
-
-// NEW — lead-compensated predicted pose
-Eigen::Isometry3d MotoMiniPlanningNode::getLatestTipPosePredicted() const
-{
-    std::lock_guard<std::mutex> lock(tip_pose_mutex_);
-    // Lead = one planner period + half a streamer period (IPC latency estimate)
-    const double lead = plan_latency_ + exec_latency_;
-    Eigen::Isometry3d predicted = latest_working_tip_world_;
-    predicted.translation() += tip_velocity_ * lead;
+    // Orientation integration: exp(w * t)
+    double angle = target_velocity_angular_.norm() * lead_time;
+    if (angle > 1e-6)
+    {
+        predicted.linear() =
+            Eigen::AngleAxisd(angle, target_velocity_angular_.normalized()).toRotationMatrix() *
+            current_target_pose_.linear();
+    }
     return predicted;
 }
 
-// NEW — smoothed Cartesian velocity of the gantry tip
-Eigen::Vector3d MotoMiniPlanningNode::getLatestTipVelocity() const
+
+Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(const Eigen::VectorXd& q_last,
+                                                              const Eigen::Isometry3d& target_next)
 {
-    std::lock_guard<std::mutex> lock(tip_pose_mutex_);
-    return tip_vel_initialized_ ? tip_velocity_ : Eigen::Vector3d::Zero();
+    // Extrapolate using Damped Least Squares
+    auto fk = manip_->calcFwdKin(q_last);
+    if (fk.find(ee_link_) == fk.end()) return q_last; // Safe fallback
+
+    Eigen::Isometry3d ee_current = fk.at(ee_link_);
+    Eigen::Vector3d dx = target_next.translation() - ee_current.translation();
+
+    // Axis-angle rotational error
+    Eigen::AngleAxisd aa(target_next.linear() * ee_current.linear().inverse());
+    Eigen::Vector3d dw = aa.axis() * aa.angle();
+
+    Eigen::Matrix<double, 6, 1> twist;
+    twist.head<3>() = dx;
+    twist.tail<3>() = dw;
+
+    Eigen::MatrixXd J = manip_->calcJacobian(q_last, base_link_, ee_link_);
+    
+    const double lambda = 0.01; // Damping
+    Eigen::MatrixXd JJt = J * J.transpose();
+    JJt += (lambda * lambda) * Eigen::MatrixXd::Identity(6, 6);
+    Eigen::VectorXd dq = J.transpose() * JJt.ldlt().solve(twist);
+
+    return q_last + dq;
 }
 
-// ---------------------------------------------------------------------------
-// jointStatePollLoop
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::jointStatePollLoop()
-{
-    const auto period = std::chrono::milliseconds(
-        static_cast<int64_t>(1000.0 / joint_state_poll_rate_hz_));
+// =========================================================================
+// PHASE 2: MPC TIMER CALLBACK (50 Hz)
+// =========================================================================
 
-    while (joint_state_poll_running_ && rclcpp::ok())
+void MotoMiniPlanningNode::mpcTimerCallback()
+{
+    if (!tracking_enabled_ || !target_initialized_) return;
+
+    auto start_time = this->now();
+
+    // ---- Step A: Warm-start shift ----
+    for (int i = 0; i < mpc_horizon_n_ - 1; ++i)
     {
-        if (last_joint_state_)
+        horizon_joints_[i] = horizon_joints_[i + 1];
+    }
+    
+    // Extrapolate final step
+    Eigen::Isometry3d P_N = predictTargetPose(mpc_horizon_n_);
+    horizon_joints_[mpc_horizon_n_ - 1] = computeDlsExtrapolation(horizon_joints_[mpc_horizon_n_ - 2], P_N);
+
+    // ---- Step C: Build micro-NLP ----
+    auto qp_problem = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
+    const int n_dof = manip_->numJoints();
+
+    std::vector<trajopt_ifopt::JointPosition::Ptr> vars;
+    for (int k = 0; k < mpc_horizon_n_; ++k)
+    {
+        auto var = std::make_shared<trajopt_ifopt::JointPosition>(
+            horizon_joints_[k], manip_->getJointNames(), "step_" + std::to_string(k));
+        vars.push_back(var);
+        qp_problem->addVariableSet(var);
+    }
+
+    // Anchor q_0 to current joint states
+    Eigen::VectorXd q_anchor;
+    {
+        std::lock_guard<std::mutex> lock(_mpc_state_mutex);
+        if (current_joints_.size() == n_dof)
+            q_anchor = current_joints_;
+        else
+            q_anchor = horizon_joints_[0]; // Fallback
+    }
+
+    auto q0_bounds = std::vector<ifopt::Bounds>(static_cast<size_t>(n_dof));
+    for (int i = 0; i < n_dof; ++i)
+        q0_bounds[static_cast<size_t>(i)] = ifopt::Bounds(q_anchor[i], q_anchor[i]);
+
+    auto anchor_cnt = std::make_shared<trajopt_ifopt::JointPosConstraint>(
+        q0_bounds, 
+        std::vector<trajopt_ifopt::JointPosition::ConstPtr>{vars[0]},
+        Eigen::VectorXd::Ones(n_dof));
+    qp_problem->addConstraintSet(anchor_cnt);
+
+    const auto v_lim = manip_->getLimits().velocity_limits;
+
+    // Apply Costs and Constraints across horizon
+    for (int k = 0; k < mpc_horizon_n_; ++k)
+    {
+        if (k > 0)
         {
-            std::lock_guard<std::mutex> lock(joint_state_poll_mutex_);
-            latest_polled_joint_state_ = *last_joint_state_;
-            if (!joint_state_poll_initialized_)
-                joint_state_poll_initialized_ = true;
+            // Cartesian tracking penalty (k > 0)
+            Eigen::Isometry3d P_k = predictTargetPose(k);
+            trajopt_ifopt::CartPosInfo cp_info(manip_, ee_link_, base_link_, Eigen::Isometry3d::Identity(), P_k);
+            auto cart_cnt = std::make_shared<trajopt_ifopt::CartPosConstraint>(cp_info, vars[k]);
+            qp_problem->addCostSet(cart_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
+
+            // Joint Velocity smoothing cost
+            auto vel_cnt = std::make_shared<trajopt_ifopt::JointVelConstraint>(
+                Eigen::VectorXd::Zero(n_dof), std::vector<trajopt_ifopt::JointPosition::ConstPtr>{vars[k - 1], vars[k]},
+                Eigen::VectorXd::Ones(n_dof));
+            qp_problem->addCostSet(vel_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
+
+
         }
-        std::this_thread::sleep_for(period);
-    }
-}
 
-// ---------------------------------------------------------------------------
-// tfPollLoop — position EMA + velocity EMA + predictive target
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::tfPollLoop()
-{
-    const auto period = std::chrono::microseconds(
-        static_cast<int64_t>(1e6 / tf_poll_rate_hz_));
-
-    while (tf_poll_running_ && rclcpp::ok())
-    {
-        try
+        if (k > 0 && k < mpc_horizon_n_ - 1)
         {
-            const auto world_to_base = tf_buffer_->lookupTransform(
-                tracking_world_frame_, tracking_gantry_base_frame_, tf2::TimePointZero);
-            const auto base_to_tip = tf_buffer_->lookupTransform(
-                tracking_gantry_base_frame_, tracking_tip_frame_, tf2::TimePointZero);
-
-            const Eigen::Isometry3d T_world_base = tf2::transformToEigen(world_to_base.transform);
-            const Eigen::Isometry3d T_base_tip   = tf2::transformToEigen(base_to_tip.transform);
-            const Eigen::Isometry3d measured      = T_world_base * T_base_tip;
-
-            {
-                std::lock_guard<std::mutex> lock(tip_pose_mutex_);
-
-                if (!tracking_pose_initialized_)
-                {
-                    // Cold start — accept raw measurement directly
-                    latest_working_tip_world_  = measured;
-                    tip_prev_measured_         = measured;
-                    prev_ema_translation_      = measured.translation();  // init EMA velocity basis
-                    tip_prev_time_             = this->now();
-                    tracking_pose_initialized_ = true;
-                    tip_vel_initialized_       = false;
-                    tip_velocity_.setZero();
-                }
-                else
-                {
-                    // ── Position EMA (unchanged) ──────────────────────────────
-                    const double alpha = tracking_ema_alpha_;
-                    latest_working_tip_world_.translation() =
-                        (1.0 - alpha) * latest_working_tip_world_.translation() +
-                               alpha  * measured.translation();
-                    latest_working_tip_world_.linear() = measured.linear();
-
-                    // ── Velocity EMA ──────────────────────────────────────────
-                    // ✅ Bug 3 Fix: finite-diff on EMA-filtered position (not raw)
-                    // so velocity stays phase-aligned with the target fed to planner.
-                    const double dt_tf =
-                        (this->now() - tip_prev_time_).seconds();
-
-                    if (dt_tf > 1e-4 && dt_tf < 0.05)  // skip stale / bogus TF
-                    {
-                        const Eigen::Vector3d raw_vel =
-                            (latest_working_tip_world_.translation() -
-                             prev_ema_translation_) / dt_tf;
-
-                        if (!tip_vel_initialized_)
-                        {
-                            tip_velocity_       = raw_vel;
-                            tip_vel_initialized_ = true;
-                        }
-                        else
-                        {
-                            // Lower alpha than position — derivative is noisier
-                            tip_velocity_ = tf_vel_alpha_ * raw_vel
-                                          + (1.0 - tf_vel_alpha_) * tip_velocity_;
-                        }
-                    }
-
-                    prev_ema_translation_ = latest_working_tip_world_.translation();
-                    tip_prev_measured_ = measured;
-                    tip_prev_time_     = this->now();
-                }
-            }
-
-            // Debug publish
-            if (pub_tracked_pose_)
-            {
-                geometry_msgs::msg::PoseStamped ps;
-                ps.header.stamp    = this->now();
-                ps.header.frame_id = tracking_world_frame_;
-                ps.pose            = tf2::toMsg(measured);
-                pub_tracked_pose_->publish(ps);
-            }
+            // Joint Acceleration smoothing cost
+            auto acc_cnt = std::make_shared<trajopt_ifopt::JointAccelConstraint>(
+                Eigen::VectorXd::Zero(n_dof),
+                std::vector<trajopt_ifopt::JointPosition::ConstPtr>{vars[k - 1], vars[k], vars[k + 1]},
+                Eigen::VectorXd::Ones(n_dof));
+            qp_problem->addCostSet(acc_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
         }
-        catch (const tf2::TransformException &) {}  // TF not ready — retry
 
-        std::this_thread::sleep_for(period);
+        // Discrete Collision setup
+        auto collision_cache = std::make_shared<trajopt_ifopt::CollisionCache>(100ul);
+        trajopt_common::TrajOptCollisionConfig collision_config(mpc_d_safe_, 10.0);
+        auto collision_evaluator = std::make_shared<trajopt_ifopt::SingleTimestepCollisionEvaluator>(
+            collision_cache, manip_, env_, collision_config);
+        auto coll_cnt = std::make_shared<trajopt_ifopt::DiscreteCollisionConstraint>(collision_evaluator, vars[k], 1);
+        qp_problem->addConstraintSet(coll_cnt);
+    }
+
+    qp_problem->setup();
+
+    // ---- Step D: Solve ----
+    auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
+    trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
+    solver.params.max_iterations = mpc_max_iter_;
+    solver.params.initial_trust_box_size = 0.1;
+    solver.params.improve_ratio_threshold = 0.1;
+
+    solver.solve(qp_problem);
+
+    // ---- Step E: Extract results ----
+    for (int k = 0; k < mpc_horizon_n_; ++k)
+    {
+        horizon_joints_[k] = vars[k]->GetValues();
+    }
+
+    buildAndPublishTrajectory();
+
+    auto end_time = this->now();
+    double duration = (end_time - start_time).seconds() * 1000.0;
+    if (duration > 15.0)
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                             "MPC tick took %.2f ms (budget: 15ms)", duration);
     }
 }
 
-// ---------------------------------------------------------------------------
-// trackingTick — planning tick at tracking_rate_hz_
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::trackingTick()
+// =========================================================================
+// PHASE 3: BUILD AND PUBLISH
+// =========================================================================
+
+void MotoMiniPlanningNode::buildAndPublishTrajectory()
 {
-    RCLCPP_DEBUG(this->get_logger(), "[trackingTick] entered.");
+    trajectory_msgs::msg::JointTrajectory msg;
+    msg.header.stamp = this->now();
+    msg.joint_names = manip_->getJointNames();
 
-    if (!last_joint_state_ || last_joint_state_->position.empty())
+    const int n_dof = manip_->numJoints();
+
+    for (int k = 0; k < mpc_horizon_n_; ++k)
     {
-        RCLCPP_DEBUG(this->get_logger(), "[trackingTick] No joint state — skipping.");
-        return;
-    }
-    if (!tracking_enabled_ || !tracking_pose_initialized_)
-    {
-        RCLCPP_DEBUG(this->get_logger(),
-                     "[trackingTick] Guard: enabled=%d pose_init=%d — skipping.",
-                     (int)tracking_enabled_, (int)tracking_pose_initialized_);
-        return;
-    }
+        trajectory_msgs::msg::JointTrajectoryPoint pt;
+        pt.positions.assign(horizon_joints_[k].data(), horizon_joints_[k].data() + n_dof);
+        pt.time_from_start = rclcpp::Duration::from_seconds(k * mpc_dt_);
 
-    const std::vector<std::string> joint_names = {
-        "joint_1_s", "joint_2_l", "joint_3_u",
-        "joint_4_r", "joint_5_b", "joint_6_t"};
+        // Eq 5: Velocity Extraction
+        Eigen::VectorXd vel(n_dof);
+        if (k == 0)
+            vel = (horizon_joints_[1] - horizon_joints_[0]) / mpc_dt_;
+        else if (k == mpc_horizon_n_ - 1)
+            vel = (horizon_joints_[mpc_horizon_n_ - 1] - horizon_joints_[mpc_horizon_n_ - 2]) / mpc_dt_;
+        else
+            vel = (horizon_joints_[k + 1] - horizon_joints_[k - 1]) / (2.0 * mpc_dt_);
 
-    // ── Predicted target (lead-compensated) ───────────────────────────────
-    const Eigen::Isometry3d target   = getLatestTipPosePredicted();  // ← key change
-    const Eigen::Vector3d   tip_vel  = getLatestTipVelocity();       // ← for Jac FF
-
-    // ── HW joint velocities (cold-start fallback only) ────────────────────
-    Eigen::VectorXd hw_vel;
-    {
-        const auto js = getLatestJointState();
-        if (js.velocity.size() == joint_names.size())
-        {
-            hw_vel.resize(static_cast<Eigen::Index>(joint_names.size()));
-            for (size_t i = 0; i < joint_names.size(); ++i)
-            {
-                auto it = std::find(js.name.begin(), js.name.end(), joint_names[i]);
-                hw_vel[static_cast<Eigen::Index>(i)] =
-                    (it != js.name.end())
-                        ? js.velocity[static_cast<size_t>(
-                              std::distance(js.name.begin(), it))]
-                        : 0.0;
-            }
-        }
+        pt.velocities.assign(vel.data(), vel.data() + n_dof);
+        msg.points.push_back(pt);
     }
 
-    // ── Call planner (async — non-blocking) ───────────────────────────────
-    // CAS guard: drop this tick gracefully if previous planning call still running.
-    bool expected = false;
-    if (!tracking_worker_busy_.compare_exchange_strong(expected, true,
-                                                       std::memory_order_acq_rel))
-    {
-        RCLCPP_DEBUG(this->get_logger(),
-                     "[trackingTick] previous planning still running — dropping tick.");
-        return;
-    }
-
-    const std::vector<std::string> traj_joint_names = {
-        "joint_1_s", "joint_2_l", "joint_3_u",
-        "joint_4_r", "joint_5_b", "joint_6_t"};
-
-    tracking_worker_future_ = std::async(
-        std::launch::async,
-        [this, target, tip_vel, hw_vel, traj_joint_names]()
-        {
-            if (planner_->runTrackingPlanner(target, hw_vel, tip_vel))
-            {
-                auto traj_ptr = planner_->getTrajectory();
-                if (traj_ptr && !traj_ptr->empty())
-                    publishTrackingTrajectory(*traj_ptr, traj_joint_names);
-                else
-                    RCLCPP_DEBUG(this->get_logger(), "Tracking: empty trajectory.");
-            }
-            else
-            {
-                RCLCPP_DEBUG(this->get_logger(), "Tracking: planning failed.");
-            }
-            tracking_worker_busy_.store(false, std::memory_order_release);
-        });
+    pub_trajectory_->publish(msg);
 }
-
-// ---------------------------------------------------------------------------
-// trackingStreamTick — no-op (handled by motomini_traj_streamer)
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::trackingStreamTick() {}

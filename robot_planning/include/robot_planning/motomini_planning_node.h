@@ -111,85 +111,45 @@ private:
     // ---- Debug ----
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
-    // ---- Tracking ----
-    bool tracking_enabled_{false};  // runtime switch: true = follow TF, false = planning mode
-    double tracking_rate_hz_{50.0}; // Increased from 30 Hz to 50 Hz for faster replanning cycles
-    std::string tracking_world_frame_{"world"};
-    std::string tracking_gantry_base_frame_{"gantry_base_link"};
-    std::string tracking_tip_frame_{"working_tip"};
+    // ---- MPC Tracking Mode ----
+    bool tracking_enabled_{false}; // runtime switch: true = MPC tracking, false = static
+    tesseract_kinematics::KinematicGroup::ConstPtr manip_;
+    std::vector<Eigen::VectorXd> horizon_joints_; // size N
+    Eigen::VectorXd current_joints_;              // latest from /joint_states
+    Eigen::Isometry3d current_target_pose_;       // latest from TF/topic
+    rclcpp::Time last_target_time_{0, 0, RCL_ROS_TIME};
+    Eigen::Vector3d target_velocity_linear_{0.0, 0.0, 0.0};
+    Eigen::Vector3d target_velocity_angular_{0.0, 0.0, 0.0};
+    bool target_initialized_{false};
+    
+    mutable std::mutex _mpc_state_mutex;
+    mutable std::mutex _mpc_target_mutex;
 
-    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    rclcpp::TimerBase::SharedPtr mpc_timer_; // 50 Hz
 
-    // TF polling thread — fast, continuous pose caching
-    std::thread tf_poll_thread_;
-    std::atomic<bool> tf_poll_running_{false};
-    mutable std::mutex tip_pose_mutex_;
-    Eigen::Isometry3d latest_working_tip_world_{Eigen::Isometry3d::Identity()};
-    bool tracking_pose_initialized_{false};
-    double tf_poll_rate_hz_{200.0};
-    double tracking_ema_alpha_{0.6};
+    // MPC Config
+    int mpc_horizon_n_{10};
+    double mpc_dt_{0.02};
+    double mpc_w_cart_{10.0};
+    double mpc_w_vel_{1.0};
+    double mpc_w_acc_{0.5};
+    double mpc_d_safe_{0.01};
+    int mpc_max_iter_{3};
+    std::string ee_link_{"tool0"};
+    std::string base_link_{"world"};
 
-    // EMA Cartesian velocity of the gantry tip (estimated in tfPollLoop)
-    Eigen::Vector3d   tip_velocity_{0.0, 0.0, 0.0};
-    Eigen::Isometry3d tip_prev_measured_{Eigen::Isometry3d::Identity()};
-    Eigen::Vector3d   prev_ema_translation_{0.0, 0.0, 0.0};  // for EMA-derived velocity
-    rclcpp::Time      tip_prev_time_{0, 0, RCL_ROS_TIME};
-    bool              tip_vel_initialized_{false};
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_tracking_target_;
 
-    // Latency estimates for predictive (lead-compensated) target
-    double tf_vel_alpha_{0.15};   // EMA weight for tip velocity (0.1=smooth, 0.3=responsive)
-    double plan_latency_{0.033};  // one planner period (1/tracking_rate_hz_)
-    double exec_latency_{0.010};  // streamer half-period + IPC estimate
-
-    // Joint state polling thread — fast, continuous joint state caching
-    std::thread joint_state_poll_thread_;
-    std::atomic<bool> joint_state_poll_running_{false};
-    mutable std::mutex joint_state_poll_mutex_;
-    sensor_msgs::msg::JointState latest_polled_joint_state_;
-    bool joint_state_poll_initialized_{false};
-    double joint_state_poll_rate_hz_{100.0}; // 100 Hz polling for responsive joint state
-
-    // Tracking trajectory throttling — prevents controller splicing errors
-    rclcpp::Time last_tracking_publish_time_{0, 0, RCL_ROS_TIME};
-    double tracking_publish_throttle_sec_{0.025}; // Reduced from 0.05s to 0.025s (~40 Hz) for continuous real-time tracking
-    Eigen::Isometry3d last_published_target_{Eigen::Isometry3d::Identity()};
-    double tracking_position_threshold_m_{0.002}; // Reduced from 0.005m to 0.002m (2mm) for very responsive tracking
-
-    // Continuous tracking — detect trajectory completion
-    std::vector<double> last_trajectory_end_state_; // Joint positions at end of last published trajectory
-    double trajectory_completion_tolerance_{0.15};  // Increased from 0.1 to 0.15 rad (~8.6 deg) for relaxed completion detection
-    bool last_trajectory_completed_{true};          // Flag to check if trajectory has been reached
-
-    // Continuous streaming integration
-    std::shared_ptr<tesseract_common::JointTrajectory> cached_tracking_traj_;
-    rclcpp::Time tracking_traj_start_time_{0, 0, RCL_ROS_TIME};
-    double tracking_stream_time_{0.0};
-    void trackingStreamTick();
-
-    // Async tracking planner worker (prevents blocking 30 Hz timer)
-    std::future<void>      tracking_worker_future_;
-    std::atomic<bool>      tracking_worker_busy_{false};
-
-    // ---- Private Methods ----
-
-    // Setup
+    // Private helpers
     bool initializeEnvironment();
 
-    // Tracking (motomini_node_tracking.cpp)
-    void tfPollLoop(); // runs in tf_poll_thread_
-    void startTfPolling();
-    void stopTfPolling();
-    Eigen::Isometry3d getLatestTipPose() const;
-    Eigen::Isometry3d getLatestTipPosePredicted() const;  // lead-compensated
-    Eigen::Vector3d   getLatestTipVelocity() const;
+    // MPC Phase Methods
+    void targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
+    void mpcTimerCallback();
+    Eigen::Isometry3d predictTargetPose(int step_k);
+    Eigen::VectorXd computeDlsExtrapolation(const Eigen::VectorXd& q_last, const Eigen::Isometry3d& target_next);
+    void buildAndPublishTrajectory();
 
-    void jointStatePollLoop(); // runs in joint_state_poll_thread_
-    void startJointStatePolling();
-    void stopJointStatePolling();
-    sensor_msgs::msg::JointState getLatestJointState() const;
-
-    void trackingTick();
 
     // Callbacks (motomini_node_callbacks.cpp)
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
@@ -206,8 +166,6 @@ private:
                            const std::vector<std::string> &joint_names,
                            double start_delay_sec = 0.10,
                            double min_step_dt_sec = 0.02);
-    void publishTrackingTrajectory(const tesseract_common::JointTrajectory &tess_traj,
-                                   const std::vector<std::string> &joint_names);
 
     // Parameter change callback — propagates GUI/service param updates to the planner
     rcl_interfaces::msg::SetParametersResult

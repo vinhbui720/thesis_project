@@ -18,6 +18,7 @@ find_package(console_bridge REQUIRED)
 
 find_package(trajopt_sqp REQUIRED)
 find_package(trajopt_ifopt REQUIRED)
+find_package(OsqpEigen REQUIRED)
 
 find_package(tesseract_environment REQUIRED)
 find_package(tesseract_command_language REQUIRED)
@@ -83,7 +84,6 @@ add_library(
   # Planning library — split into 3 logical units for clarity and scalability:
   src/motomini_planning_base.cpp      # Constructor + shared-state helpers
   src/motomini_planning_run.cpp       # Full offline TrajOpt/OMPL pipeline (run())
-  src/motomini_planning_tracking.cpp  # Lightweight real-time IK tracking
   src/gantry_planning.cpp
 )
 
@@ -95,6 +95,7 @@ target_link_libraries(
   tesseract::tesseract_motion_planners_trajopt_ifopt
   trajopt::trajopt_sqp
   trajopt::trajopt_ifopt
+  OsqpEigen::OsqpEigen
   tesseract::tesseract_task_composer
   tesseract::tesseract_task_composer_planning_nodes
 

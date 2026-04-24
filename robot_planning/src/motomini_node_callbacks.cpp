@@ -30,6 +30,24 @@ void MotoMiniPlanningNode::jointStateCallback(
 {
     last_joint_state_ = msg;
 
+    // Fast capture for MPC anchor
+    {
+        std::lock_guard<std::mutex> lock(_mpc_state_mutex);
+        if (manip_) {
+            const auto& joint_names = manip_->getJointNames();
+            if (current_joints_.size() != static_cast<long>(joint_names.size())) {
+                current_joints_.resize(static_cast<long>(joint_names.size()));
+            }
+            for (size_t i = 0; i < joint_names.size(); ++i) {
+                auto it = std::find(msg->name.begin(), msg->name.end(), joint_names[i]);
+                if (it != msg->name.end()) {
+                    size_t idx = static_cast<size_t>(std::distance(msg->name.begin(), it));
+                    current_joints_[static_cast<std::ptrdiff_t>(i)] = msg->position[idx];
+                }
+            }
+        }
+    }
+
     // Thread-safe environment update for the online SQP solver
     bool online_mode = this->get_parameter("online_mode").as_bool();
     if (is_executing_ && online_mode)
@@ -191,10 +209,10 @@ void MotoMiniPlanningNode::trackingControlCallback(
     tracking_enabled_ = msg->data;
     if (msg->data)
     {
-        // Reset TF pose cache so tracking re-locks onto the current tip position.
+        // Reset target initialization so tracking re-locks onto the current tip position.
         {
-            std::lock_guard<std::mutex> lock(tip_pose_mutex_);
-            tracking_pose_initialized_ = false;
+            std::lock_guard<std::mutex> lock(_mpc_target_mutex);
+            target_initialized_ = false;
         }
         RCLCPP_INFO(this->get_logger(), "Mode → TRACKING");
         publishStatus("Mode: Tracking");
