@@ -2,8 +2,7 @@
  * @file motomini_node_tracking.cpp
  * @brief MotoMiniPlanningNode — MPC Receding Horizon Planner tracking mode.
  *
- * Replaces the old DLS tracking with the high-performance micro-NLP solver directly
- * inside the node per Phase 1-3 requirements.
+ * Optimized for high-frequency (30Hz) execution to feed the trajectory streamer.
  *
  * @author Bùi Quang Vinh
  */
@@ -27,9 +26,36 @@
 #include <trajopt_ifopt/constraints/joint_position_constraint.h>
 #include <trajopt_ifopt/constraints/joint_velocity_constraint.h>
 #include <trajopt_ifopt/constraints/joint_acceleration_constraint.h>
+#include <tesseract_collision/core/types.h>
 #include <trajopt_ifopt/constraints/collision/discrete_collision_evaluators.h>
 #include <trajopt_ifopt/constraints/collision/discrete_collision_constraint.h>
+#include <trajopt_ifopt/constraints/collision/continuous_collision_evaluators.h>
+#include <trajopt_ifopt/constraints/collision/continuous_collision_constraint.h>
 #include <trajopt_ifopt/costs/squared_cost.h>
+
+// Tesseract Planning
+#include <tesseract_command_language/composite_instruction.h>
+#include <tesseract_command_language/joint_waypoint.h>
+#include <tesseract_command_language/state_waypoint.h>
+#include <tesseract_command_language/cartesian_waypoint.h>
+#include <tesseract_command_language/move_instruction.h>
+#include <tesseract_command_language/utils.h>
+#include <tesseract_motion_planners/core/utils.h>
+#include <tesseract_time_parameterization/isp/iterative_spline_parameterization.h>
+#include <tesseract_time_parameterization/core/utils.h>
+#include <tesseract_common/manipulator_info.h>
+#include <tesseract_common/profile_dictionary.h>
+
+#include <tesseract_task_composer/core/task_composer_context.h>
+#include <tesseract_task_composer/core/task_composer_data_storage.h>
+#include <tesseract_task_composer/core/task_composer_node.h>
+#include <tesseract_task_composer/core/task_composer_executor.h>
+#include <tesseract_task_composer/core/task_composer_future.h>
+#include <tesseract_task_composer/core/task_composer_plugin_factory.h>
+
+#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_default_composite_profile.h>
+#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_default_move_profile.h>
+#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_osqp_solver_profile.h>
 
 // TF/Math
 #include <tf2/LinearMath/Quaternion.h>
@@ -51,7 +77,7 @@ void MotoMiniPlanningNode::targetPoseCallback(const geometry_msgs::msg::PoseStam
         rclcpp::Time current_time(msg->header.stamp);
         double dt = (current_time - last_target_time_).seconds();
         
-        if (dt > 1e-4) // Prevent div by zero
+        if (dt > 1e-4)
         {
             // Estimate target velocities via finite differencing
             target_velocity_linear_ = (new_pose.translation() - current_target_pose_.translation()) / dt;
@@ -78,15 +104,12 @@ void MotoMiniPlanningNode::targetPoseCallback(const geometry_msgs::msg::PoseStam
 
 Eigen::Isometry3d MotoMiniPlanningNode::predictTargetPose(int step_k)
 {
-    // Step B: Target Projection (constant-velocity model)
-    // P_k = P_tgt(t) ⊕ (k · Δt · v_tgt(t))
     std::lock_guard<std::mutex> lock(_mpc_target_mutex);
     
     double lead_time = step_k * mpc_dt_;
     Eigen::Isometry3d predicted = current_target_pose_;
     predicted.translation() += target_velocity_linear_ * lead_time;
 
-    // Orientation integration: exp(w * t)
     double angle = target_velocity_angular_.norm() * lead_time;
     if (angle > 1e-6)
     {
@@ -101,14 +124,11 @@ Eigen::Isometry3d MotoMiniPlanningNode::predictTargetPose(int step_k)
 Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(const Eigen::VectorXd& q_last,
                                                               const Eigen::Isometry3d& target_next)
 {
-    // Extrapolate using Damped Least Squares
     auto fk = manip_->calcFwdKin(q_last);
-    if (fk.find(ee_link_) == fk.end()) return q_last; // Safe fallback
+    if (fk.find(ee_link_) == fk.end()) return q_last;
 
     Eigen::Isometry3d ee_current = fk.at(ee_link_);
     Eigen::Vector3d dx = target_next.translation() - ee_current.translation();
-
-    // Axis-angle rotational error
     Eigen::AngleAxisd aa(target_next.linear() * ee_current.linear().inverse());
     Eigen::Vector3d dw = aa.axis() * aa.angle();
 
@@ -117,245 +137,199 @@ Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(const Eigen::Vecto
     twist.tail<3>() = dw;
 
     Eigen::MatrixXd J = manip_->calcJacobian(q_last, base_link_, ee_link_);
-    
-    const double lambda = 0.01; // Damping
+    const double lambda = 0.05; // Slightly higher damping for smoothness
     Eigen::MatrixXd JJt = J * J.transpose();
     JJt += (lambda * lambda) * Eigen::MatrixXd::Identity(6, 6);
     Eigen::VectorXd dq = J.transpose() * JJt.ldlt().solve(twist);
 
-    return q_last + dq;
+    Eigen::VectorXd q_next = q_last + dq;
+    for (int i = 0; i < q_next.size(); ++i)
+        q_next[i] = std::max(joint_limits_(i, 0), std::min(joint_limits_(i, 1), q_next[i]));
+
+    return q_next;
 }
 
 // =========================================================================
-// PHASE 2: MPC TIMER CALLBACK (50 Hz)
+// PHASE 2: MPC TIMER CALLBACK (30 Hz recommended to stay away from streamer 20ms guard)
 // =========================================================================
 
 void MotoMiniPlanningNode::mpcTimerCallback()
 {
-    if (!tracking_enabled_)
-    {
-        return;
-    }
+    if (!tracking_enabled_) return;
     
     if (!target_initialized_)
     {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
-                             "mpcTimerCallback: skipping, target_initialized_ is false");
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "MPC: Waiting for target...");
         return;
     }
 
+    if (!task_factory_ || !task_executor_ || !mpc_task_)
+    {
+        RCLCPP_ERROR_ONCE(this->get_logger(), "TaskComposer components NOT initialized!");
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> env_lock(env_mutex_);
     auto start_time = this->now();
 
-    // ---- Step A: Warm-start shift ----
-    for (int i = 0; i < mpc_horizon_n_ - 1; ++i)
-    {
+    // 1. Warm-start shift
+    int horizon = 5; 
+    for (int i = 0; i < horizon - 1; ++i)
         horizon_joints_[i] = horizon_joints_[i + 1];
-    }
     
-    // Extrapolate final step
-    Eigen::Isometry3d P_N = predictTargetPose(mpc_horizon_n_);
-    horizon_joints_[mpc_horizon_n_ - 1] = computeDlsExtrapolation(horizon_joints_[mpc_horizon_n_ - 2], P_N);
-
-    // ---- Step C: Build micro-NLP ----
-    auto qp_problem = std::make_shared<trajopt_sqp::TrajOptQPProblem>();
-    const int n_dof = manip_->numJoints();
-
-    // Check if manip is valid
-    if (!manip_)
-    {
-        RCLCPP_ERROR_ONCE(this->get_logger(), "mpcTimerCallback: manip_ is null!");
-        return;
-    }
-
-    std::vector<trajopt_ifopt::JointPosition::Ptr> vars;
-    Eigen::MatrixX2d joint_limits = manip_->getLimits().joint_limits;
-    for (int k = 0; k < mpc_horizon_n_; ++k)
-    {
-        auto var = std::make_shared<trajopt_ifopt::JointPosition>(
-            horizon_joints_[k], manip_->getJointNames(), "step_" + std::to_string(k));
-        var->SetBounds(joint_limits);
-        vars.push_back(var);
-        qp_problem->addVariableSet(var);
-    }
-
-    // Anchor q_0 to current joint states
+    const std::vector<std::string> joint_names = manip_->getJointNames();
+    
+    using namespace tesseract_planning;
+    CompositeInstruction ci_prog("DEFAULT", 
+        tesseract_common::ManipulatorInfo(manip_->getName(), base_link_, ee_link_));
+    
+    // 2. Get current joints as anchor
     Eigen::VectorXd q_anchor;
     {
         std::lock_guard<std::mutex> lock(_mpc_state_mutex);
-        if (current_joints_.size() == n_dof)
-            q_anchor = current_joints_;
-        else
-            q_anchor = horizon_joints_[0]; // Fallback
+        q_anchor = current_joints_;
     }
+    if (q_anchor.size() == 0) return;
 
-    auto q0_bounds = std::vector<ifopt::Bounds>(static_cast<size_t>(n_dof));
-    for (int i = 0; i < n_dof; ++i)
-        q0_bounds[static_cast<size_t>(i)] = ifopt::Bounds(q_anchor[i], q_anchor[i]);
+    // Clamp anchor
+    for (int i = 0; i < q_anchor.size(); ++i)
+        q_anchor[i] = std::max(joint_limits_(i, 0), std::min(joint_limits_(i, 1), q_anchor[i]));
 
-    auto anchor_cnt = std::make_shared<trajopt_ifopt::JointPosConstraint>(
-        q0_bounds, 
-        std::vector<trajopt_ifopt::JointPosition::ConstPtr>{vars[0]},
-        Eigen::VectorXd::Ones(n_dof));
-    qp_problem->addConstraintSet(anchor_cnt);
+    ci_prog.push_back(MoveInstruction(StateWaypoint(joint_names, q_anchor), 
+                                      MoveInstructionType::FREESPACE, "FREESPACE"));
 
-    const auto v_lim = manip_->getLimits().velocity_limits;
-
-    // Apply Costs and Constraints across horizon
-    for (int k = 0; k < mpc_horizon_n_; ++k)
+    // 3. Build horizon with CartesianWaypoints for precision
+    for (int k = 1; k <= horizon; ++k)
     {
-        if (k > 0)
+        Eigen::Isometry3d P_k = predictTargetPose(k);
+        const Eigen::VectorXd& seed_prev = (k == 1) ? q_anchor : horizon_joints_[k-2];
+        
+        tesseract_kinematics::KinGroupIKInput ik_in(P_k, base_link_, ee_link_);
+        auto ik_sols = manip_->calcInvKin(ik_in, seed_prev);
+
+        if (!ik_sols.empty())
         {
-            // Cartesian tracking penalty (k > 0)
-            Eigen::Isometry3d P_k = predictTargetPose(k);
-            trajopt_ifopt::CartPosInfo cp_info(manip_, ee_link_, base_link_, Eigen::Isometry3d::Identity(), P_k);
-            auto cart_cnt = std::make_shared<trajopt_ifopt::CartPosConstraint>(
-                cp_info, vars[k], Eigen::VectorXd::Ones(6) * mpc_w_cart_);
-            qp_problem->addCostSet(cart_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
-
-            // Joint Velocity smoothing cost
-            auto vel_cnt = std::make_shared<trajopt_ifopt::JointVelConstraint>(
-                Eigen::VectorXd::Zero(n_dof), std::vector<trajopt_ifopt::JointPosition::ConstPtr>{vars[k - 1], vars[k]},
-                Eigen::VectorXd::Ones(n_dof) * mpc_w_vel_);
-            qp_problem->addCostSet(vel_cnt, trajopt_sqp::CostPenaltyType::SQUARED);
-
-
-        }
-
-        if (k > 0 && k < mpc_horizon_n_ - 1)
-        {
-            // Joint Acceleration smoothing cost (commented out because it requires 4 variables)
-            // auto acc_cnt = std::make_shared<trajopt_ifopt::JointAccelConstraint>(...);
-        }
-
-        // Discrete Collision setup
-        auto collision_cache = std::make_shared<trajopt_ifopt::CollisionCache>(100ul);
-        trajopt_common::TrajOptCollisionConfig collision_config(mpc_d_safe_, 10.0);
-        auto collision_evaluator = std::make_shared<trajopt_ifopt::SingleTimestepCollisionEvaluator>(
-            collision_cache, manip_, env_, collision_config);
-        auto coll_cnt = std::make_shared<trajopt_ifopt::DiscreteCollisionConstraint>(collision_evaluator, vars[k], 1);
-        qp_problem->addConstraintSet(coll_cnt);
-    }
-
-    qp_problem->setup();
-
-    // ---- Step D: Solve ----
-    auto qp_solver = std::make_shared<trajopt_sqp::OSQPEigenSolver>();
-    trajopt_sqp::TrustRegionSQPSolver solver(qp_solver);
-    solver.params.max_iterations = mpc_max_iter_;
-    solver.params.initial_trust_box_size = 0.1;
-    solver.params.improve_ratio_threshold = 0.1;
-
-    solver.solve(qp_problem);
-
-    // ---- Step E: Extract results ----
-    std::vector<Eigen::Vector3d> horizon_path;
-    for (int k = 0; k < mpc_horizon_n_; ++k)
-    {
-        horizon_joints_[k] = vars[k]->GetValues();
-
-        if (pub_ee_path_)
-        {
-            auto fk = manip_->calcFwdKin(horizon_joints_[k]);
-            if (fk.find(ee_link_) != fk.end())
+            double best_d = std::numeric_limits<double>::max();
+            for (const auto& s : ik_sols)
             {
-                horizon_path.push_back(fk.at(ee_link_).translation());
+                double d = (s - seed_prev).squaredNorm();
+                if (d < best_d) { best_d = d; horizon_joints_[k - 1] = s; }
             }
         }
+        else
+            horizon_joints_[k - 1] = computeDlsExtrapolation(seed_prev, P_k);
+
+        for (int i = 0; i < horizon_joints_[k-1].size(); ++i)
+            horizon_joints_[k-1][i] = std::max(joint_limits_(i, 0), std::min(joint_limits_(i, 1), horizon_joints_[k-1][i]));
+
+        ci_prog.push_back(MoveInstruction(CartesianWaypoint(P_k), 
+                                          MoveInstructionType::FREESPACE, "FREESPACE"));
     }
 
-    if (pub_ee_path_ && !horizon_path.empty())
-    {
-        visualization_msgs::msg::Marker marker;
-        marker.header.frame_id = base_link_;
-        marker.header.stamp = this->now();
-        marker.ns = "mpc_horizon_path";
-        marker.id = 1;
-        marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-        marker.action = visualization_msgs::msg::Marker::ADD;
-        marker.scale.x = 0.005;
-        // Orange for the MPC horizon path
-        marker.color.r = 1.0f;
-        marker.color.g = 0.5f;
-        marker.color.b = 0.0f;
-        marker.color.a = 1.0f;
+    // 4. Configure Fast Profiles
+    auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
+    
+    auto trajopt_ifopt_move = std::make_shared<TrajOptIfoptDefaultMoveProfile>();
+    trajopt_ifopt_move->cartesian_cost_config.enabled = true;
+    trajopt_ifopt_move->cartesian_cost_config.coeff = Eigen::VectorXd::Ones(6) * 50.0;
+    trajopt_ifopt_move->joint_cost_config.enabled = true;
+    trajopt_ifopt_move->joint_cost_config.coeff = Eigen::VectorXd::Ones(joint_names.size()) * 0.1;
+    trajopt_ifopt_move->cartesian_constraint_config.enabled = false;
 
-        for (const auto &pt : horizon_path)
-        {
-            geometry_msgs::msg::Point p;
-            p.x = pt.x();
-            p.y = pt.y();
-            p.z = pt.z();
-            marker.points.push_back(p);
-        }
-        pub_ee_path_->publish(marker);
+    auto trajopt_ifopt_composite = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
+    trajopt_ifopt_composite->collision_cost_config.enabled = (mpc_coll_type_ != -1);
+    trajopt_ifopt_composite->collision_cost_config.collision_check_config.type = tesseract_collision::CollisionEvaluatorType::DISCRETE;
+    trajopt_ifopt_composite->collision_cost_config.collision_margin_buffer = 0.01;
+    trajopt_ifopt_composite->smooth_velocities = true;
+    trajopt_ifopt_composite->velocity_coeff = Eigen::VectorXd::Ones(1) * 1.0;
 
-        // Also plot the TARGET prediction path
-        visualization_msgs::msg::Marker target_marker;
-        target_marker.header.frame_id = base_link_;
-        target_marker.header.stamp = this->now();
-        target_marker.ns = "mpc_target_path";
-        target_marker.id = 2;
-        target_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-        target_marker.action = visualization_msgs::msg::Marker::ADD;
-        target_marker.scale.x = 0.003;
-        // Cyan for target predictions
-        target_marker.color.r = 0.0f;
-        target_marker.color.g = 1.0f;
-        target_marker.color.b = 1.0f;
-        target_marker.color.a = 1.0f;
-        for (int k = 0; k < mpc_horizon_n_; ++k)
+    auto trajopt_ifopt_solver = std::make_shared<TrajOptIfoptOSQPSolverProfile>();
+    trajopt_ifopt_solver->opt_params.max_iterations = 3; 
+    trajopt_ifopt_solver->opt_params.initial_trust_box_size = 0.01; 
+    trajopt_ifopt_solver->opt_params.min_approx_improve = 1e-3;
+
+    const std::string NS = "TrajOptIfoptMotionPlannerTask";
+    profiles->addProfile(NS, "FREESPACE", trajopt_ifopt_move);
+    profiles->addProfile(NS, "DEFAULT", trajopt_ifopt_composite);
+    profiles->addProfile(NS, "DEFAULT", trajopt_ifopt_solver);
+
+    // 5. Execute Task
+    std::shared_ptr<const tesseract_environment::Environment> const_env = env_;
+    auto ds = std::make_unique<TaskComposerDataStorage>();
+    ds->setData("planning_input", ci_prog);
+    ds->setData("environment", const_env);
+    ds->setData("profiles", profiles);
+    ds->setData("initial_guess", horizon_joints_);
+
+    auto tc_ctx = std::make_shared<TaskComposerContext>(mpc_task_->getName(), std::move(ds));
+    
+    try {
+        auto fut = task_executor_->run(*mpc_task_, std::move(tc_ctx));
+        if (!fut) return;
+        fut->wait();
+
+        const std::string out_key = mpc_task_->getOutputKeys().get("program");
+        const auto stored = fut->context->data_storage->getData();
+        if (stored.count(out_key) == 0) return;
+
+        auto ci_out = stored.at(out_key).template as<CompositeInstruction>();
+        
+        // Convert to joint positions and extract trajectory
+        tesseract_planning::formatProgram(ci_out, *env_);
+        auto tess_traj = toJointTrajectory(ci_out);
+
+        if (!tess_traj.empty())
         {
-            Eigen::Isometry3d P_k = predictTargetPose(k);
-            geometry_msgs::msg::Point p;
-            p.x = P_k.translation().x();
-            p.y = P_k.translation().y();
-            p.z = P_k.translation().z();
-            target_marker.points.push_back(p);
+            // CRITICAL: Accurate velocities and time stamps for the streamer
+            for (size_t i = 0; i < tess_traj.size(); ++i)
+            {
+                tess_traj[i].time = i * mpc_dt_;
+                if (i > 0)
+                    tess_traj[i].velocity = (tess_traj[i].position - tess_traj[i-1].position) / mpc_dt_;
+                else
+                    tess_traj[i].velocity = Eigen::VectorXd::Zero(tess_traj[i].position.size());
+            }
+
+            for (size_t k = 0; k < std::min((size_t)horizon, tess_traj.size()); ++k)
+                horizon_joints_[k] = tess_traj[k].position;
+
+            // Feed full horizon to streamer on /path_command
+            publishTrajectory(tess_traj, joint_names, 0.0, mpc_dt_);
+            
+            // Visual Marker
+            if (pub_ee_path_)
+            {
+                visualization_msgs::msg::Marker marker;
+                marker.header.frame_id = base_link_;
+                marker.header.stamp = this->now();
+                marker.ns = "mpc_horizon_path";
+                marker.id = 1;
+                marker.type = visualization_msgs::msg::Marker::LINE_STRIP; marker.action = visualization_msgs::msg::Marker::ADD;
+                marker.scale.x = 0.005;
+                marker.color.r = 1.0f; marker.color.g = 1.0f; marker.color.b = 0.0f; marker.color.a = 1.0f;
+                for (const auto& state : tess_traj)
+                {
+                    auto fk = manip_->calcFwdKin(state.position);
+                    if (fk.count(ee_link_) > 0)
+                    {
+                        geometry_msgs::msg::Point p;
+                        p.x = fk.at(ee_link_).translation().x();
+                        p.y = fk.at(ee_link_).translation().y();
+                        p.z = fk.at(ee_link_).translation().z();
+                        marker.points.push_back(p);
+                    }
+                }
+                pub_ee_path_->publish(marker);
+            }
         }
-        pub_ee_path_->publish(target_marker);
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "MPC Pipeline Error: %s", e.what());
     }
-
-    buildAndPublishTrajectory();
 
     auto end_time = this->now();
     double duration = (end_time - start_time).seconds() * 1000.0;
-    if (duration > 15.0)
-    {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                             "MPC tick took %.2f ms (budget: 15ms)", duration);
-    }
+    if (duration > 20.0)
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "MPC tick took %.2f ms (budget: 20ms)", duration);
 }
 
-// =========================================================================
-// PHASE 3: BUILD AND PUBLISH
-// =========================================================================
-
-void MotoMiniPlanningNode::buildAndPublishTrajectory()
-{
-    trajectory_msgs::msg::JointTrajectory msg;
-    msg.header.stamp = this->now();
-    msg.joint_names = manip_->getJointNames();
-
-    const int n_dof = manip_->numJoints();
-
-    for (int k = 0; k < mpc_horizon_n_; ++k)
-    {
-        trajectory_msgs::msg::JointTrajectoryPoint pt;
-        pt.positions.assign(horizon_joints_[k].data(), horizon_joints_[k].data() + n_dof);
-        pt.time_from_start = rclcpp::Duration::from_seconds(k * mpc_dt_);
-
-        // Eq 5: Velocity Extraction
-        Eigen::VectorXd vel(n_dof);
-        if (k == 0)
-            vel = (horizon_joints_[1] - horizon_joints_[0]) / mpc_dt_;
-        else if (k == mpc_horizon_n_ - 1)
-            vel = (horizon_joints_[mpc_horizon_n_ - 1] - horizon_joints_[mpc_horizon_n_ - 2]) / mpc_dt_;
-        else
-            vel = (horizon_joints_[k + 1] - horizon_joints_[k - 1]) / (2.0 * mpc_dt_);
-
-        pt.velocities.assign(vel.data(), vel.data() + n_dof);
-        msg.points.push_back(pt);
-    }
-
-    pub_trajectory_->publish(msg);
-}
+void MotoMiniPlanningNode::buildAndPublishTrajectory() {}

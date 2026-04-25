@@ -36,7 +36,7 @@ class ROS2Publisher(Node):
         self.tracking_frame_id = cfg.get("ros2_publisher", {}).get("tracking_frame_id", "tracking_task")
 
         # ── Publishers ────────────────────────────────────────────────────
-        self._pub_pose     = self.create_publisher(PoseStamped,    '/object/pose',            10)
+        self._pub_pose     = self.create_publisher(PoseStamped,    '/tracking_target_pose',            10)
         self._pub_vel      = self.create_publisher(TwistStamped,   '/object/velocity',        10)
         self._pub_status   = self.create_publisher(String,          '/object/tracking_status', 10)
         self._pub_active   = self.create_publisher(Bool,            '/object/tracking_active', 10)
@@ -150,21 +150,40 @@ class ROS2Publisher(Node):
 
         quat = self._rot_to_quat(R)
 
+        # ── Apply default transformation ──────────────────────────────────
+        # Define a default transformation matrix
+        default_transform = np.eye(4, dtype=np.float64)
+        default_transform[:3, :3] = np.array([[1, 0, 0],
+                              [0, 1, 0],
+                              [0, 0, 1]], dtype=np.float64)  # Identity rotation
+        default_transform[:3, 3] = np.array([0.0, 0.0, -0.1], dtype=np.float64)  # Default translation
+
+        # Define a homogeneous transformation matrix for the pose
+        homogeneous_matrix = np.eye(4, dtype=np.float64)
+        homogeneous_matrix[:3, :3] = R
+        homogeneous_matrix[:3, 3] = t
+
+        # Apply the default transformation
+        transformed_matrix = default_transform @ homogeneous_matrix
+        transformed_position = transformed_matrix[:3, 3]
+        transformed_rotation = transformed_matrix[:3, :3]
+        transformed_quat = self._rot_to_quat(transformed_rotation)
+        # transformed_position[2] = -transformed_position[2]
         # ── Publish PoseStamped ───────────────────────────────────────────
         ps = PoseStamped()
         ps.header.stamp    = stamp
         ps.header.frame_id = self.frame_id
-        ps.pose.position.x = float(t[0])
-        ps.pose.position.y = float(t[1])
-        ps.pose.position.z = float(t[2])
-        ps.pose.orientation.x = float(quat[0])
-        ps.pose.orientation.y = float(quat[1])
-        ps.pose.orientation.z = float(quat[2])
-        ps.pose.orientation.w = float(quat[3])
+        ps.pose.position.x = float(transformed_position[0])
+        ps.pose.position.y = float(transformed_position[1])
+        ps.pose.position.z = float(transformed_position[2])
+        ps.pose.orientation.x = float(transformed_quat[0])
+        ps.pose.orientation.y = float(transformed_quat[1])
+        ps.pose.orientation.z = float(transformed_quat[2])
+        ps.pose.orientation.w = float(transformed_quat[3])
         self._pub_pose.publish(ps)
         
         # ── Publish TF Transform ──────────────────────────────────────────
-        self._publish_transform(stamp, t, quat)
+        self._publish_transform(stamp, transformed_position, transformed_quat)
 
         # ── Publish TwistStamped (linear velocity only) ───────────────────
         velocity = data.get("velocity", None)

@@ -145,6 +145,7 @@ namespace Vinhtesseract_examples
 
         void setToolpathCallback(ToolpathCallback cb);
         void setChunkReadyCallback(ChunkReadyCallback cb) { chunk_ready_cb_ = std::move(cb); }
+        void setEndEffector(const std::string &ee_link) { ee_link_ = ee_link; }
 
         // Lightweight tracking planner (collision check only, no optimization yet).
         // hw_velocity: live joint velocities from /joint_states (6-element vector).

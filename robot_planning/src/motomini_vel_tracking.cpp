@@ -326,6 +326,10 @@ private:
         if (!currentManipulatorJointVector(q))
             return;
 
+        // Snapshot previous command positions before any update so we can
+        // derive a consistent velocity at the end regardless of clamping.
+        const std::vector<double> p_prev = tracked_positions_;
+
         // Compute desired joint velocities from Cartesian cmd_vel.
         // If no cmd_vel is active, hold current position (zero velocity).
         Eigen::VectorXd theta_d(static_cast<Eigen::Index>(joint_names_.size()));
@@ -333,7 +337,11 @@ private:
 
         if (latest_cart_vel_.norm() > 0.0)
         {
-            Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
+            // Feed-forward: compute Jacobian at command position, not actual.
+            // Using q_actual adds one cycle of phase lag; q_cmd is predictive.
+            const Eigen::VectorXd q_cmd = Eigen::Map<const Eigen::VectorXd>(
+                tracked_positions_.data(), static_cast<Eigen::Index>(tracked_positions_.size()));
+            Eigen::MatrixXd J = manip_->calcJacobian(q_cmd, base_link_, ee_link_);
             double w = std::sqrt(std::max(0.0, (J * J.transpose()).determinant()));
             theta_d = calcSrInverse(J, w, w0_, k0_) * latest_cart_vel_;
 
@@ -356,24 +364,26 @@ private:
         for (size_t i = 0; i < joint_names_.size(); ++i)
             tracked_positions_[i] += theta_d[static_cast<Eigen::Index>(i)] * dt_;
 
-        // Latency safety: clamp lead against actual position.
+        // Lead guard: clamp command ahead of actual to prevent buffer runaway.
         for (size_t i = 0; i < joint_names_.size(); ++i)
         {
             double actual = q[static_cast<Eigen::Index>(i)];
             double lead = tracked_positions_[i] - actual;
             if (std::abs(lead) > MAX_LEAD_RAD)
-            {
                 tracked_positions_[i] = actual + std::copysign(MAX_LEAD_RAD, lead);
-                // Recompute velocity to reflect clamped position.
-                theta_d[static_cast<Eigen::Index>(i)] =
-                    (tracked_positions_[i] - (actual - std::copysign(MAX_LEAD_RAD, lead))) / dt_;
-            }
         }
+
+        // Derive velocity as the exact derivative of the position path:
+        //   v_k = (p_k - p_{k-1}) / dt
+        // This guarantees position-velocity consistency for the controller's
+        // cubic interpolator even when the lead guard clamps the position.
+        std::vector<double> velocities(joint_names_.size());
+        for (size_t i = 0; i < joint_names_.size(); ++i)
+            velocities[i] = (tracked_positions_[i] - p_prev[i]) / dt_;
 
         // Advance stream time (strictly monotonic).
         stream_time_ += dt_;
 
-        std::vector<double> velocities(theta_d.data(), theta_d.data() + theta_d.size());
         publishStreamPoint(tracked_positions_, velocities, stream_time_);
     }
 
@@ -412,7 +422,12 @@ private:
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<MotoMiniVelTrackingNode>());
+    // StaticSingleThreadedExecutor drains subscriptions before firing the
+    // timer, so joint_states are always fresh when doStream() runs.
+    rclcpp::executors::StaticSingleThreadedExecutor exec;
+    auto node = std::make_shared<MotoMiniVelTrackingNode>();
+    exec.add_node(node);
+    exec.spin();
     rclcpp::shutdown();
     return 0;
 }

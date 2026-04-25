@@ -208,7 +208,7 @@ def generate_launch_description():
             # Evaluates to True only if debug is 'true' AND vel_streaming is 'false'
             condition=IfCondition(
                 PythonExpression([
-                    "'", LaunchConfiguration('debug'), "' == 'true' and '", 
+                    "'", 
                     LaunchConfiguration('vel_streaming'), "' == 'true' and '",
                     LaunchConfiguration('jogging'), "' == 'false'"
                 ])
@@ -225,7 +225,7 @@ def generate_launch_description():
             executable='command_node',
             name='command_node',
             output='screen',
-            condition=UnlessCondition(debug)
+            # condition=UnlessCondition(debug)
         )
     ]
 

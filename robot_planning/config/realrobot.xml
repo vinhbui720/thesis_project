@@ -1,0 +1,128 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<root>
+ <tabbed_widget name="Main Window" parent="main_window">
+  <Tab containers="1" tab_name="tab1">
+   <Container>
+    <DockSplitter orientation="-" count="2" sizes="0.501119;0.498881">
+     <DockArea name="...">
+      <plot flip_x="false" flip_y="false" line_width="1.0" mode="TimeSeries">
+       <range left="127.224477" top="1034145235.200000" bottom="-903136777.200000" right="138.047529"/>
+       <limitY/>
+       <curve name="/joint_command/header/stamp/sec" color="#9467bd"/>
+       <curve name="/joint_command/header/stamp/nanosec" color="#f14cc1"/>
+       <curve name="/joint_command/points[0]/time_from_start/nanosec" color="#17becf"/>
+       <curve name="diff time " color="#1f77b4"/>
+      </plot>
+     </DockArea>
+     <DockSplitter orientation="|" count="2" sizes="0.5;0.5">
+      <DockArea name="...">
+       <plot flip_x="false" flip_y="false" line_width="1.0" mode="TimeSeries">
+        <range left="127.224477" top="-0.507492" bottom="-0.507501" right="138.047529"/>
+        <limitY/>
+        <curve name="/joint_command/points[0]/positions[0]" color="#17becf"/>
+        <curve name="/joint_command/points[0]/positions[1]" color="#bcbd22"/>
+        <curve name="/joint_command/points[0]/positions[2]" color="#1f77b4"/>
+        <curve name="/joint_command/points[0]/positions[3]" color="#d62728"/>
+        <curve name="/joint_command/points[0]/positions[4]" color="#1ac938"/>
+        <curve name="/joint_command/points[0]/positions[5]" color="#ff7f0e"/>
+        <curve name="/motomini_joint_states/joint_1_s/position" color="#d62728"/>
+        <curve name="/motomini_joint_states/joint_2_l/position" color="#1f77b4"/>
+        <curve name="/motomini_joint_states/joint_3_u/position" color="#d62728"/>
+        <curve name="/motomini_joint_states/joint_4_r/position" color="#1ac938"/>
+        <curve name="/motomini_joint_states/joint_5_b/position" color="#ff7f0e"/>
+        <curve name="/motomini_joint_states/joint_6_t/position" color="#f14cc1"/>
+       </plot>
+      </DockArea>
+      <DockArea name="...">
+       <plot flip_x="false" flip_y="false" line_width="1.0" mode="TimeSeries">
+        <range left="127.224477" top="0.100000" bottom="-0.100000" right="138.047529"/>
+        <limitY/>
+        <curve name="/joint_command/points[0]/velocities[0]" color="#1f77b4"/>
+        <curve name="/joint_command/points[0]/velocities[1]" color="#d62728"/>
+        <curve name="/joint_command/points[0]/velocities[2]" color="#1ac938"/>
+        <curve name="/joint_command/points[0]/velocities[3]" color="#ff7f0e"/>
+        <curve name="/joint_command/points[0]/velocities[4]" color="#f14cc1"/>
+        <curve name="/joint_command/points[0]/velocities[5]" color="#9467bd"/>
+        <curve name="/motomini_joint_states/joint_1_s/velocity" color="#1ac938"/>
+        <curve name="/motomini_joint_states/joint_2_l/velocity" color="#ff7f0e"/>
+        <curve name="/motomini_joint_states/joint_3_u/velocity" color="#f14cc1"/>
+        <curve name="/motomini_joint_states/joint_4_r/velocity" color="#9467bd"/>
+        <curve name="/motomini_joint_states/joint_5_b/velocity" color="#17becf"/>
+        <curve name="/motomini_joint_states/joint_6_t/velocity" color="#bcbd22"/>
+       </plot>
+      </DockArea>
+     </DockSplitter>
+    </DockSplitter>
+   </Container>
+  </Tab>
+  <Tab containers="1" tab_name="tab2">
+   <Container>
+    <DockSplitter orientation="-" count="1" sizes="1">
+     <DockArea name="...">
+      <plot flip_x="false" flip_y="false" line_width="1.0" mode="XYPlot">
+       <range left="-291144879.767264" top="1009408396.300000" bottom="-19642100.300000" right="1287040186.767264"/>
+       <limitY/>
+       <curve curve_y="/joint_command/points[0]/time_from_start/nanosec" name="/joint_command/[header/stamp/nanosec;points[0]/time_from_start/nanosec]" color="#bcbd22" curve_x="/joint_command/header/stamp/nanosec"/>
+      </plot>
+     </DockArea>
+    </DockSplitter>
+   </Container>
+  </Tab>
+  <currentTabIndex index="0"/>
+ </tabbed_widget>
+ <use_relative_time_offset enabled="1"/>
+ <!-- - - - - - - - - - - - - - - -->
+ <!-- - - - - - - - - - - - - - - -->
+ <Plugins>
+  <plugin ID="DataLoad CSV">
+   <parameters delimiter="0" time_axis=""/>
+  </plugin>
+  <plugin ID="DataLoad MCAP"/>
+  <plugin ID="DataLoad ROS2 bags">
+   <use_header_stamp value="false"/>
+   <discard_large_arrays value="true"/>
+   <max_array_size value="100"/>
+   <boolean_strings_to_number value="true"/>
+   <remove_suffix_from_strings value="true"/>
+   <selected_topics value=""/>
+  </plugin>
+  <plugin ID="DataLoad ULog"/>
+  <plugin ID="MQTT Subscriber (Mosquitto)"/>
+  <plugin ID="ROS2 Topic Subscriber">
+   <use_header_stamp value="false"/>
+   <discard_large_arrays value="true"/>
+   <max_array_size value="100"/>
+   <boolean_strings_to_number value="true"/>
+   <remove_suffix_from_strings value="true"/>
+   <selected_topics value="/joint_command;/path_command;/motomini_joint_states"/>
+  </plugin>
+  <plugin ID="UDP Server"/>
+  <plugin ID="WebSocket Server"/>
+  <plugin ID="ZMQ Subscriber"/>
+  <plugin ID="Fast Fourier Transform"/>
+  <plugin ID="Quaternion to RPY"/>
+  <plugin ID="Reactive Script Editor">
+   <library code="--[[ Helper function to create a series from arrays&#xa;&#xa; new_series: a series previously created with ScatterXY.new(name)&#xa; prefix:     prefix of the timeseries, before the index of the array&#xa; suffix_X:   suffix to complete the name of the series containing the X value. If [nil], use the index of the array.&#xa; suffix_Y:   suffix to complete the name of the series containing the Y value&#xa; timestamp:   usually the tracker_time variable&#xa;              &#xa; Example:&#xa; &#xa; Assuming we have multiple series in the form:&#xa; &#xa;   /trajectory/node.{X}/position/x&#xa;   /trajectory/node.{X}/position/y&#xa;   &#xa; where {N} is the index of the array (integer). We can create a reactive series from the array with:&#xa; &#xa;   new_series = ScatterXY.new(&quot;my_trajectory&quot;) &#xa;   CreateSeriesFromArray( new_series, &quot;/trajectory/node&quot;, &quot;position/x&quot;, &quot;position/y&quot;, tracker_time );&#xa;--]]&#xa;&#xa;function CreateSeriesFromArray( new_series, prefix, suffix_X, suffix_Y, timestamp )&#xa;  &#xa;  --- clear previous values&#xa;  new_series:clear()&#xa;  &#xa;  --- Append points to new_series&#xa;  index = 0&#xa;  while(true) do&#xa;&#xa;    x = index;&#xa;    -- if not nil, get the X coordinate from a series&#xa;    if suffix_X ~= nil then &#xa;      series_x = TimeseriesView.find( string.format( &quot;%s.%d/%s&quot;, prefix, index, suffix_X) )&#xa;      if series_x == nil then break end&#xa;      x = series_x:atTime(timestamp)&#x9; &#xa;    end&#xa;    &#xa;    series_y = TimeseriesView.find( string.format( &quot;%s.%d/%s&quot;, prefix, index, suffix_Y) )&#xa;    if series_y == nil then break end &#xa;    y = series_y:atTime(timestamp)&#xa;    &#xa;    new_series:push_back(x,y)&#xa;    index = index+1&#xa;  end&#xa;end&#xa;&#xa;--[[ Similar to the built-in function GetSeriesNames(), but select only the names with a give prefix. --]]&#xa;&#xa;function GetSeriesNamesByPrefix(prefix)&#xa;  -- GetSeriesNames(9 is a built-in function&#xa;  all_names = GetSeriesNames()&#xa;  filtered_names = {}&#xa;  for i, name in ipairs(all_names)  do&#xa;    -- check the prefix&#xa;    if name:find(prefix, 1, #prefix) then&#xa;      table.insert(filtered_names, name);&#xa;    end&#xa;  end&#xa;  return filtered_names&#xa;end&#xa;&#xa;--[[ Modify an existing series, applying offsets to all their X and Y values&#xa;&#xa; series: an existing timeseries, obtained with TimeseriesView.find(name)&#xa; delta_x: offset to apply to each x value&#xa; delta_y: offset to apply to each y value &#xa;  &#xa;--]]&#xa;&#xa;function ApplyOffsetInPlace(series, delta_x, delta_y)&#xa;  -- use C++ indices, not Lua indices&#xa;  for index=0, series:size()-1 do&#xa;    x,y = series:at(index)&#xa;    series:set(index, x + delta_x, y + delta_y)&#xa;  end&#xa;end&#xa;"/>
+   <scripts/>
+  </plugin>
+  <plugin ID="CSV Exporter"/>
+  <plugin ID="ROS2 Topic Re-Publisher"/>
+ </Plugins>
+ <!-- - - - - - - - - - - - - - - -->
+ <previouslyLoaded_Datafiles/>
+ <previouslyLoaded_Streamer name="ROS2 Topic Subscriber"/>
+ <!-- - - - - - - - - - - - - - - -->
+ <customMathEquations>
+  <snippet name="diff time ">
+   <global></global>
+   <function>return value-v1</function>
+   <linked_source>/joint_command/header/stamp/nanosec</linked_source>
+   <additional_sources>
+    <v1>/joint_command/points[0]/time_from_start/nanosec</v1>
+   </additional_sources>
+  </snippet>
+ </customMathEquations>
+ <snippets/>
+ <!-- - - - - - - - - - - - - - - -->
+</root>
+

@@ -89,4 +89,15 @@ motomini_planning_node:
     ifopt_min_trust_box_size: 1.0e-5       # stop if trust region shrinks below this
     ifopt_initial_trust_box_size: 0.5      # initial SQP step size
 
-    tracking_num_steps: 2                     # number of steps in the trajectory to track (including start)
+    # ===========================================================================
+    #  MPC TRACKING PARAMETERS
+    # ===========================================================================
+    tracking_horizon: 5                   # number of horizon steps
+    tracking_dt: 0.02                      # MPC time step (seconds)
+    tracking_w_cart: 10.0                  # Cartesian tracking weight
+    tracking_w_vel: 1.0                    # Velocity smoothing weight
+    tracking_w_acc: 0.5                    # Acceleration smoothing weight
+    tracking_d_safe: 0.01                  # Collision safety margin (meters)
+    # 0 = DISCRETE, 1 = CONTINUOUS, 2 = LVS_CONTINUOUS
+    tracking_coll_type: 0
+    tracking_max_iter: 3                   # Max SQP iterations per tick

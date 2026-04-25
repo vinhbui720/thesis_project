@@ -2,28 +2,24 @@
  * @file motomini_traj_streamer.cpp
  * @brief Motomini trajectory streamer — MPC-aware trajectory executor.
  *
- * Design rationale (v3):
+ * Design rationale (v5):
  * ─────────────────────────────────────────────────────────────────────────────
- *  The upstream planner (motomini_planning_tracking.cpp) is an MPC loop that:
- *   - Re-plans from the CURRENT robot state every tick
- *   - Publishes a short trajectory (5 waypoints, ~100–300 ms horizon)
+ *  Dual-mode architecture. The worker thread decides mode on each new trajectory:
  *
- *  Therefore the streamer MUST:
- *   1. Always execute the trajectory starting from t=0 (the planner already
- *      seeds from current state, so point[0] ≈ robot's actual position).
- *   2. Replace the active trajectory immediately when a new one arrives.
- *   3. On replace, do a SHORT Hermite velocity-blend (≈ 1–2 control ticks)
- *      just to avoid a velocity discontinuity — NOT a long geometric blend.
- *   4. If no new trajectory arrives before the current one ends, HOLD the
- *      last waypoint (do not extrapolate).
+ *  Mode A — FAITHFUL (header.frame_id == "new_path" OR first trajectory):
+ *    Dense Hermite resampling only. No filtering. Geometric integrity preserved.
+ *    RT thread starts from t=0 of the new trajectory.
  *
- *  Key corrections vs v2:
- *   - traj_start_time_ resets to NOW every time a new trajectory is accepted
- *     (correct for MPC: each new plan is relative to now).
- *   - Splice is always at index 0 (the planner sends "start = current state").
- *   - blend_dur_ is very short (1–2 ticks = 20–40 ms). Long blends caused
- *     the streamer to be perpetually blending, never tracking.
- *   - Debounce still guards against same-millisecond republishes.
+ *  Mode B — SPLICE (continuous MPC re-plans):
+ *    1. Dense Hermite resampling.
+ *    2. Full FIR Gaussian filter (removes MPC numeric chatter).
+ *    3. Find merge index i_match (closest cache point to committed state).
+ *    4. Hermite bridge: (snap_pos, snap_vel) → cache[i_match+hw].
+ *       Guarantees vel[i_match] == snap_vel — zero velocity discontinuity.
+ *    5. RT thread starts reading from i_match (the bridge entry).
+ *
+ *  RT thread (doStream) is a pure O(1) cache lookup — no clamping, no
+ *  integrator, no blending. All smoothing is offline in the worker.
  *
  * @author Bùi Quang Vinh
  */
@@ -61,24 +57,33 @@
 #define JOINT_6_T_LOWER_LIMIT_RAD (-360.0 * M_PI / 180.0)
 
 #define SAFETY_JOINT_PADDING_RAD (5.0 * M_PI / 180.0)
-#define MAX_LEAD_RAD 0.10 // max commanded-vs-actual gap tolerated
 
 // Minimum interval between accepted trajectories (prevents same-ms spam)
 static constexpr double MIN_TRAJ_UPDATE_INTERVAL_S = 0.02; // 20 ms
 
+// Sigmoid handover window for Mode B (±ticks around splice point)
+static constexpr int SPLICE_HALF_WINDOW = 4; // ±4 ticks = 80 ms at 50 Hz
+
 // ============================================================================
 // Data Structures
 // ============================================================================
+
+// Processing mode selected by the worker thread per incoming trajectory.
+//   FAITHFUL — single/fresh path: Hermite resample only, no filtering, no blend.
+//   SPLICE   — MPC continuous mode: sigmoid handover + full FIR filter.
+enum class ProcessingMode { FAITHFUL, SPLICE };
 
 struct ProcessedCache {
     std::vector<std::array<double, 6>> pos;
     std::vector<std::array<double, 6>> vel;
     std::vector<double>                time;
 
-    double   t_splice     {0.0};
-    double   dt           {0.02};
-    bool     dense_filled {false};
-    rclcpp::Time created_at;
+    double         t_splice     {0.0};
+    double         dt           {0.02};
+    bool           dense_filled {false};
+    bool           skip_blend   {false}; // Mode A: RT thread skips Hermite blend
+    ProcessingMode mode         {ProcessingMode::SPLICE};
+    rclcpp::Time   created_at;
 };
 
 /**
@@ -114,17 +119,13 @@ public:
     MotoMiniTrajStreamer() : rclcpp::Node("motomini_traj_streamer")
     {
         this->declare_parameter<double>("rate_hz", 50.0);
-        this->declare_parameter<int>("blend_ticks", 1);
         this->declare_parameter<double>("splice_w_pos", 1.0);
         this->declare_parameter<double>("splice_w_vel", 0.5);
-        this->declare_parameter<int>("prep_ticks", 4);
 
         rate_hz_ = this->get_parameter("rate_hz").as_double();
         dt_ = 1.0 / std::max(1.0, rate_hz_);
-        blend_dur_ = dt_ * std::max(1, static_cast<int>(this->get_parameter("blend_ticks").as_int()));
         splice_w_pos_ = this->get_parameter("splice_w_pos").as_double();
         splice_w_vel_ = this->get_parameter("splice_w_vel").as_double();
-        prep_ticks_   = std::max(0, static_cast<int>(this->get_parameter("prep_ticks").as_int()));
 
         joint_names_ = {"joint_1_s", "joint_2_l", "joint_3_u",
                         "joint_4_r", "joint_5_b", "joint_6_t"};
@@ -161,8 +162,8 @@ public:
             period_ns, std::bind(&MotoMiniTrajStreamer::tick, this));
 
         RCLCPP_INFO(this->get_logger(),
-                    "Traj Streamer thread-safe ready (%.0f Hz, dt=%.3fs, blend_dur=%.3fs)",
-                    rate_hz_, dt_, blend_dur_);
+                    "Traj Streamer ready (%.0f Hz, dt=%.3fs, splice_window=%d ticks)",
+                    rate_hz_, dt_, SPLICE_HALF_WINDOW);
     }
 
 private:
@@ -173,13 +174,6 @@ private:
         STATE_STREAMING,
         STATE_STOPPED
     };
-    enum BlendState
-    {
-        BLEND_IDLE,
-        BLEND_ACTIVE
-    };
-
-
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
         std::lock_guard<std::mutex> lock(sensor_state_mutex_);
@@ -234,13 +228,23 @@ private:
 
     void processTrajectory(const trajectory_msgs::msg::JointTrajectory::SharedPtr msg)
     {
+        // ── Mode Detection ────────────────────────────────────────────────────
+        // Mode A (FAITHFUL): first trajectory ever, OR planner signals "new_path"
+        //   via header.frame_id. Hermite resample only — no FIR, no sigmoid.
+        // Mode B (SPLICE): rapid MPC re-plans. Sigmoid handover at splice ±4
+        //   ticks + full FIR to remove numeric chatter.
+        auto existing = std::atomic_load_explicit(&active_cache_, std::memory_order_acquire);
+        const bool is_faithful = (msg->header.frame_id == "new_path") || (!existing);
+
+        // ── Snap committed state ──────────────────────────────────────────────
         std::vector<double> snap_pos, snap_vel;
         {
             std::lock_guard<std::mutex> lock(splice_state_mutex_);
             snap_pos = committed_pos_;
             snap_vel = committed_vel_;
         }
-        
+
+        // ── Joint index mapping ───────────────────────────────────────────────
         std::vector<int> src_idx(n_joints_, -1);
         for (size_t i = 0; i < n_joints_; ++i) {
             auto it = std::find(msg->joint_names.begin(), msg->joint_names.end(), joint_names_[i]);
@@ -248,141 +252,180 @@ private:
                 src_idx[i] = static_cast<int>(std::distance(msg->joint_names.begin(), it));
         }
 
+        // ── Splice Point (Mode B only; Mode A always t_splice = 0) ───────────
         double t_splice = 0.0;
-        double min_cost = std::numeric_limits<double>::max();
-        double min_splice_time = 2.0 * dt_; 
-
-        if (!snap_pos.empty() && !snap_vel.empty()) {
+        if (!is_faithful && !snap_pos.empty() && !snap_vel.empty()) {
+            double min_cost = std::numeric_limits<double>::max();
+            const double min_splice_time = 2.0 * dt_;
             for (const auto &pt : msg->points) {
-                double t_k = rclcpp::Duration(pt.time_from_start).seconds();
+                const double t_k = rclcpp::Duration(pt.time_from_start).seconds();
                 if (t_k < min_splice_time) continue;
-
-                double cost_pos = 0.0;
-                double cost_vel = 0.0;
+                double cost_pos = 0.0, cost_vel = 0.0;
                 for (size_t i = 0; i < n_joints_; ++i) {
                     int s = src_idx[i];
                     if (s < 0) continue;
                     if (static_cast<size_t>(s) < pt.positions.size()) {
-                        double d_pos = pt.positions[static_cast<size_t>(s)] - snap_pos[i];
-                        cost_pos += d_pos * d_pos;
+                        double d = pt.positions[static_cast<size_t>(s)] - snap_pos[i];
+                        cost_pos += d * d;
                     }
                     if (static_cast<size_t>(s) < pt.velocities.size()) {
-                        double d_vel = pt.velocities[static_cast<size_t>(s)] - snap_vel[i];
-                        cost_vel += d_vel * d_vel;
+                        double d = pt.velocities[static_cast<size_t>(s)] - snap_vel[i];
+                        cost_vel += d * d;
                     }
                 }
-                double J = splice_w_pos_ * cost_pos + splice_w_vel_ * cost_vel;
-                if (J < min_cost) {
-                    min_cost = J;
-                    t_splice = t_k;
-                }
+                const double J = splice_w_pos_ * cost_pos + splice_w_vel_ * cost_vel;
+                if (J < min_cost) { min_cost = J; t_splice = t_k; }
             }
+            const double t_end = rclcpp::Duration(msg->points.back().time_from_start).seconds();
+            t_splice = std::clamp(t_splice, 0.0, t_end * 0.5);
         }
 
-        const double t_end_msg = rclcpp::Duration(msg->points.back().time_from_start).seconds();
-        t_splice = std::clamp(t_splice, 0.0, t_end_msg * 0.5);
-
-        // Map into dense cache
+        // ── Build cache header ────────────────────────────────────────────────
         auto cache = std::make_shared<ProcessedCache>();
-        cache->t_splice = t_splice;
-        cache->dt = dt_;
+        cache->t_splice   = t_splice;
+        cache->dt         = dt_;
         cache->created_at = this->now();
+        cache->mode       = is_faithful ? ProcessingMode::FAITHFUL : ProcessingMode::SPLICE;
+        cache->skip_blend = is_faithful;
 
-        size_t n_pts = msg->points.size();
+        // ── Raw data extraction ───────────────────────────────────────────────
+        const size_t n_pts = msg->points.size();
         std::vector<std::array<double, 6>> raw_pos(n_pts);
         std::vector<std::array<double, 6>> raw_vel(n_pts);
-        std::vector<double> raw_time(n_pts);
+        std::vector<double>                raw_time(n_pts);
 
         for (size_t k = 0; k < n_pts; ++k) {
             raw_time[k] = rclcpp::Duration(msg->points[k].time_from_start).seconds();
             for (size_t i = 0; i < n_joints_; ++i) {
-                int s = src_idx[i];
-                if (s >= 0 && static_cast<size_t>(s) < msg->points[k].positions.size())
-                    raw_pos[k][i] = msg->points[k].positions[s];
-                else
-                    raw_pos[k][i] = (k == 0) ? snap_pos[i] : raw_pos[k-1][i];
-
-                // If explicit velocity is missing, default to 0.0 BUT note it so we can recompute via central difference
-                if (s >= 0 && static_cast<size_t>(s) < msg->points[k].velocities.size() && !msg->points[k].velocities.empty())
-                    raw_vel[k][i] = msg->points[k].velocities[s];
-                else
-                    raw_vel[k][i] = 0.0;
+                const int s = src_idx[i];
+                raw_pos[k][i] = (s >= 0 && static_cast<size_t>(s) < msg->points[k].positions.size())
+                    ? msg->points[k].positions[static_cast<size_t>(s)]
+                    : ((k == 0) ? snap_pos[i] : raw_pos[k - 1][i]);
+                raw_vel[k][i] = (s >= 0 && !msg->points[k].velocities.empty()
+                                 && static_cast<size_t>(s) < msg->points[k].velocities.size())
+                    ? msg->points[k].velocities[static_cast<size_t>(s)]
+                    : 0.0;
             }
         }
-
-        // Handle missing velocities numerically (boundary safe)
+        // Fill missing velocities via finite differences
         for (size_t i = 0; i < n_joints_; ++i) {
-            int s = src_idx[i];
+            const int s = src_idx[i];
             for (size_t k = 0; k < n_pts; ++k) {
-                if (msg->points[k].velocities.empty() || s < 0 || static_cast<size_t>(s) >= msg->points[k].velocities.size()) { // If missing
+                if (msg->points[k].velocities.empty() || s < 0 ||
+                    static_cast<size_t>(s) >= msg->points[k].velocities.size()) {
                     if (k == 0 && n_pts > 1)
-                        raw_vel[k][i] = (raw_pos[1][i] - raw_pos[0][i]) / std::max(1e-9, raw_time[1] - raw_time[0]);
+                        raw_vel[k][i] = (raw_pos[1][i] - raw_pos[0][i]) /
+                                        std::max(1e-9, raw_time[1] - raw_time[0]);
                     else if (k == n_pts - 1 && n_pts > 1)
-                        raw_vel[k][i] = (raw_pos[k][i] - raw_pos[k-1][i]) / std::max(1e-9, raw_time[k] - raw_time[k-1]);
+                        raw_vel[k][i] = (raw_pos[k][i] - raw_pos[k-1][i]) /
+                                        std::max(1e-9, raw_time[k] - raw_time[k-1]);
                     else if (k > 0 && k < n_pts - 1)
-                        raw_vel[k][i] = (raw_pos[k+1][i] - raw_pos[k-1][i]) / std::max(1e-9, raw_time[k+1] - raw_time[k-1]);
+                        raw_vel[k][i] = (raw_pos[k+1][i] - raw_pos[k-1][i]) /
+                                        std::max(1e-9, raw_time[k+1] - raw_time[k-1]);
                 }
             }
         }
 
-        // Rate Adaptation: Resample to dt_
-        double total_time = raw_time.back();
-        size_t dense_n = static_cast<size_t>(std::ceil(total_time / dt_)) + 1;
+        // ── Dense Hermite Resampling (both modes) ─────────────────────────────
+        const double total_time = raw_time.back();
+        const size_t dense_n = static_cast<size_t>(std::ceil(total_time / dt_)) + 1;
         cache->pos.resize(dense_n);
         cache->vel.resize(dense_n);
         cache->time.resize(dense_n);
 
         size_t raw_idx = 0;
         for (size_t i = 0; i < dense_n; ++i) {
-            double t = i * dt_;
+            const double t = i * dt_;
             cache->time[i] = t;
+            while (raw_idx + 1 < n_pts - 1 && raw_time[raw_idx + 1] < t) raw_idx++;
 
-            while (raw_idx + 1 < n_pts - 1 && raw_time[raw_idx + 1] < t) {
-                raw_idx++;
-            }
-
-            double t0 = raw_time[raw_idx];
-            double t1 = raw_time[std::min(raw_idx + 1, n_pts - 1)];
-            double T = std::max(1e-9, t1 - t0);
-            
+            const double t0 = raw_time[raw_idx];
+            const double t1 = raw_time[std::min(raw_idx + 1, n_pts - 1)];
+            const double T  = std::max(1e-9, t1 - t0);
             for (size_t j = 0; j < n_joints_; ++j) {
                 HermiteBlend h;
                 h.p0 = raw_pos[raw_idx][j];
                 h.v0 = raw_vel[raw_idx][j];
                 h.p1 = raw_pos[std::min(raw_idx + 1, n_pts - 1)][j];
                 h.v1 = raw_vel[std::min(raw_idx + 1, n_pts - 1)][j];
-                h.T = T;
-                
+                h.T  = T;
                 cache->pos[i][j] = h.pos(t - t0);
                 cache->vel[i][j] = h.vel(t - t0);
             }
         }
         cache->dense_filled = true;
 
-        // Gaussian pre-splice shape
-        size_t i_splice = static_cast<size_t>(t_splice / dt_);
-        if (i_splice >= static_cast<size_t>(prep_ticks_) && cache->pos.size() > 3) {
-            int start = std::max(2, static_cast<int>(i_splice) - prep_ticks_);
-            int end = std::min(static_cast<int>(cache->pos.size() - 3), static_cast<int>(i_splice));
-            
-            double w[5] = {0.0625, 0.25, 0.375, 0.25, 0.0625};
-            auto pos_copy = cache->pos;
+        // ── Mode B Post-Processing ────────────────────────────────────────────
+        if (!is_faithful) {
+            const int n = static_cast<int>(cache->pos.size());
 
-            for (int k = start; k <= end; ++k) {
-                for (size_t j = 0; j < n_joints_; ++j) {
-                    double smoothed = 0.0;
-                    for (int o = -2; o <= 2; ++o) {
-                        smoothed += w[o+2] * pos_copy[k + o][j];
+            // Step 1 — Full FIR Gaussian filter: removes MPC numeric noise from the
+            // resampled trajectory before we compute the merge waypoints.
+            if (n > 4) {
+                static const double w[5] = {0.0625, 0.25, 0.375, 0.25, 0.0625};
+                auto pos_copy = cache->pos;
+                for (int k = 2; k < n - 2; ++k) {
+                    for (size_t j = 0; j < n_joints_; ++j) {
+                        double s = 0.0;
+                        for (int o = -2; o <= 2; ++o)
+                            s += w[o + 2] * pos_copy[k + o][j];
+                        cache->pos[k][j] = s;
                     }
-                    cache->pos[k][j] = smoothed;
+                }
+                for (int k = 1; k < n - 1; ++k) {
+                    for (size_t j = 0; j < n_joints_; ++j)
+                        cache->vel[k][j] = (cache->pos[k + 1][j] - cache->pos[k - 1][j]) / (2.0 * dt_);
                 }
             }
-            // Recompute velocity after smoothing
-            for (int k = start; k <= end; ++k) {
+
+            // Step 2 — Find merge index: point in the FIR-smoothed cache closest to the
+            // committed state. This is where the robot currently "is" in the new plan.
+            size_t i_match = 0;
+            {
+                double min_d = std::numeric_limits<double>::max();
+                for (size_t k = 0; k < cache->pos.size(); ++k) {
+                    double d = 0.0;
+                    for (size_t j = 0; j < n_joints_; ++j) {
+                        const double dd = cache->pos[k][j] - snap_pos[j];
+                        d += dd * dd;
+                    }
+                    if (d < min_d) { min_d = d; i_match = k; }
+                }
+            }
+
+            // Step 3 — Hermite bridge: overwrite cache[i_match .. i_match+hw] with a
+            // cubic curve that starts at (snap_pos, snap_vel) and lands on the
+            // FIR-smoothed trajectory hw ticks later.
+            // This guarantees:  vel[i_match] == snap_vel  (zero velocity discontinuity).
+            const int hw = SPLICE_HALF_WINDOW;
+            const size_t i_end = std::min(i_match + static_cast<size_t>(hw),
+                                          cache->pos.size() - 1);
+            if (i_end > i_match && !snap_pos.empty()) {
+                const double T_bridge = static_cast<double>(i_end - i_match) * dt_;
                 for (size_t j = 0; j < n_joints_; ++j) {
-                    cache->vel[k][j] = (cache->pos[k+1][j] - cache->pos[k-1][j]) / (2.0 * dt_);
+                    HermiteBlend h;
+                    h.p0 = snap_pos[j];
+                    h.v0 = snap_vel[j];
+                    h.p1 = cache->pos[i_end][j];
+                    h.v1 = cache->vel[i_end][j];
+                    h.T  = T_bridge;
+                    for (size_t k = i_match; k <= i_end; ++k) {
+                        const double t_local = static_cast<double>(k - i_match) * dt_;
+                        cache->pos[k][j] = h.pos(t_local);
+                        cache->vel[k][j] = h.vel(t_local);
+                    }
                 }
             }
+
+            // Step 4 — Advance splice time so the RT thread starts reading at i_match
+            // (the bridge entry point = robot's current position).
+            cache->t_splice = static_cast<double>(i_match) * dt_;
+
+            RCLCPP_DEBUG(this->get_logger(),
+                "Mode B: i_match=%zu t_splice=%.3fs bridge→i_end=%zu", i_match, cache->t_splice, i_end);
+        } else {
+            RCLCPP_DEBUG(this->get_logger(),
+                "Mode A: faithful, %zu dense pts, no filtering", dense_n);
         }
 
         std::atomic_store_explicit(&active_cache_, cache, std::memory_order_release);
@@ -397,9 +440,8 @@ private:
         }
         
         state_.store(STATE_WAIT_JOINT);
-        blend_state_.store(BLEND_IDLE);
         tracked_pos_.clear();
-        
+
         {
             std::lock_guard<std::mutex> lock(sensor_state_mutex_);
             est_vel_.assign(n_joints_, 0.0);
@@ -423,7 +465,6 @@ private:
         }
 
         state_.store(STATE_STOPPED);
-        blend_state_.store(BLEND_IDLE);
         std::atomic_store_explicit(&active_cache_, std::shared_ptr<ProcessedCache>(nullptr), std::memory_order_release);
 
         if (!tracked_pos_.empty())
@@ -490,171 +531,56 @@ private:
         pub_stream_->publish(traj);
     }
 
+    // RT thread: pure O(1) cache lookup — no clamping, no integrator.
+    // All smoothing is pre-computed offline by the worker thread.
     void doStream()
     {
-        std::vector<double> target_pos = tracked_pos_;
-        std::vector<double> target_vel(n_joints_, 0.0);
-
         auto cache = std::atomic_load_explicit(&active_cache_, std::memory_order_acquire);
 
-        // Detect new cache
+        // New cache arrived — align stream clock to the bridge entry point
         if (cache && cache->created_at != current_cache_time_) {
             current_cache_time_ = cache->created_at;
-            
-            double d_sq = 0.0;
-            if (cache->pos.size() > 0) {
-                // To check jump distance against splice point
-                size_t i_splice = static_cast<size_t>(cache->t_splice / cache->dt);
-                i_splice = std::min(i_splice, cache->pos.size() - 1);
-                for (size_t i = 0; i < n_joints_; ++i) {
-                    double d = cache->pos[i_splice][i] - tracked_pos_[i];
-                    d_sq += d * d;
-                }
-            }
-
-            if (d_sq > 0.0001) { // 10 mrad sq
-                hermite_.resize(n_joints_);
-                size_t i_splice = static_cast<size_t>(cache->t_splice / cache->dt);
-                i_splice = std::min(i_splice, cache->pos.size() - 1);
-
-                std::vector<double> local_est_vel;
-                {
-                    std::lock_guard<std::mutex> lock(sensor_state_mutex_);
-                    local_est_vel = est_vel_;
-                }
-
-                for (size_t i = 0; i < n_joints_; ++i) {
-                    hermite_[i].p0 = tracked_pos_[i];
-                    hermite_[i].v0 = local_est_vel[i];
-                    hermite_[i].p1 = cache->pos[i_splice][i];
-                    hermite_[i].v1 = cache->vel[i_splice][i];
-                    hermite_[i].T = blend_dur_;
-                }
-                blend_state_.store(BLEND_ACTIVE);
-                blend_start_time_ = this->now();
-            } else {
-                blend_state_.store(BLEND_IDLE);
-            }
             traj_start_time_ = this->now() - rclcpp::Duration::from_seconds(cache->t_splice);
+            RCLCPP_INFO(this->get_logger(), "[RT] Cache swap: %s | pts=%zu t_splice=%.3fs",
+                cache->mode == ProcessingMode::FAITHFUL ? "Mode-A" : "Mode-B",
+                cache->pos.size(), cache->t_splice);
         }
 
-        if (blend_state_.load() == BLEND_ACTIVE)
-        {
-            const double be = (this->now() - blend_start_time_).seconds();
-            if (be >= blend_dur_)
-            {
-                blend_state_.store(BLEND_IDLE);
-                if (cache && cache->pos.size() > 0) {
-                    double min_d = std::numeric_limits<double>::max();
-                    double t_resplice = 0.0;
-                    for (size_t k = 0; k < cache->pos.size(); ++k) {
-                        double d = 0.0;
-                        for(size_t i = 0; i < n_joints_; ++i) {
-                            double dd = cache->pos[k][i] - tracked_pos_[i];
-                            d += dd * dd;
-                        }
-                        if (d < min_d) {
-                            min_d = d;
-                            t_resplice = cache->time[k];
-                        }
-                    }
-                    traj_start_time_ = this->now() - rclcpp::Duration::from_seconds(t_resplice);
-                } else {
-                    traj_start_time_ = this->now();
-                }
-            }
-            else
-            {
-                for (size_t i = 0; i < n_joints_; ++i)
-                {
-                    target_pos[i] = hermite_[i].pos(be);
-                    target_vel[i] = hermite_[i].vel(be);
-                }
-                
-                applyLeadClamp(target_pos, target_vel);
-                if (checkLimits(target_pos))
-                    tracked_pos_ = target_pos;
-                else
-                    target_vel.assign(n_joints_, 0.0);
-                
-                {
-                    std::lock_guard<std::mutex> lock(splice_state_mutex_);
-                    committed_pos_ = tracked_pos_;
-                    committed_vel_ = target_vel;
-                }
-                publishStreamPoint(tracked_pos_, target_vel, (this->now() - stream_epoch_).seconds());
-                return;
-            }
-        }
+        std::vector<double> out_pos = tracked_pos_;
+        std::vector<double> out_vel(n_joints_, 0.0);
 
-        if (cache && cache->pos.size() > 0)
-        {
+        if (cache && cache->dense_filled && !cache->pos.empty()) {
             const double elapsed = (this->now() - traj_start_time_).seconds();
-            if (elapsed >= 0.0) { // Safety bound!
-                if (cache->dense_filled) {
-                    double inv_dt = 1.0 / cache->dt;
-                    size_t idx = static_cast<size_t>(elapsed * inv_dt);
-                    if (idx >= cache->pos.size()) {
-                        auto &last_p = cache->pos.back();
-                        for(size_t i=0; i<n_joints_; ++i) {
-                            target_pos[i] = last_p[i];
-                            target_vel[i] = 0.0;
-                        }
-                    } else {
-                        for(size_t i=0; i<n_joints_; ++i) {
-                            target_pos[i] = cache->pos[idx][i];
-                            target_vel[i] = cache->vel[idx][i];
-                        }
+            if (elapsed >= 0.0) {
+                const size_t idx = static_cast<size_t>(elapsed / cache->dt);
+                if (idx >= cache->pos.size()) {
+                    // End of trajectory — hold last waypoint, zero velocity
+                    for (size_t i = 0; i < n_joints_; ++i) {
+                        out_pos[i] = cache->pos.back()[i];
+                        out_vel[i] = 0.0;
+                    }
+                } else {
+                    for (size_t i = 0; i < n_joints_; ++i) {
+                        out_pos[i] = cache->pos[idx][i];
+                        out_vel[i] = cache->vel[idx][i];
                     }
                 }
             }
         }
 
-        applyLeadClamp(target_pos, target_vel);
-
-        if (!checkLimits(target_pos))
-        {
-            target_vel.assign(n_joints_, 0.0);
-        }
-        else
-        {
-            tracked_pos_ = target_pos;
+        if (!checkLimits(out_pos)) {
+            out_vel.assign(n_joints_, 0.0);
+        } else {
+            tracked_pos_ = out_pos;
         }
 
         {
             std::lock_guard<std::mutex> lock(splice_state_mutex_);
             committed_pos_ = tracked_pos_;
-            committed_vel_ = target_vel;
+            committed_vel_ = out_vel;
         }
 
-        publishStreamPoint(tracked_pos_, target_vel, (this->now() - stream_epoch_).seconds());
-    }
-
-    void applyLeadClamp(std::vector<double> &pos, std::vector<double> &vel)
-    {
-        sensor_msgs::msg::JointState::SharedPtr local_js;
-        {
-            std::lock_guard<std::mutex> lock(sensor_state_mutex_);
-            local_js = last_joint_state_;
-        }
-        
-        if (!local_js)
-            return;
-        for (size_t i = 0; i < n_joints_; ++i)
-        {
-            auto it = std::find(local_js->name.begin(),
-                                local_js->name.end(), joint_names_[i]);
-            if (it == local_js->name.end())
-                continue;
-            const double actual = local_js->position[static_cast<size_t>(std::distance(local_js->name.begin(), it))];
-            const double lead = pos[i] - actual;
-            if (std::abs(lead) > MAX_LEAD_RAD)
-            {
-                const double scale = MAX_LEAD_RAD / std::abs(lead);
-                pos[i] = actual + std::copysign(MAX_LEAD_RAD, lead);
-                vel[i] *= scale;
-            }
-        }
+        publishStreamPoint(tracked_pos_, out_vel, (this->now() - stream_epoch_).seconds());
     }
 
     void tick()
@@ -700,7 +626,7 @@ private:
                 std::lock_guard<std::mutex> lock(sensor_state_mutex_);
                 est_vel_.assign(n_joints_, 0.0);
             }
-            stream_epoch_ = this->now(); 
+            stream_epoch_ = this->now();
             traj_start_time_ = stream_epoch_;
             {
                 std::lock_guard<std::mutex> lock(splice_state_mutex_);
@@ -723,11 +649,9 @@ private:
     size_t n_joints_{6};
     double rate_hz_{50.0};
     double dt_{0.02};
-    double blend_dur_{0.04};                        
-    rclcpp::Time stream_epoch_{0, 0, RCL_ROS_TIME}; 
+    rclcpp::Time stream_epoch_{0, 0, RCL_ROS_TIME};
 
     std::atomic<State> state_{STATE_WAIT_JOINT};
-    std::atomic<BlendState> blend_state_{BLEND_IDLE};
 
     rclcpp::Time arm_entry_time_{0, 0, RCL_ROS_TIME};
     bool arm_trigger_sent_{false};
@@ -739,9 +663,6 @@ private:
 
     rclcpp::Time traj_start_time_{0, 0, RCL_ROS_TIME};
     rclcpp::Time current_cache_time_{0, 0, RCL_ROS_TIME};
-
-    std::vector<HermiteBlend> hermite_;
-    rclcpp::Time blend_start_time_{0, 0, RCL_ROS_TIME};
 
     sensor_msgs::msg::JointState::SharedPtr last_joint_state_;
 
@@ -767,7 +688,6 @@ private:
 
     double splice_w_pos_{1.0};
     double splice_w_vel_{0.5};
-    int prep_ticks_{4};
 };
 
 int main(int argc, char **argv)

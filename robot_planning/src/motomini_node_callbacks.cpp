@@ -214,6 +214,16 @@ void MotoMiniPlanningNode::trackingControlCallback(
             std::lock_guard<std::mutex> lock(_mpc_target_mutex);
             target_initialized_ = false;
         }
+
+        // Initialize MPC horizon with current robot position to avoid jumps
+        {
+            std::lock_guard<std::mutex> lock(_mpc_state_mutex);
+            if (current_joints_.size() > 0) {
+                if (horizon_joints_.size() != static_cast<size_t>(mpc_horizon_n_))
+                    horizon_joints_.resize(static_cast<size_t>(mpc_horizon_n_));
+                for (auto& q : horizon_joints_) q = current_joints_;
+            }
+        }
         RCLCPP_INFO(this->get_logger(), "Mode → TRACKING");
         publishStatus("Mode: Tracking");
     }

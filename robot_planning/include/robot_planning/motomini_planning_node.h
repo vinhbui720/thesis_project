@@ -38,11 +38,30 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
-// Tesseract
+// Tesseract Environment & Viz
 #include <tesseract_environment/environment.h>
 #include <tesseract_monitoring/environment_monitor.h>
 #include <tesseract_visualization/visualization.h>
+
+// Tesseract Command Language
+#include <tesseract_command_language/composite_instruction.h>
+#include <tesseract_command_language/move_instruction.h>
+#include <tesseract_command_language/state_waypoint.h>
+#include <tesseract_command_language/cartesian_waypoint.h>
+#include <tesseract_command_language/joint_waypoint.h>
+#include <tesseract_command_language/utils.h>
+
+// Tesseract Task Composer
+#include <tesseract_task_composer/core/task_composer_node.h>
+#include <tesseract_task_composer/core/task_composer_executor.h>
+#include <tesseract_task_composer/core/task_composer_context.h>
+#include <tesseract_task_composer/core/task_composer_data_storage.h>
+#include <tesseract_task_composer/core/task_composer_future.h>
+#include <tesseract_task_composer/core/task_composer_plugin_factory.h>
+
+// Tesseract Common
 #include <tesseract_common/joint_state.h>
+#include <tesseract_common/profile_dictionary.h>
 
 // Eigen
 #include <Eigen/Geometry>
@@ -55,6 +74,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <shared_mutex>
+
+#include <trajopt_ifopt/constraints/collision/discrete_collision_evaluators.h>
 
 class MotoMiniPlanningNode : public rclcpp::Node
 {
@@ -124,6 +146,13 @@ private:
     
     mutable std::mutex _mpc_state_mutex;
     mutable std::mutex _mpc_target_mutex;
+    mutable std::shared_mutex env_mutex_;
+    std::shared_ptr<trajopt_ifopt::CollisionCache> mpc_collision_cache_;
+
+    // Tesseract Planning Factory
+    std::unique_ptr<tesseract_planning::TaskComposerPluginFactory> task_factory_;
+    std::unique_ptr<tesseract_planning::TaskComposerExecutor> task_executor_;
+    tesseract_planning::TaskComposerNode::UPtr mpc_task_;
 
     rclcpp::TimerBase::SharedPtr mpc_timer_; // 50 Hz
 
@@ -135,8 +164,10 @@ private:
     double mpc_w_acc_{0.5};
     double mpc_d_safe_{0.01};
     int mpc_max_iter_{3};
+    int mpc_coll_type_{0}; // 0 = DISCRETE, 1 = CONTINUOUS
     std::string ee_link_{"tool0"};
     std::string base_link_{"world"};
+    Eigen::MatrixX2d joint_limits_; // [min, max] for each joint
 
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_tracking_target_;
 
@@ -166,6 +197,8 @@ private:
                            const std::vector<std::string> &joint_names,
                            double start_delay_sec = 0.10,
                            double min_step_dt_sec = 0.02);
+    void publishTrackingTrajectory(const tesseract_common::JointTrajectory &tess_traj,
+                                   const std::vector<std::string> &joint_names);
 
     // Parameter change callback — propagates GUI/service param updates to the planner
     rcl_interfaces::msg::SetParametersResult
