@@ -333,9 +333,15 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 
     param_callback_handle_ = this->add_on_set_parameters_callback(
         std::bind(&MotoMiniPlanningNode::onParameterChange, this, std::placeholders::_1));
+
+    // Start the background avoidance worker thread
+    startAvoidanceWorker();
 }
 
-MotoMiniPlanningNode::~MotoMiniPlanningNode() {}
+MotoMiniPlanningNode::~MotoMiniPlanningNode()
+{
+    stopAvoidanceWorker();
+}
 
 void MotoMiniPlanningNode::postInit()
 {
