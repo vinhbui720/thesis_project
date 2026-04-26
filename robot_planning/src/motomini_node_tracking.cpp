@@ -408,172 +408,49 @@ void MotoMiniPlanningNode::mpcTimerCallback()
         {
             const size_t traj_size = tess_traj.size();
 
-            // ===============================================================
-            // FIX 5a — PER-SEGMENT TIMING FROM LIMITING JOINT
-            // Compute how long each TrajOpt segment needs so no joint
-            // ever exceeds v_max.
-            // ===============================================================
-            std::vector<double> seg_dt(traj_size, mpc_dt_);
-            for (size_t i = 1; i < traj_size; ++i)
+            // Assign time + compute velocity
+            for (size_t i = 0; i < traj_size; ++i)
             {
-                Eigen::VectorXd delta = tess_traj[i].position - tess_traj[i - 1].position;
-                double dt_req = mpc_dt_;
-                for (int j = 0; j < delta.size(); ++j)
+                tess_traj[i].time = i * mpc_dt_;
+
+                if (i > 0)
                 {
-                    double t = std::abs(delta[j]) / v_max[j];
-                    if (t > dt_req)
-                        dt_req = t;
-                }
-                seg_dt[i] = dt_req;
-            }
+                    Eigen::VectorXd v =
+                        (tess_traj[i].position - tess_traj[i - 1].position) / mpc_dt_;
 
-            // ===============================================================
-            // FIX 5b & 6 MERGED — QUINTIC SPLINE INTERPOLATION
-            //
-            // Replaces linear interpolation and low-pass filtering.
-            // Calculates central-difference target velocities for the sparse
-            // waypoints, then connects them using 5th-order polynomials.
-            // This guarantees C1 continuity (perfectly smooth velocities)
-            // and bounds acceleration, eliminating mechanical jerk entirely.
-            // ===============================================================
-            const double MAX_RAD_PER_STEP = 0.02;
-
-            // 1. Calculate Target Velocities at Sparse Waypoints
-            std::vector<Eigen::VectorXd> sparse_v(traj_size, Eigen::VectorXd::Zero(n_joints));
-            static Eigen::VectorXd last_commanded_vel = Eigen::VectorXd::Zero(n_joints);
-
-            static Eigen::VectorXd prev_q_anchor;
-
-            Eigen::VectorXd v_anchor;
-
-            if (prev_q_anchor.size() == q_anchor.size())
-            {
-                v_anchor = (q_anchor - prev_q_anchor) / mpc_dt_;
-            }
-            else
-            {
-                v_anchor = Eigen::VectorXd::Zero(q_anchor.size());
-            }
-
-            sparse_v[0] = v_anchor;
-            prev_q_anchor = q_anchor;
-            for (size_t i = 1; i < traj_size - 1; ++i)
-            {
-                sparse_v[i] = (tess_traj[i + 1].position - tess_traj[i - 1].position) / (seg_dt[i] + seg_dt[i + 1]);
-                for (int j = 0; j < n_joints; ++j)
-                    sparse_v[i][j] = std::max(-v_max[j], std::min(v_max[j], sparse_v[i][j]));
-            }
-
-            // Set ending velocity (using backward difference)
-            if (traj_size > 1)
-            {
-                sparse_v[traj_size - 1] = (tess_traj[traj_size - 1].position - tess_traj[traj_size - 2].position) / seg_dt[traj_size - 1];
-                for (int j = 0; j < n_joints; ++j)
-                    sparse_v[traj_size - 1][j] = std::max(-v_max[j], std::min(v_max[j], sparse_v[traj_size - 1][j]));
-            }
-
-            // 2. Generate Dense Spline
-            tesseract_common::JointTrajectory dense_traj;
-            dense_traj.reserve(traj_size * 20);
-
-            {
-                tesseract_common::JointState sp;
-                sp.joint_names = tess_traj.front().joint_names;
-                sp.position = tess_traj.front().position;
-                sp.velocity = sparse_v[0];
-                sp.time = 0.0;
-                dense_traj.push_back(sp);
-            }
-
-            double cumulative_time = 0.0;
-
-            for (size_t i = 1; i < traj_size; ++i)
-            {
-                Eigen::VectorXd delta_q = tess_traj[i].position - tess_traj[i - 1].position;
-                double max_delta = delta_q.lpNorm<Eigen::Infinity>();
-                int num_substeps = std::max(1, static_cast<int>(std::ceil(max_delta / MAX_RAD_PER_STEP)));
-
-                double dt_sub = seg_dt[i] / num_substeps;
-                double T = seg_dt[i];
-                double T2 = T * T;
-                double T3 = T2 * T;
-                double T4 = T3 * T;
-                double T5 = T4 * T;
-
-                for (int step = 1; step <= num_substeps; ++step)
-                {
-                    double t = step * dt_sub;
-                    double t2 = t * t;
-                    double t3 = t2 * t;
-                    double t4 = t3 * t;
-                    double t5 = t4 * t;
-
-                    tesseract_common::JointState pt;
-                    pt.joint_names = tess_traj[i].joint_names;
-                    pt.position = Eigen::VectorXd::Zero(n_joints);
-                    pt.velocity = Eigen::VectorXd::Zero(n_joints);
-
-                    for (int j = 0; j < n_joints; ++j)
+                    // Clamp velocity
+                    for (int j = 0; j < v.size(); ++j)
                     {
-                        double q0 = tess_traj[i - 1].position[j];
-                        double q1 = tess_traj[i].position[j];
-                        double v0 = sparse_v[i - 1][j];
-                        double v1 = sparse_v[i][j];
-
-                        // Quintic Coefficients (assuming a0 = 0, a1 = 0 for maximum smoothness)
-                        double c0 = q0;
-                        double c1 = v0;
-                        double c3 = (20.0 * (q1 - q0) - (8.0 * v1 + 12.0 * v0) * T) / (2.0 * T3);
-                        double c4 = (30.0 * (q0 - q1) + (14.0 * v1 + 16.0 * v0) * T) / (2.0 * T4);
-                        double c5 = (12.0 * (q1 - q0) - 6.0 * (v1 + v0) * T) / (2.0 * T5);
-
-                        pt.position[j] = c0 + c1 * t + c3 * t3 + c4 * t4 + c5 * t5;
-                        pt.velocity[j] = c1 + 3.0 * c3 * t2 + 4.0 * c4 * t3 + 5.0 * c5 * t4;
+                        v[j] = std::max(-v_max[j], std::min(v_max[j], v[j]));
                     }
 
-                    cumulative_time += dt_sub;
-                    pt.time = cumulative_time;
-                    dense_traj.push_back(pt);
+                    tess_traj[i].velocity = v;
                 }
-            }
-
-            // Save the momentum to bridge smoothly to the next MPC tick
-            if (dense_traj.size() > 1)
-            {
-                last_commanded_vel = dense_traj[1].velocity;
-            }
-
-            // ===============================================================
-            // UPDATE WARM-START HORIZON FOR NEXT TICK
-            // ===============================================================
-            size_t anchor_idx = 1;
-            for (size_t k = 1; k < dense_traj.size(); ++k)
-            {
-                if (dense_traj[k].time >= mpc_dt_)
+                else
                 {
-                    anchor_idx = k;
-                    break;
+                    tess_traj[i].velocity = Eigen::VectorXd::Zero(n_joints);
                 }
             }
+
+            // Update warm-start horizon for next tick
+            size_t anchor_idx = std::min<size_t>(1, tess_traj.size() - 1);
+
             for (int k = 0; k < horizon; ++k)
             {
-                size_t grab = std::min(anchor_idx + static_cast<size_t>(k * 2),
-                                       dense_traj.size() - 1);
-                horizon_joints_[k] = dense_traj[grab].position;
+                size_t grab = std::min(anchor_idx + k, tess_traj.size() - 1);
+                horizon_joints_[k] = tess_traj[grab].position;
             }
 
-            // ===============================================================
-            // FIX 7 — SPLICE-TIME CAP
-            // ===============================================================
+            // Publish trajectory
             double solve_elapsed_sec = (this->now() - tick_start_time).seconds();
 
-            if (!dense_traj.empty())
-            {
-                double traj_duration = dense_traj.back().time;
-                solve_elapsed_sec = std::min(solve_elapsed_sec, traj_duration * 0.8);
-            }
+            static double smooth_splice = 0.0;
+            double alpha = 0.2;
 
-            publishTrajectory(dense_traj, joint_names, solve_elapsed_sec, mpc_dt_);
+            smooth_splice = alpha * solve_elapsed_sec + (1 - alpha) * smooth_splice;
+            solve_elapsed_sec = smooth_splice;
+
+            publishTrajectory(tess_traj, joint_names, solve_elapsed_sec, mpc_dt_);
 
             // Visual EE path marker
             if (pub_ee_path_)
@@ -590,7 +467,7 @@ void MotoMiniPlanningNode::mpcTimerCallback()
                 marker.color.g = 1.0f;
                 marker.color.b = 0.0f;
                 marker.color.a = 1.0f;
-                for (const auto &state : dense_traj)
+                for (const auto &state : tess_traj)
                 {
                     auto fk = manip_->calcFwdKin(state.position);
                     if (fk.count(ee_link_) > 0)
