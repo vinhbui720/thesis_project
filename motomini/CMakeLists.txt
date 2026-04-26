@@ -107,12 +107,22 @@ ament_target_dependencies(vel_to_controller
   std_msgs
 )
 
+add_executable(obstacle_simulator src/obstacle_simulator.cpp)
+ament_target_dependencies(obstacle_simulator
+  rclcpp
+  geometry_msgs
+  std_msgs
+  tf2
+  tf2_ros
+)
+
 set(MOTOMINI_TARGETS
   object_controller
   object_tf_broadcaster
   env_tf_broadcaster
   command_node
   vel_to_controller
+  obstacle_simulator
 )
 
 if(TARGET object_pose)

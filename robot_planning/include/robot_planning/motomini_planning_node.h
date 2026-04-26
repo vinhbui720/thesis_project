@@ -6,14 +6,16 @@
  * logical concern lives in its own translation unit:
  *   motomini_node_setup.cpp     — constructor, postInit, env init
  *   motomini_node_callbacks.cpp — ROS subscription callbacks + monitor
- *   motomini_node_tracking.cpp  — Cartesian servo with reactive collision avoidance
+ *   motomini_node_tracking.cpp  — Cartesian servo with QP-CBF collision avoidance
  *   motomini_node_publish.cpp   — trajectory & status publishers
  *   motomini_node_main.cpp      — main()
  *
- * Tracking mode features reactive collision avoidance: a background worker
- * runs TrajOpt with collision costs while the hot path (30 Hz) checks for
- * collisions in the DLS-IK horizon. On detection, control switches to following
- * a pre-computed collision-free path, then returns to DLS tracking when clear.
+ * Tracking mode features QP-CBF (Control Barrier Function) collision avoidance:
+ *   • Single continuous mode: always tracking the target via DLS-IK
+ *   • At 30 Hz, solve QP: min ½‖J q̇ - v_des‖²_W + ½λ‖q̇‖² subject to safety constraints
+ *   • Hard collision avoidance: nᵢᵀ J q̇ ≥ −γ(dᵢ − d_safe) for each near-contact
+ *   • Result: robot curves smoothly around obstacles while tracking target
+ *   • Mathematically rigorous safety, no state machine, no background threads
  *
  * @author Bùi Quang Vinh
  */
@@ -149,7 +151,7 @@ private:
     Eigen::Vector3d target_velocity_linear_{0.0, 0.0, 0.0};
     Eigen::Vector3d target_velocity_angular_{0.0, 0.0, 0.0};
     bool target_initialized_{false};
-    
+
     mutable std::mutex _mpc_state_mutex;
     mutable std::mutex _mpc_target_mutex;
     mutable std::shared_mutex env_mutex_;
@@ -171,57 +173,38 @@ private:
     double mpc_d_safe_{0.01};
     int mpc_max_iter_{3};
     int mpc_coll_type_{0}; // 0 = DISCRETE, 1 = CONTINUOUS
-    std::string ee_link_{"tool0"};
+    std::string ee_link_{"magnetic_link"};
     std::string base_link_{"world"};
     Eigen::MatrixX2d joint_limits_; // [min, max] for each joint
 
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_tracking_target_;
 
-    // ---- Collision Avoidance Worker (background thread) ----
-    enum class ControllerMode : uint8_t
-    {
-        TRACKING            = 0,  // pure DLS-IK Cartesian servoing
-        AVOIDANCE_REQUESTED = 1,  // collision detected, TrajOpt computing
-        AVOIDANCE_EXEC      = 2,  // following pre-computed collision-free path
-    };
-    std::atomic<ControllerMode> mode_{ControllerMode::TRACKING};
+    // ---- DLS Tracking Parameters ----
+    double dls_damping_{0.1};     // Damping factor for DLS-IK (higher = more robust, less precise)
+    double qp_velocity_reg_{0.5}; // Damping/regularization for DLS (replaces QP's λ)
+    size_t qp_fallback_count_{0}; // Track failures for diagnostics (even though we're not using QP anymore)
 
-    // Worker thread and synchronization
-    std::thread                  avoidance_worker_;
-    std::atomic<bool>            avoidance_running_{false};
-
-    // Request side (main loop → worker)
-    std::mutex                   avoidance_request_mutex_;
-    std::condition_variable      avoidance_request_cv_;
-    std::atomic<bool>            avoidance_request_pending_{false};
-    Eigen::VectorXd              avoidance_request_anchor_;
-
-    // Result side (worker → main loop)
-    mutable std::shared_mutex    avoidance_result_mutex_;
-    std::vector<Eigen::VectorXd> avoidance_traj_;
-    std::size_t                  avoidance_idx_{0};
-    rclcpp::Time                 avoidance_traj_stamp_;
-    std::atomic<bool>            avoidance_traj_valid_{false};
-
-    // Avoidance tuning parameters
-    double collision_safety_margin_{0.02};   // [m] inflated link margin
-    int    avoidance_horizon_{10};            // longer than tracking horizon
-    double avoidance_traj_max_age_{1.0};      // [s] before forcing re-plan
+    // Repulsion/Relaxation parameters
+    double repulsion_lookahead_{0.01};
+    double repulsion_safety_{0.02};
+    double repulsion_max_speed_{0.20};
+    double relax_distance_{0.5};
+    double relax_z_min_factor_{0.5};
+    double relax_rot_min_factor_{0.10};
 
     // Private helpers
     bool initializeEnvironment();
-
-    // Avoidance Worker Lifecycle
-    void startAvoidanceWorker();
-    void stopAvoidanceWorker();
 
     // MPC Phase Methods
     void targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
     void mpcTimerCallback();
     Eigen::Isometry3d predictTargetPose(int step_k);
-    Eigen::VectorXd computeDlsExtrapolation(const Eigen::VectorXd& q_last, const Eigen::Isometry3d& target_next);
+    Eigen::VectorXd computeDlsExtrapolation(const Eigen::VectorXd &q_last, const Eigen::Isometry3d &target_next);
+    Eigen::VectorXd solveQpVelocity(const Eigen::VectorXd &q, const Eigen::Isometry3d &target_pose);
+    Eigen::Matrix<double, 6, 1> computeCartesianRepulsion(const Eigen::VectorXd &q,
+                                                          Eigen::Matrix<double, 6, 1> &weight_diag,
+                                                          double &min_dist);
     void buildAndPublishTrajectory();
-
 
     // Callbacks (motomini_node_callbacks.cpp)
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
@@ -240,14 +223,6 @@ private:
                            double min_step_dt_sec = 0.02);
     void publishTrackingTrajectory(const tesseract_common::JointTrajectory &tess_traj,
                                    const std::vector<std::string> &joint_names);
-
-    // Avoidance worker helpers (motomini_node_tracking.cpp)
-    void   avoidanceWorkerLoop();
-    bool   runAvoidancePlan(const Eigen::VectorXd &q_start,
-                            std::vector<Eigen::VectorXd> &out_traj);
-    int    checkCollisionInHorizon(const std::vector<Eigen::VectorXd> &q_traj);
-    bool   checkCollisionAtState(const Eigen::VectorXd &q);
-    void   requestAvoidance(const Eigen::VectorXd &anchor);
 
     // Parameter change callback — propagates GUI/service param updates to the planner
     rcl_interfaces::msg::SetParametersResult

@@ -159,4 +159,23 @@
         <parent link="base_link" />
         <child link="base" />
     </joint>
+
+    <!-- Obstacle Link for Collision Detection -->
+    <!-- Position controlled via obstacle_simulator TF broadcaster -->
+    <link name="obstacle_link">
+        <collision>
+            <origin xyz="0 0 0" rpy="0 1.57 0" />
+            <geometry>
+                <cylinder radius="0.02" length="0.05" />
+            </geometry>
+        </collision>
+    </link>
+
+    <!-- Fixed joint to world (obstacle position will be overridden by TF broadcaster) -->
+    <joint name="world_to_obstacle" type="fixed">
+        <parent link="world" />
+        <child link="obstacle_link" />
+        <origin xyz="0.1 0.0 0.2" rpy="0 0 0" />
+    </joint>
+
 </robot>

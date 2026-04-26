@@ -44,12 +44,12 @@ class TrackingTestNode(Node):
         # Oscillate y between -0.1 and 0.1 using a sine wave
         # Completes one full back and forth cycle every 5 seconds
         period = 5.0
-        y_val = 0.1 * math.sin(2.0 * math.pi * current_time / period)
+        y_val = 0.2 * math.sin(0.5 * math.pi * current_time / period)
         
         # Set Position
-        msg.pose.position.x = 0.18
+        msg.pose.position.x = 0.2
         msg.pose.position.y = y_val
-        msg.pose.position.z = 0.245
+        msg.pose.position.z = 0.05
         
         # Set Orientation (Assuming tool pointing forward/up: W=1)
         # Using Identity quaternion to avoid violent 180-degree wrist flips

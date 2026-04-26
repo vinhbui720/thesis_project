@@ -101,3 +101,17 @@ motomini_planning_node:
     # 0 = DISCRETE, 1 = CONTINUOUS, 2 = LVS_CONTINUOUS
     tracking_coll_type: 0
     tracking_max_iter: 3                   # Max SQP iterations per tick
+
+    # ===========================================================================
+    #  QP-CBF (CONTROL BARRIER FUNCTION) COLLISION AVOIDANCE
+    #  Formulation: min ½‖J q̇ - v_des‖²_W + ½λ‖q̇‖²
+    #              s.t. nᵢᵀ J q̇ ≥ -γ(dᵢ - d_safe)  [safety constraint per contact]
+    # ===========================================================================
+    qp_track_weight_pos: 5.0               # Weight for position tracking in Hessian (lower = faster convergence)
+    qp_track_weight_rot: 0.2               # Weight for rotation tracking in Hessian
+    qp_velocity_reg: 0.5                   # Regularization λ for joint velocity smoothing (high = very stable)
+    cbf_lookahead_distance: 0.15           # [m] Lookahead distance for collision detection
+    cbf_safety_distance: 0.02              # [m] Minimum safe distance from obstacle
+    cbf_gamma: 1.0                         # CBF decay rate parameter
+    qp_warm_start: false                   # Disable warm-start (restart solver each iteration)
+    qp_max_iter: 500                       # Max QP solver iterations (increased to handle ill-conditioning)

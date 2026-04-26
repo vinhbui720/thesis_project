@@ -1,72 +1,78 @@
 // ============================================================================
-// ADD THIS BLOCK TO motomini_planning_node.h INSIDE THE CLASS
+// HEADER CLEANUP — motomini_planning_node.h
 // ============================================================================
+
+// ---------------------------------------------------------------------------
+// 1) REMOVE these previously-added items (state machine + worker thread).
+//    Search for these names in your .h and delete them entirely:
+// ---------------------------------------------------------------------------
 //
-// In the existing #include section at the top of the .h file, add:
+//   enum class ControllerMode { ... };
+//   std::atomic<ControllerMode> mode_;
 //
-//   #include <atomic>
-//   #include <thread>
-//   #include <condition_variable>
-//   #include <shared_mutex>
+//   std::thread                  avoidance_worker_;
+//   std::atomic<bool>            avoidance_running_;
+//   std::mutex                   avoidance_request_mutex_;
+//   std::condition_variable      avoidance_request_cv_;
+//   std::atomic<bool>            avoidance_request_pending_;
+//   Eigen::VectorXd              avoidance_request_anchor_;
 //
-// Then inside the class body, in the `private:` section, add:
+//   mutable std::shared_mutex    avoidance_result_mutex_;
+//   std::vector<Eigen::VectorXd> avoidance_traj_;
+//   std::size_t                  avoidance_idx_;
+//   rclcpp::Time                 avoidance_traj_stamp_;
+//   std::atomic<bool>            avoidance_traj_valid_;
+//
+//   double collision_safety_margin_;
+//   int    avoidance_horizon_;
+//   double avoidance_traj_max_age_;
+//
+//   void  startAvoidanceWorker();
+//   void  stopAvoidanceWorker();
+//   void  avoidanceWorkerLoop();
+//   bool  runAvoidancePlan(...);
+//   int   checkCollisionInHorizon(...);
+//   bool  checkCollisionAtState(...);
+//   void  requestAvoidance(...);
+//
+// ---------------------------------------------------------------------------
+// 2) REMOVE these calls from your constructor and destructor:
+// ---------------------------------------------------------------------------
+//
+//   startAvoidanceWorker();   // <-- DELETE from constructor
+//   stopAvoidanceWorker();    // <-- DELETE from destructor
+//
+// ---------------------------------------------------------------------------
+// 3) ADD this block in the `private:` section of MotoMiniPlanningNode:
+// ---------------------------------------------------------------------------
 
 private:
-    // ---------- State machine -------------------------------------------
-    enum class ControllerMode : uint8_t
-    {
-        TRACKING            = 0,  // pure DLS-IK Cartesian servoing
-        AVOIDANCE_REQUESTED = 1,  // collision detected, TrajOpt computing
-        AVOIDANCE_EXEC      = 2,  // following pre-computed collision-free path
-    };
-    std::atomic<ControllerMode> mode_{ControllerMode::TRACKING};
+    // -------- Reactive obstacle avoidance (potential field, FIRAS-style) ---
+    //
+    //   When any robot link comes within `rep_distance_threshold_` of an
+    //   obstacle, a Cartesian repulsive velocity is generated at the contact
+    //   point and projected back into joint space via J^T. Summed with the
+    //   tracking DLS step, this produces "string-like" deflection: the
+    //   robot continues to chase the target but is shoved sideways around
+    //   the obstacle, returning to perfect tracking once the obstacle is
+    //   no longer in the way.
+    //
+    //   Tune these:
+    //     rep_distance_threshold_  larger = robot dodges further out
+    //     rep_gain_                larger = harder push (may oscillate)
+    //     rep_velocity_max_        cap when penetrating (numerical stability)
+    //     rep_joint_velocity_cap_  per-tick safety lid on repulsion's dq
+    //
+    double rep_distance_threshold_{0.10};   // [m]    activation distance
+    double rep_gain_{0.5};                  // [m²/s] FIRAS coefficient
+    double rep_velocity_max_{0.6};          // [m/s]  saturation when penetrating
+    double rep_joint_velocity_cap_{1.0};    // [rad/s] per-joint repulsion cap
 
-    // ---------- Avoidance worker (background thread) --------------------
-    std::thread                  avoidance_worker_;
-    std::atomic<bool>            avoidance_running_{false};
+    /// Returns dq from repulsive forces only. Returns zeros if nothing is
+    /// inside `rep_distance_threshold_`. Cheap to call every tick.
+    Eigen::VectorXd computeRepulsiveJointVelocity(const Eigen::VectorXd& q);
 
-    // request side
-    std::mutex                   avoidance_request_mutex_;
-    std::condition_variable      avoidance_request_cv_;
-    std::atomic<bool>            avoidance_request_pending_{false};
-    Eigen::VectorXd              avoidance_request_anchor_;
-
-    // result side
-    mutable std::shared_mutex    avoidance_result_mutex_;
-    std::vector<Eigen::VectorXd> avoidance_traj_;
-    std::size_t                  avoidance_idx_{0};
-    rclcpp::Time                 avoidance_traj_stamp_;
-    std::atomic<bool>            avoidance_traj_valid_{false};
-
-    // ---------- Tunables -----------------------------------------------
-    double collision_safety_margin_{0.02};   // [m] inflated link margin
-    int    avoidance_horizon_{10};            // longer than tracking
-    double avoidance_traj_max_age_{1.0};      // [s] before forcing re-plan
-
-public:
-    // Lifecycle — call these from constructor / destructor.
-    void startAvoidanceWorker();
-    void stopAvoidanceWorker();
-
-private:
-    // Internal helpers (declarations only)
-    void   avoidanceWorkerLoop();
-    bool   runAvoidancePlan(const Eigen::VectorXd &q_start,
-                            std::vector<Eigen::VectorXd> &out_traj);
-    int    checkCollisionInHorizon(const std::vector<Eigen::VectorXd> &q_traj);
-    bool   checkCollisionAtState(const Eigen::VectorXd &q);
-    void   requestAvoidance(const Eigen::VectorXd &anchor);
-
-// ============================================================================
-// END OF HEADER ADDITIONS
-//
-// In the constructor of MotoMiniPlanningNode (after task_factory_/task_executor_
-// are initialised), add:
-//
-//   startAvoidanceWorker();
-//
-// In the destructor (or in a shutdown method called before destruction), add:
-//
-//   stopAvoidanceWorker();
-//
-// ============================================================================
+// ---------------------------------------------------------------------------
+// END of header changes. The constructor/destructor stay clean of any
+// avoidance setup — repulsion needs no initialization, no thread, no state.
+// ---------------------------------------------------------------------------

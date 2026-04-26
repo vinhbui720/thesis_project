@@ -54,12 +54,19 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     // ---- Tracking/MPC parameters ----
     this->declare_parameter<int>("tracking_horizon", 10);
     this->declare_parameter<double>("tracking_dt", 0.02);
-    this->declare_parameter<double>("tracking_w_cart", 20.0);
-    this->declare_parameter<double>("tracking_w_vel", 1.0);
+    this->declare_parameter<double>("tracking_w_cart", 50.0);
+    this->declare_parameter<double>("tracking_w_vel", 5.0);
     this->declare_parameter<double>("tracking_w_acc", 0.5);
     this->declare_parameter<double>("tracking_d_safe", 0.01);
     this->declare_parameter<int>("tracking_coll_type", 0); // 0=DISCRETE, 1=CONTINUOUS
     this->declare_parameter<int>("tracking_max_iter", 10);
+    this->declare_parameter<double>("tracking_qp_reg", 0.10);
+    this->declare_parameter<double>("repulsion_lookahead", 0.02);
+    this->declare_parameter<double>("repulsion_safety", 0.005);
+    this->declare_parameter<double>("repulsion_max_speed", 0.20);
+    this->declare_parameter<double>("relax_distance", 0.01);
+    this->declare_parameter<double>("relax_z_min_factor", 0.05);
+    this->declare_parameter<double>("relax_rot_min_factor", 0.10);
 
     mpc_horizon_n_ = this->get_parameter("tracking_horizon").as_int();
     mpc_dt_ = this->get_parameter("tracking_dt").as_double();
@@ -69,6 +76,13 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     mpc_d_safe_ = this->get_parameter("tracking_d_safe").as_double();
     mpc_max_iter_ = this->get_parameter("tracking_max_iter").as_int();
     mpc_coll_type_ = this->get_parameter("tracking_coll_type").as_int();
+    qp_velocity_reg_ = this->get_parameter("tracking_qp_reg").as_double();
+    repulsion_lookahead_ = this->get_parameter("repulsion_lookahead").as_double();
+    repulsion_safety_ = this->get_parameter("repulsion_safety").as_double();
+    repulsion_max_speed_ = this->get_parameter("repulsion_max_speed").as_double();
+    relax_distance_ = this->get_parameter("relax_distance").as_double();
+    relax_z_min_factor_ = this->get_parameter("relax_z_min_factor").as_double();
+    relax_rot_min_factor_ = this->get_parameter("relax_rot_min_factor").as_double();
 
     bool online_mode = this->get_parameter("online_mode").as_bool();
     bool debug = this->get_parameter("debug").as_bool();
@@ -119,6 +133,8 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
                 ->getFilePath());
         task_factory_ = std::make_unique<tesseract_planning::TaskComposerPluginFactory>(config_path, *locator);
         task_executor_ = task_factory_->createTaskComposerExecutor("TaskflowExecutor");
+
+        // DLS-IK tracking is simple and needs no pre-initialization
     }
     current_target_pose_ = Eigen::Isometry3d::Identity();
     target_velocity_linear_.setZero();
@@ -333,14 +349,11 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
 
     param_callback_handle_ = this->add_on_set_parameters_callback(
         std::bind(&MotoMiniPlanningNode::onParameterChange, this, std::placeholders::_1));
-
-    // Start the background avoidance worker thread
-    startAvoidanceWorker();
 }
 
 MotoMiniPlanningNode::~MotoMiniPlanningNode()
 {
-    stopAvoidanceWorker();
+    // No background threads to stop — reactive avoidance runs inline at 30 Hz
 }
 
 void MotoMiniPlanningNode::postInit()
@@ -358,6 +371,9 @@ bool MotoMiniPlanningNode::initializeEnvironment()
         RCLCPP_ERROR(this->get_logger(), "URDF or SRDF parameter is empty.");
         return false;
     }
+
+    RCLCPP_INFO(this->get_logger(), "SRDF path: %s", srdf_xml_.c_str());
+
     auto locator = std::make_shared<tesseract_rosutils::ROSResourceLocator>();
     env_ = std::make_shared<tesseract_environment::Environment>();
     if (!env_->init(urdf_xml_, srdf_xml_, locator))
@@ -365,7 +381,51 @@ bool MotoMiniPlanningNode::initializeEnvironment()
         RCLCPP_ERROR(this->get_logger(), "Failed to initialize Tesseract environment.");
         return false;
     }
+
+    // DEBUG: Verify SRDF loaded by checking ACM
+    auto acm = env_->getAllowedCollisionMatrix();
+    if (acm)
+    {
+        size_t num_disabled = 0;
+        // Count disabled collision pairs (this is an estimate; Tesseract doesn't expose exact count)
+        RCLCPP_INFO(this->get_logger(), "✓ ACM initialized from SRDF");
+
+        // Log a few examples of disabled pairs
+        const auto &scene_graph = env_->getSceneGraph();
+        const auto &links = scene_graph->getLinks();
+        std::vector<std::pair<std::string, std::string>> examples;
+        for (const auto &link1 : links)
+        {
+            for (const auto &link2 : links)
+            {
+                if (link1->getName() < link2->getName() &&
+                    acm->isCollisionAllowed(link1->getName(), link2->getName()))
+                {
+                    examples.push_back({link1->getName(), link2->getName()});
+                    if (examples.size() >= 3)
+                        break;
+                }
+            }
+            if (examples.size() >= 3)
+                break;
+        }
+        if (!examples.empty())
+        {
+            RCLCPP_INFO(this->get_logger(), "Example disabled collisions:");
+            for (const auto &[l1, l2] : examples)
+                RCLCPP_INFO(this->get_logger(), "  %s ↔ %s", l1.c_str(), l2.c_str());
+        }
+    }
+    else
+    {
+        RCLCPP_WARN(this->get_logger(), "⚠️ ACM is null — SRDF may not have loaded properly!");
+    }
+
     plotter_ = std::make_shared<tesseract_rosutils::ROSPlotting>(env_->getSceneGraph()->getRoot());
+
+    // Note: Obstacle is dynamically added by ROSEnvironmentMonitor when it sees
+    // the obstacle_simulator's TF broadcasts and loads obstacle.urdf.xacro from
+    // the package resource locator.
     return true;
 }
 
@@ -429,6 +489,13 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
             else if (n == "tracking_d_safe") mpc_d_safe_ = p.as_double();
             else if (n == "tracking_coll_type") mpc_coll_type_ = static_cast<int>(p.as_int());
             else if (n == "tracking_max_iter") mpc_max_iter_ = static_cast<int>(p.as_int());
+            else if (n == "tracking_qp_reg") qp_velocity_reg_ = p.as_double();
+            else if (n == "repulsion_lookahead") repulsion_lookahead_ = p.as_double();
+            else if (n == "repulsion_safety") repulsion_safety_ = p.as_double();
+            else if (n == "repulsion_max_speed") repulsion_max_speed_ = p.as_double();
+            else if (n == "relax_distance") relax_distance_ = p.as_double();
+            else if (n == "relax_z_min_factor") relax_z_min_factor_ = p.as_double();
+            else if (n == "relax_rot_min_factor") relax_rot_min_factor_ = p.as_double();
             else if (n == "ee_link" || n == "tool_param")
             {
                 ee_link_ = p.as_string();

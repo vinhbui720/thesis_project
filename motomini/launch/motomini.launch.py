@@ -221,6 +221,12 @@ def generate_launch_description():
             output="screen"
         ),
         Node(
+            package="motomini",
+            executable="obstacle_simulator",
+            name="obstacle_simulator",
+            output="screen"
+        ),
+        Node(
             package='motomini',
             executable='command_node',
             name='command_node',

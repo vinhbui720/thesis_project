@@ -14,6 +14,7 @@
     <xacro:include filename="motoman_motomini_sensors.urdf.xacro" />
     <xacro:include filename="motoman_motomini_tool.xacro" />
     <xacro:include filename="2axis.urdf.xacro" />
+    <xacro:include filename="obstacle.urdf.xacro" />
     <!-- <xacro:include filename="plate.urdf.xacro" /> -->
     <!-- ========= TOOLS ========= -->
     <xacro:motomini_tool
@@ -31,6 +32,13 @@
         <parent link="world" />
         <child link="gantry_base_link" />
         <origin xyz="0.03 -0.46 0.0602" rpy="0 0 3.14" />
+    </joint>
+
+    <!-- Obstacle joint (position controlled by obstacle_simulator TF broadcaster) -->
+    <joint name="world_to_obstacle" type="fixed">
+        <parent link="world" />
+        <child link="obstacle_link" />
+        <origin xyz="0.1 0.0 0.15" rpy="0 0 0" />
     </joint>
     <!-- <joint name="world_to_plate" type="fixed">
         <parent link="world" />

@@ -20,26 +20,26 @@ def generate_launch_description():
     # 2. Get Package Paths
     pkg_share = FindPackageShare("robot_planning")
 
-    # 3. Process URDF (Xacro)
+    # 3. Load URDF (already in XML format)
     robot_description_content = Command(
         [
-            PathJoinSubstitution([FindExecutable(name="xacro")]),
+            PathJoinSubstitution([FindExecutable(name="cat")]),
             " ",
-            PathJoinSubstitution([pkg_share, "urdf", "motomini.xacro"]),
+            PathJoinSubstitution([pkg_share, "urdf", "motoman_motomini.urdf"]),
         ]
     )
-    
+
     # FIX: Wrap content in ParameterValue to prevent YAML parsing errors
     robot_description = {
         "robot_description": ParameterValue(robot_description_content, value_type=str)
     }
 
-    # 4. Process SRDF (Text)
+    # 4. Load SRDF (Text)
     robot_description_semantic_content = Command(
         [
             PathJoinSubstitution([FindExecutable(name="cat")]),
             " ",
-            PathJoinSubstitution([pkg_share, "config", "motomini.srdf"]),
+            PathJoinSubstitution([pkg_share, "urdf", "motoman_motomini.srdf"]),
         ]
     )
 
@@ -53,7 +53,7 @@ def generate_launch_description():
 
     planner_node = Node(
         package="robot_planning",
-        executable="motomini_planner_node",
+        executable="motomini_planning_node",
         output="screen",
         parameters=[
             robot_description,
