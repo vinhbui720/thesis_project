@@ -222,13 +222,20 @@ void MotoMiniPlanningNode::trackingControlCallback(
                 if (horizon_joints_.size() != static_cast<size_t>(mpc_horizon_n_))
                     horizon_joints_.resize(static_cast<size_t>(mpc_horizon_n_));
                 for (auto& q : horizon_joints_) q = current_joints_;
+                last_tracking_velocity_command_ =
+                    Eigen::VectorXd::Zero(current_joints_.size());
             }
         }
+        tracking_start_time_ = this->now();
+        has_tracking_velocity_command_ = false;
+        mode_.store(ControllerMode::TRACKING);
+        avoidance_traj_valid_.store(false);
         RCLCPP_INFO(this->get_logger(), "Mode → TRACKING");
         publishStatus("Mode: Tracking");
     }
     else
     {
+        has_tracking_velocity_command_ = false;
         RCLCPP_INFO(this->get_logger(), "Mode → PLANNING (use /target_poses + /start)");
         publishStatus("Mode: Planning");
     }

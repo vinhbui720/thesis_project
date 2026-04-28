@@ -60,6 +60,21 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("tracking_d_safe", 0.01);
     this->declare_parameter<int>("tracking_coll_type", 0); // 0=DISCRETE, 1=CONTINUOUS
     this->declare_parameter<int>("tracking_max_iter", 10);
+    this->declare_parameter<double>("tracking_velocity_limit_scale", 0.65);
+    this->declare_parameter<double>("tracking_accel_limit", 8.0);
+    this->declare_parameter<double>("tracking_command_lead_limit", 0.12);
+    this->declare_parameter<double>("tracking_velocity_filter_alpha", 0.55);
+    this->declare_parameter<double>("tracking_start_ramp_time", 0.6);
+    this->declare_parameter<double>("tracking_start_velocity_scale", 0.15);
+    this->declare_parameter<double>("tracking_target_pos_alpha", 0.35);
+    this->declare_parameter<double>("tracking_target_rot_alpha", 0.20);
+    this->declare_parameter<double>("tracking_output_dt", 0.004);
+    this->declare_parameter<bool>("tracking_use_smooth_output", true);
+    this->declare_parameter<double>("tracking_cart_pos_gain", 1.0);
+    this->declare_parameter<double>("tracking_cart_rot_gain", 0.5);
+    this->declare_parameter<double>("tracking_max_cart_speed", 0.25);
+    this->declare_parameter<double>("tracking_max_rot_speed", 1.0);
+    this->declare_parameter<double>("tracking_orientation_weight", 0.0);
 
     mpc_horizon_n_ = this->get_parameter("tracking_horizon").as_int();
     mpc_dt_ = this->get_parameter("tracking_dt").as_double();
@@ -69,6 +84,35 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     mpc_d_safe_ = this->get_parameter("tracking_d_safe").as_double();
     mpc_max_iter_ = this->get_parameter("tracking_max_iter").as_int();
     mpc_coll_type_ = this->get_parameter("tracking_coll_type").as_int();
+    tracking_velocity_limit_scale_ =
+        this->get_parameter("tracking_velocity_limit_scale").as_double();
+    tracking_accel_limit_ = this->get_parameter("tracking_accel_limit").as_double();
+    tracking_command_lead_limit_ =
+        this->get_parameter("tracking_command_lead_limit").as_double();
+    tracking_velocity_filter_alpha_ =
+        this->get_parameter("tracking_velocity_filter_alpha").as_double();
+    tracking_start_ramp_time_ =
+        this->get_parameter("tracking_start_ramp_time").as_double();
+    tracking_start_velocity_scale_ =
+        this->get_parameter("tracking_start_velocity_scale").as_double();
+    tracking_target_pos_alpha_ =
+        this->get_parameter("tracking_target_pos_alpha").as_double();
+    tracking_target_rot_alpha_ =
+        this->get_parameter("tracking_target_rot_alpha").as_double();
+    tracking_output_dt_ =
+        this->get_parameter("tracking_output_dt").as_double();
+    tracking_use_smooth_output_ =
+        this->get_parameter("tracking_use_smooth_output").as_bool();
+    tracking_cart_pos_gain_ =
+        this->get_parameter("tracking_cart_pos_gain").as_double();
+    tracking_cart_rot_gain_ =
+        this->get_parameter("tracking_cart_rot_gain").as_double();
+    tracking_max_cart_speed_ =
+        this->get_parameter("tracking_max_cart_speed").as_double();
+    tracking_max_rot_speed_ =
+        this->get_parameter("tracking_max_rot_speed").as_double();
+    tracking_orientation_weight_ =
+        this->get_parameter("tracking_orientation_weight").as_double();
 
     bool online_mode = this->get_parameter("online_mode").as_bool();
     bool debug = this->get_parameter("debug").as_bool();
@@ -112,6 +156,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         current_joints_ = Eigen::VectorXd::Zero(n_dof);
         mpc_collision_cache_ = std::make_shared<trajopt_ifopt::CollisionCache>(static_cast<size_t>(mpc_horizon_n_) * 4);
         joint_limits_ = manip_->getLimits().joint_limits;
+        velocity_limits_ = manip_->getLimits().velocity_limits;
 
         std::shared_ptr<const tesseract_common::ResourceLocator> locator = env_->getResourceLocator();
         std::filesystem::path config_path(
@@ -429,6 +474,21 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
             else if (n == "tracking_d_safe") mpc_d_safe_ = p.as_double();
             else if (n == "tracking_coll_type") mpc_coll_type_ = static_cast<int>(p.as_int());
             else if (n == "tracking_max_iter") mpc_max_iter_ = static_cast<int>(p.as_int());
+            else if (n == "tracking_velocity_limit_scale") tracking_velocity_limit_scale_ = p.as_double();
+            else if (n == "tracking_accel_limit") tracking_accel_limit_ = p.as_double();
+            else if (n == "tracking_command_lead_limit") tracking_command_lead_limit_ = p.as_double();
+            else if (n == "tracking_velocity_filter_alpha") tracking_velocity_filter_alpha_ = p.as_double();
+            else if (n == "tracking_start_ramp_time") tracking_start_ramp_time_ = p.as_double();
+            else if (n == "tracking_start_velocity_scale") tracking_start_velocity_scale_ = p.as_double();
+            else if (n == "tracking_target_pos_alpha") tracking_target_pos_alpha_ = p.as_double();
+            else if (n == "tracking_target_rot_alpha") tracking_target_rot_alpha_ = p.as_double();
+            else if (n == "tracking_output_dt") tracking_output_dt_ = p.as_double();
+            else if (n == "tracking_use_smooth_output") tracking_use_smooth_output_ = p.as_bool();
+            else if (n == "tracking_cart_pos_gain") tracking_cart_pos_gain_ = p.as_double();
+            else if (n == "tracking_cart_rot_gain") tracking_cart_rot_gain_ = p.as_double();
+            else if (n == "tracking_max_cart_speed") tracking_max_cart_speed_ = p.as_double();
+            else if (n == "tracking_max_rot_speed") tracking_max_rot_speed_ = p.as_double();
+            else if (n == "tracking_orientation_weight") tracking_orientation_weight_ = p.as_double();
             else if (n == "ee_link" || n == "tool_param")
             {
                 ee_link_ = p.as_string();

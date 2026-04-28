@@ -174,6 +174,28 @@ private:
     std::string ee_link_{"tool0"};
     std::string base_link_{"world"};
     Eigen::MatrixX2d joint_limits_; // [min, max] for each joint
+    Eigen::MatrixX2d velocity_limits_; // [min, max] for each joint
+
+    // Real robot tracking safety. URDF velocity limits are hardware maxima; the
+    // online servo uses a lower, ramped command envelope.
+    double tracking_velocity_limit_scale_{0.65};
+    double tracking_accel_limit_{8.0}; // [rad/s^2]
+    double tracking_command_lead_limit_{0.12}; // [rad]
+    double tracking_velocity_filter_alpha_{0.55};
+    double tracking_start_ramp_time_{0.6}; // [s]
+    double tracking_start_velocity_scale_{0.15};
+    double tracking_target_pos_alpha_{0.35};
+    double tracking_target_rot_alpha_{0.20};
+    double tracking_output_dt_{0.004}; // [s] dense published trajectory resolution
+    bool tracking_use_smooth_output_{true};
+    double tracking_cart_pos_gain_{1.0};
+    double tracking_cart_rot_gain_{0.5};
+    double tracking_max_cart_speed_{0.25}; // [m/s]
+    double tracking_max_rot_speed_{1.0}; // [rad/s]
+    double tracking_orientation_weight_{0.0};
+    rclcpp::Time tracking_start_time_{0, 0, RCL_ROS_TIME};
+    Eigen::VectorXd last_tracking_velocity_command_;
+    bool has_tracking_velocity_command_{false};
 
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_tracking_target_;
 
@@ -219,7 +241,11 @@ private:
     void targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
     void mpcTimerCallback();
     Eigen::Isometry3d predictTargetPose(int step_k);
-    Eigen::VectorXd computeDlsExtrapolation(const Eigen::VectorXd& q_last, const Eigen::Isometry3d& target_next);
+    Eigen::VectorXd computeDlsExtrapolation(const Eigen::VectorXd& q_last,
+                                            const Eigen::Isometry3d& target_next,
+                                            const Eigen::VectorXd& velocity_limit,
+                                            const Eigen::Vector3d& v_ff_lin,
+                                            const Eigen::Vector3d& v_ff_ang);
     void buildAndPublishTrajectory();
 
 

@@ -2,8 +2,9 @@
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from std_msgs.msg import Bool
+from tf2_ros import TransformBroadcaster
 import math
 import time
 
@@ -14,6 +15,7 @@ class TrackingTestNode(Node):
         # Publishers
         self.pose_pub = self.create_publisher(PoseStamped, '/tracking_target_pose', 10)
         self.control_pub = self.create_publisher(Bool, '/tracking_control', 10)
+        self.tf_broadcaster = TransformBroadcaster(self)
         
         # Timer to publish pose at 50Hz
         self.timer_pose = self.create_timer(0.02, self.publish_pose)
@@ -60,6 +62,20 @@ class TrackingTestNode(Node):
         msg.pose.orientation.w = 1.0
         
         self.pose_pub.publish(msg)
+        self.publish_tracking_tf(msg)
+
+    def publish_tracking_tf(self, pose_msg):
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = pose_msg.header.stamp
+        tf_msg.header.frame_id = 'world'
+        tf_msg.child_frame_id = 'tracking_frame'
+
+        tf_msg.transform.translation.x = pose_msg.pose.position.x
+        tf_msg.transform.translation.y = pose_msg.pose.position.y
+        tf_msg.transform.translation.z = pose_msg.pose.position.z
+        tf_msg.transform.rotation = pose_msg.pose.orientation
+
+        self.tf_broadcaster.sendTransform(tf_msg)
 
 def main(args=None):
     rclpy.init(args=args)

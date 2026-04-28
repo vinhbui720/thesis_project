@@ -1,61 +1,3 @@
-/**
- * @file motomini_node_tracking.cpp
- * @brief MotoMiniPlanningNode — Cartesian servo controller with reactive
- *        collision avoidance.
- *
- *  ARCHITECTURE
- *  ============
- *
- *      ┌───────────────────────── HOT PATH (30 Hz, never blocks) ──────────┐
- *      │                                                                   │
- *      │   target ─► PT1 smoother ─► predict horizon ─► DLS-IK chain       │
- *      │                                                  │                │
- *      │                                                  ▼                │
- *      │                                       ┌─── collision check ─┐    │
- *      │                                       │                     │    │
- *      │                            no collision                  collision│
- *      │                                       │                     │    │
- *      │                                       ▼                     ▼    │
- *      │                                 publish DLS         signal worker │
- *      │                                  (TRACKING)         publish HOLD  │
- *      │                                                  (AVOIDANCE_REQ)  │
- *      │                                                       │           │
- *      │                                                       ▼           │
- *      │                                                worker returns?    │
- *      │                                                       │           │
- *      │                                                  follow it        │
- *      │                                                  (AVOIDANCE_EXEC) │
- *      └───────────────────────────────────────────────────────────────────┘
- *
- *      ┌───────────────────────── COLD PATH (background thread) ───────────┐
- *      │                                                                   │
- *      │   wait for trigger → snapshot anchor + targets → run TrajOpt with │
- *      │   collision_cost ENABLED, longer horizon, stricter convergence    │
- *      │   → on success store result; on failure log and wait again.       │
- *      │                                                                   │
- *      └───────────────────────────────────────────────────────────────────┘
- *
- *  KEY PROPERTIES
- *  ==============
- *  • The controller never blocks on TrajOpt. Worst case (TrajOpt slow), the
- *    robot just *holds* its current pose until the avoidance plan arrives.
- *  • While following an avoidance trajectory, every tick re-checks for
- *    collisions against the *current* environment. If the world changes
- *    again, we re-plan.
- *  • The cross-tick velocity LPF (carried over from the tracker) is what
- *    smooths the seam when modes switch — no jumps.
- *  • Hand-off back to TRACKING happens automatically: when the avoidance
- *    trajectory is exhausted AND the DLS horizon is currently clear.
- *
- *  REQUIRED .h ADDITIONS
- *  =====================
- *  See  motomini_planning_node_additions.h  for the block to paste into
- *  your class. You also need to call  startAvoidanceWorker()  in the
- *  constructor and  stopAvoidanceWorker()  in the destructor.
- *
- *  @author Bùi Quang Vinh
- */
-
 #include <robot_planning/motomini_planning_node.h>
 
 // ROS / Tesseract
@@ -102,6 +44,10 @@
 
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_eigen/tf2_eigen.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 // ============================================================================
 // FREE-FUNCTION HELPERS
@@ -180,6 +126,155 @@ static void unwrapHorizonContinuousJoints(std::vector<Eigen::VectorXd> &q_traj,
     }
 }
 
+static Eigen::VectorXd positiveUpperLimits(const Eigen::MatrixX2d &limits,
+                                           int n,
+                                           double fallback)
+{
+    Eigen::VectorXd out = Eigen::VectorXd::Constant(n, fallback);
+    if (limits.rows() < n || limits.cols() < 2)
+        return out;
+
+    for (int i = 0; i < n; ++i)
+    {
+        double lim = std::max(std::abs(limits(i, 0)), std::abs(limits(i, 1)));
+        if (!std::isfinite(lim) || lim <= 1e-9)
+            lim = fallback;
+        out[i] = lim;
+    }
+    return out;
+}
+
+static tesseract_common::JointTrajectory buildDenseSmoothTrajectory(
+    const std::vector<Eigen::VectorXd> &q_knots,
+    const std::vector<std::string> &joint_names,
+    double knot_dt,
+    double output_dt,
+    const Eigen::VectorXd &velocity_limit,
+    bool smooth_output)
+{
+    tesseract_common::JointTrajectory traj;
+    if (q_knots.empty())
+        return traj;
+
+    const int n_joints = static_cast<int>(q_knots.front().size());
+    if (q_knots.size() == 1 || !smooth_output)
+    {
+        traj.reserve(q_knots.size());
+        for (size_t k = 0; k < q_knots.size(); ++k)
+        {
+            tesseract_common::JointState s;
+            s.joint_names = joint_names;
+            s.position = q_knots[k];
+            s.time = static_cast<double>(k) * knot_dt;
+            if (q_knots.size() == 1)
+                s.velocity = Eigen::VectorXd::Zero(n_joints);
+            else if (k == 0)
+                s.velocity = (q_knots[1] - q_knots[0]) / knot_dt;
+            else if (k == q_knots.size() - 1)
+                s.velocity = (q_knots[k] - q_knots[k - 1]) / knot_dt;
+            else
+                s.velocity = (q_knots[k + 1] - q_knots[k - 1]) / (2.0 * knot_dt);
+            s.acceleration = Eigen::VectorXd::Zero(n_joints);
+            traj.push_back(s);
+        }
+        return traj;
+    }
+
+    const double T = std::max(1e-6, knot_dt);
+    const double dt = std::clamp(output_dt, 0.001, T);
+    const size_t n_knots = q_knots.size();
+    const size_t n_segments = n_knots - 1;
+
+    std::vector<Eigen::VectorXd> slope(n_segments, Eigen::VectorXd::Zero(n_joints));
+    for (size_t k = 0; k < n_segments; ++k)
+        slope[k] = (q_knots[k + 1] - q_knots[k]) / T;
+
+    std::vector<Eigen::VectorXd> tangent(n_knots, Eigen::VectorXd::Zero(n_joints));
+    tangent.front() = slope.front();
+    tangent.back() = slope.back();
+    for (size_t k = 1; k + 1 < n_knots; ++k)
+    {
+        for (int j = 0; j < n_joints; ++j)
+        {
+            const double m0 = slope[k - 1][j];
+            const double m1 = slope[k][j];
+            if (m0 * m1 <= 0.0)
+            {
+                tangent[k][j] = 0.0;
+            }
+            else
+            {
+                tangent[k][j] = 2.0 * m0 * m1 / (m0 + m1);
+            }
+        }
+    }
+
+    for (auto &v : tangent)
+    {
+        for (int j = 0; j < n_joints; ++j)
+        {
+            const double lim = (j < velocity_limit.size())
+                                   ? std::max(0.0, velocity_limit[j])
+                                   : std::numeric_limits<double>::infinity();
+            v[j] = std::clamp(v[j], -lim, lim);
+        }
+    }
+
+    const double total_time = static_cast<double>(n_segments) * T;
+    const size_t n_samples = static_cast<size_t>(std::ceil(total_time / dt)) + 1;
+    traj.reserve(n_samples);
+
+    for (size_t sample = 0; sample < n_samples; ++sample)
+    {
+        const double t = std::min(static_cast<double>(sample) * dt, total_time);
+        const size_t seg = std::min(static_cast<size_t>(t / T), n_segments - 1);
+        const double local_t = t - static_cast<double>(seg) * T;
+        const double u = std::clamp(local_t / T, 0.0, 1.0);
+        const double u2 = u * u;
+        const double u3 = u2 * u;
+
+        const double h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+        const double h10 = u3 - 2.0 * u2 + u;
+        const double h01 = -2.0 * u3 + 3.0 * u2;
+        const double h11 = u3 - u2;
+
+        const double dh00 = (6.0 * u2 - 6.0 * u) / T;
+        const double dh10 = 3.0 * u2 - 4.0 * u + 1.0;
+        const double dh01 = (-6.0 * u2 + 6.0 * u) / T;
+        const double dh11 = 3.0 * u2 - 2.0 * u;
+
+        const double ddh00 = (12.0 * u - 6.0) / (T * T);
+        const double ddh10 = (6.0 * u - 4.0) / T;
+        const double ddh01 = (-12.0 * u + 6.0) / (T * T);
+        const double ddh11 = (6.0 * u - 2.0) / T;
+
+        tesseract_common::JointState s;
+        s.joint_names = joint_names;
+        s.time = t;
+        s.position = h00 * q_knots[seg] +
+                     h10 * T * tangent[seg] +
+                     h01 * q_knots[seg + 1] +
+                     h11 * T * tangent[seg + 1];
+        s.velocity = dh00 * q_knots[seg] +
+                     dh10 * tangent[seg] +
+                     dh01 * q_knots[seg + 1] +
+                     dh11 * tangent[seg + 1];
+        s.acceleration = ddh00 * q_knots[seg] +
+                         ddh10 * tangent[seg] +
+                         ddh01 * q_knots[seg + 1] +
+                         ddh11 * tangent[seg + 1];
+        traj.push_back(s);
+    }
+
+    if (!traj.empty())
+    {
+        traj.front().position = q_knots.front();
+        traj.back().position = q_knots.back();
+    }
+
+    return traj;
+}
+
 // ============================================================================
 // ASYNC CALLBACK — Cartesian PT1 smoother
 // ============================================================================
@@ -194,8 +289,10 @@ void MotoMiniPlanningNode::targetPoseCallback(
 
     if (target_initialized_)
     {
-        const double alpha_pos = 0.10;
-        const double alpha_rot = 0.05;
+        const double alpha_pos =
+            std::clamp(tracking_target_pos_alpha_, 0.01, 1.0);
+        const double alpha_rot =
+            std::clamp(tracking_target_rot_alpha_, 0.01, 1.0);
 
         Eigen::Vector3d smoothed_pos =
             current_target_pose_.translation() +
@@ -254,7 +351,11 @@ Eigen::Isometry3d MotoMiniPlanningNode::predictTargetPose(int step_k)
 }
 
 Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(
-    const Eigen::VectorXd &q_last, const Eigen::Isometry3d &target_next)
+    const Eigen::VectorXd &q_last,
+    const Eigen::Isometry3d &target_next,
+    const Eigen::VectorXd &velocity_limit,
+    const Eigen::Vector3d & /*target_linear_vel*/,
+    const Eigen::Vector3d & /*target_angular_vel*/)
 {
     auto fk = manip_->calcFwdKin(q_last);
     if (fk.find(ee_link_) == fk.end())
@@ -266,8 +367,22 @@ Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(
     Eigen::Vector3d dw = aa.axis() * aa.angle();
 
     Eigen::Matrix<double, 6, 1> twist;
-    twist.head<3>() = dx;
-    twist.tail<3>() = dw;
+    twist.head<3>() = std::max(0.0, tracking_cart_pos_gain_) * dx;
+    const double max_pos_step =
+        std::max(0.0, tracking_max_cart_speed_) * mpc_dt_;
+    const double pos_step = twist.head<3>().norm();
+    if (max_pos_step > 1e-9 && pos_step > max_pos_step)
+        twist.head<3>() *= max_pos_step / pos_step;
+
+    const double orientation_weight =
+        std::clamp(tracking_orientation_weight_, 0.0, 1.0);
+    twist.tail<3>() =
+        orientation_weight * std::max(0.0, tracking_cart_rot_gain_) * dw;
+    const double max_rot_step =
+        std::max(0.0, tracking_max_rot_speed_) * mpc_dt_;
+    const double rot_step = twist.tail<3>().norm();
+    if (max_rot_step > 1e-9 && rot_step > max_rot_step)
+        twist.tail<3>() *= max_rot_step / rot_step;
 
     Eigen::MatrixXd J = manip_->calcJacobian(q_last, base_link_, ee_link_);
     const double lambda = 0.2;
@@ -275,10 +390,12 @@ Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(
     JJt += (lambda * lambda) * Eigen::MatrixXd::Identity(6, 6);
     Eigen::VectorXd dq = J.transpose() * JJt.ldlt().solve(twist);
 
-    const Eigen::VectorXd v_max = manip_->getLimits().velocity_limits.col(1);
-    const Eigen::VectorXd max_dq = v_max * mpc_dt_ * 0.5;
+    const Eigen::VectorXd max_dq = velocity_limit * mpc_dt_;
     for (int i = 0; i < dq.size(); ++i)
-        dq[i] = std::max(-max_dq[i], std::min(max_dq[i], dq[i]));
+    {
+        const double lim = (i < max_dq.size()) ? std::max(0.0, max_dq[i]) : 0.0;
+        dq[i] = std::max(-lim, std::min(lim, dq[i]));
+    }
 
     Eigen::VectorXd q_next = q_last + dq;
     for (int i = 0; i < q_next.size(); ++i)
@@ -455,14 +572,6 @@ bool MotoMiniPlanningNode::runAvoidancePlan(
     // (2) COMPOSITE — collision cost ENABLED, larger margin
     auto comp = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
     comp->collision_cost_config.enabled = true;
-    // Fields below are version-dependent. If your trajopt_ifopt version uses
-    // different names, adjust here. The intent: discrete checks at every
-    // waypoint, with a buffer slightly larger than collision_safety_margin_.
-    // Common knobs:
-    //   comp->collision_cost_config.type            = trajopt_common::CollisionEvaluatorType::DISCRETE;
-    //   comp->collision_cost_config.safety_margin   = collision_safety_margin_;
-    //   comp->collision_cost_config.safety_margin_buffer = 0.005;
-    //   comp->collision_cost_config.coeff           = 20.0;
 
     comp->smooth_velocities = true;
     Eigen::VectorXd vw = Eigen::VectorXd::Ones(n_joints) * 5.0;
@@ -524,7 +633,6 @@ bool MotoMiniPlanningNode::runAvoidancePlan(
     unwrapHorizonContinuousJoints(out_traj, is_cont, joint_limits_);
 
     // Final safety: re-validate the avoidance plan against the live env.
-    // (The env may have updated mid-solve.)
     for (size_t i = 1; i < out_traj.size(); ++i)
         if (checkCollisionAtState(out_traj[i]))
         {
@@ -550,13 +658,38 @@ void MotoMiniPlanningNode::mpcTimerCallback()
                              "Controller: waiting for target...");
         return;
     }
+    if (!last_joint_state_)
+    {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "Controller: waiting for joint state...");
+        return;
+    }
 
     std::shared_lock<std::shared_mutex> env_lock(env_mutex_);
     const rclcpp::Time tick_start = this->now();
 
     const int n_joints = static_cast<int>(manip_->getJointNames().size());
     const auto &joint_names = manip_->getJointNames();
-    const Eigen::VectorXd v_max = manip_->getLimits().velocity_limits.col(1);
+    const Eigen::VectorXd v_hw_limit =
+        positiveUpperLimits(velocity_limits_, n_joints, 1.0);
+
+    const double velocity_scale =
+        std::clamp(tracking_velocity_limit_scale_, 0.01, 1.0);
+    double startup_ramp = 1.0;
+    if (tracking_start_ramp_time_ > 1e-6 &&
+        tracking_start_time_.nanoseconds() > 0)
+    {
+        const double ramp_phase = std::clamp(
+            (tick_start - tracking_start_time_).seconds() /
+                tracking_start_ramp_time_,
+            0.0, 1.0);
+        const double smooth_phase =
+            ramp_phase * ramp_phase * (3.0 - 2.0 * ramp_phase);
+        const double start_scale =
+            std::clamp(tracking_start_velocity_scale_, 0.01, 1.0);
+        startup_ramp = start_scale + (1.0 - start_scale) * smooth_phase;
+    }
+    const Eigen::VectorXd v_limit = v_hw_limit * velocity_scale * startup_ramp;
     const auto is_continuous = detectContinuousJoints(joint_limits_, n_joints);
 
     // ------------------------------------------------------------------
@@ -564,31 +697,43 @@ void MotoMiniPlanningNode::mpcTimerCallback()
     // ------------------------------------------------------------------
     const double linear_speed = target_velocity_linear_.norm();
     const double angular_speed = target_velocity_angular_.norm();
-    int horizon = 3;
+    const int base_horizon = std::clamp(mpc_horizon_n_, 5, 20);
+    int horizon = base_horizon;
     if (linear_speed > 0.5 || angular_speed > 0.5)
-        horizon = 5;
-    else if (linear_speed < 0.1 && angular_speed < 0.1)
-        horizon = 2;
+        horizon = std::min(std::max(base_horizon, 8), 20);
 
     // ------------------------------------------------------------------
     // Anchor
     // ------------------------------------------------------------------
     Eigen::VectorXd q_anchor;
+    Eigen::VectorXd q_feedback;
     {
         std::lock_guard<std::mutex> lock(_mpc_state_mutex);
-        static bool first_run = true;
-        if (first_run)
+        q_feedback = current_joints_;
+        if (q_feedback.size() == 0)
+            return;
+
+        if (has_tracking_velocity_command_ &&
+            !horizon_joints_.empty() &&
+            horizon_joints_.front().size() == q_feedback.size())
         {
-            q_anchor = current_joints_;
-            first_run = false;
+            q_anchor = horizon_joints_.front();
         }
         else
         {
-            q_anchor = horizon_joints_[1];
-            const double eps = 1e-4;
-            for (int i = 0; i < q_anchor.size(); ++i)
-                q_anchor[i] = std::max(joint_limits_(i, 0) + eps,
-                                       std::min(joint_limits_(i, 1) - eps, q_anchor[i]));
+            q_anchor = q_feedback;
+        }
+
+        const double eps = 1e-4;
+        const double lead_limit = std::max(0.0, tracking_command_lead_limit_);
+        for (int i = 0; i < q_anchor.size(); ++i)
+        {
+            if (lead_limit > 1e-9 && q_feedback.size() == q_anchor.size())
+                q_anchor[i] = std::clamp(q_anchor[i],
+                                         q_feedback[i] - lead_limit,
+                                         q_feedback[i] + lead_limit);
+            q_anchor[i] = std::max(joint_limits_(i, 0) + eps,
+                                   std::min(joint_limits_(i, 1) - eps, q_anchor[i]));
         }
     }
     if (q_anchor.size() == 0)
@@ -602,7 +747,8 @@ void MotoMiniPlanningNode::mpcTimerCallback()
     std::vector<Eigen::VectorXd> q_dls(horizon + 1);
     q_dls[0] = q_anchor;
     for (int k = 1; k <= horizon; ++k)
-        q_dls[k] = computeDlsExtrapolation(q_dls[k - 1], predictTargetPose(k));
+        q_dls[k] =
+            computeDlsExtrapolation(q_dls[k - 1], predictTargetPose(k), v_limit, target_velocity_linear_, target_velocity_angular_);
     unwrapHorizonContinuousJoints(q_dls, is_continuous, joint_limits_);
 
     const int dls_first_collision = checkCollisionInHorizon(q_dls);
@@ -696,8 +842,6 @@ void MotoMiniPlanningNode::mpcTimerCallback()
         else
         {
             // Slice the avoidance trajectory into a horizon-sized window.
-            // q_publish[0] = anchor (matches what we last commanded);
-            // q_publish[1..H] = next H steps from the avoidance buffer.
             q_publish.resize(horizon + 1);
             q_publish[0] = q_anchor;
             for (int k = 1; k <= horizon; ++k)
@@ -709,8 +853,7 @@ void MotoMiniPlanningNode::mpcTimerCallback()
             avoidance_idx_++;
             rl.unlock();
 
-            // Re-validate against the LIVE environment (the obstacle
-            // could have moved or grown since the plan was made).
+            // Re-validate against the LIVE environment
             const int recheck = checkCollisionInHorizon(q_publish);
             if (recheck >= 0)
             {
@@ -732,32 +875,75 @@ void MotoMiniPlanningNode::mpcTimerCallback()
 
     // Re-unwrap (avoidance slices may have been seeded fresh).
     unwrapHorizonContinuousJoints(q_publish, is_continuous, joint_limits_);
+    if (q_publish.empty())
+        return;
 
     // ------------------------------------------------------------------
-    // CROSS-TICK VELOCITY LPF — produces the smooth merge between modes.
+    // COMMAND SHAPER — rate, acceleration and feedback lead limiting.
     // ------------------------------------------------------------------
-    static Eigen::VectorXd v_last_published =
-        Eigen::VectorXd::Zero(n_joints);
-    static bool lpf_primed = false;
-
-    if (lpf_primed && q_publish.size() >= 2 && v_last_published.size() == n_joints)
+    if (q_publish.size() >= 2)
     {
-        const double alpha_v = 0.6;
-        Eigen::VectorXd v_raw = (q_publish[1] - q_publish[0]) / mpc_dt_;
-        Eigen::VectorXd v_smooth = alpha_v * v_raw + (1.0 - alpha_v) * v_last_published;
+        Eigen::VectorXd prev_q = q_publish[0];
+        Eigen::VectorXd prev_v =
+            (last_tracking_velocity_command_.size() == n_joints)
+                ? last_tracking_velocity_command_
+                : Eigen::VectorXd::Zero(n_joints);
+        Eigen::VectorXd first_segment_v = Eigen::VectorXd::Zero(n_joints);
 
-        for (int j = 0; j < n_joints; ++j)
-            v_smooth[j] = std::max(-v_max[j], std::min(v_max[j], v_smooth[j]));
+        const double max_dv = std::max(0.0, tracking_accel_limit_) * mpc_dt_;
+        const double lead_limit = std::max(0.0, tracking_command_lead_limit_);
 
-        Eigen::VectorXd q1 = q_publish[0] + v_smooth * mpc_dt_;
-        for (int j = 0; j < n_joints; ++j)
-            q1[j] = std::max(joint_limits_(j, 0),
-                             std::min(joint_limits_(j, 1), q1[j]));
-        q_publish[1] = q1;
+        for (size_t k = 1; k < q_publish.size(); ++k)
+        {
+            Eigen::VectorXd v_cmd = (q_publish[k] - prev_q) / mpc_dt_;
+
+            for (int j = 0; j < n_joints; ++j)
+            {
+                // 1. Limit strictly based on maximum linear acceleration bounds (slew rate)
+                if (max_dv > 0.0)
+                {
+                    v_cmd[j] = std::clamp(v_cmd[j], prev_v[j] - max_dv, prev_v[j] + max_dv);
+                }
+
+                // 2. Clamp mathematically to absolute velocity limits
+                v_cmd[j] = std::clamp(v_cmd[j], -v_limit[j], v_limit[j]);
+            }
+
+            Eigen::VectorXd q_next = prev_q + v_cmd * mpc_dt_;
+            for (int j = 0; j < n_joints; ++j)
+            {
+                q_next[j] = std::clamp(q_next[j],
+                                       joint_limits_(j, 0),
+                                       joint_limits_(j, 1));
+
+                if (lead_limit > 1e-9 && q_feedback.size() == n_joints)
+                {
+                    const double future_allow =
+                        lead_limit + static_cast<double>(k) * mpc_dt_ * v_limit[j];
+                    q_next[j] = std::clamp(q_next[j],
+                                           q_feedback[j] - future_allow,
+                                           q_feedback[j] + future_allow);
+                }
+            }
+
+            q_publish[k] = q_next;
+            if (k == 1)
+                first_segment_v = v_cmd;
+            prev_q = q_next;
+            prev_v = v_cmd;
+        }
+
+        last_tracking_velocity_command_ = first_segment_v;
+        has_tracking_velocity_command_ = true;
+    }
+    else
+    {
+        last_tracking_velocity_command_ = Eigen::VectorXd::Zero(n_joints);
+        has_tracking_velocity_command_ = true;
     }
 
     // ------------------------------------------------------------------
-    // VELOCITY GATE (always on)
+    // VELOCITY GATE (always on, against the scaled tracking envelope)
     // ------------------------------------------------------------------
     bool safe = true;
     double worst_ratio = 0.0;
@@ -766,7 +952,7 @@ void MotoMiniPlanningNode::mpcTimerCallback()
         for (int j = 0; j < n_joints; ++j)
         {
             const double v = std::abs(q_publish[k][j] - q_publish[k - 1][j]) / mpc_dt_;
-            const double r = v / std::max(v_max[j], 1e-6);
+            const double r = v / std::max(v_limit[j], 1e-6);
             if (r > worst_ratio)
             {
                 worst_ratio = r;
@@ -778,34 +964,25 @@ void MotoMiniPlanningNode::mpcTimerCallback()
     if (!safe)
     {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                             "Controller: rejecting tick — joint %d at %.2fx v_max (mode=%s).",
+                             "Controller: rejecting tick — joint %d at %.2fx tracking velocity limit (mode=%s).",
                              worst_joint, worst_ratio, mode_str);
         return;
     }
-    v_last_published = (q_publish[1] - q_publish[0]) / mpc_dt_;
-    lpf_primed = true;
 
     // ------------------------------------------------------------------
-    // BUILD JointTrajectory
+    // BUILD dense JointTrajectory
     // ------------------------------------------------------------------
-    tesseract_common::JointTrajectory tess_traj;
-    tess_traj.reserve(q_publish.size());
-    for (size_t k = 0; k < q_publish.size(); ++k)
-    {
-        tesseract_common::JointState s;
-        s.joint_names = joint_names;
-        s.position = q_publish[k];
-        s.time = k * mpc_dt_;
-        if (q_publish.size() == 1)
-            s.velocity = Eigen::VectorXd::Zero(n_joints);
-        else if (k == 0)
-            s.velocity = (q_publish[1] - q_publish[0]) / mpc_dt_;
-        else if (k == q_publish.size() - 1)
-            s.velocity = (q_publish[k] - q_publish[k - 1]) / mpc_dt_;
-        else
-            s.velocity = (q_publish[k + 1] - q_publish[k - 1]) / (2.0 * mpc_dt_);
-        tess_traj.push_back(s);
-    }
+    const double publish_dt =
+        tracking_use_smooth_output_
+            ? std::clamp(tracking_output_dt_, 0.001, mpc_dt_)
+            : mpc_dt_;
+    tesseract_common::JointTrajectory tess_traj =
+        buildDenseSmoothTrajectory(q_publish,
+                                   joint_names,
+                                   mpc_dt_,
+                                   publish_dt,
+                                   v_limit,
+                                   tracking_use_smooth_output_);
 
     // ------------------------------------------------------------------
     // PUBLISH
@@ -814,7 +991,7 @@ void MotoMiniPlanningNode::mpcTimerCallback()
     static double smooth_splice = 0.0;
     smooth_splice = 0.2 * solve_elapsed + 0.8 * smooth_splice;
     const double splice_to_send = std::min(smooth_splice, 0.100);
-    publishTrajectory(tess_traj, joint_names, splice_to_send, mpc_dt_);
+    publishTrajectory(tess_traj, joint_names, splice_to_send, publish_dt);
 
     // ------------------------------------------------------------------
     // UPDATE WARM-START
@@ -832,6 +1009,7 @@ void MotoMiniPlanningNode::mpcTimerCallback()
     // ------------------------------------------------------------------
     if (pub_ee_path_)
     {
+        // 1. Robot Horizon Path Marker
         visualization_msgs::msg::Marker marker;
         marker.header.frame_id = base_link_;
         marker.header.stamp = this->now();
@@ -875,6 +1053,31 @@ void MotoMiniPlanningNode::mpcTimerCallback()
             }
         }
         pub_ee_path_->publish(marker);
+
+        // 2. Predicted Target Path Marker
+        visualization_msgs::msg::Marker target_marker;
+        target_marker.header.frame_id = base_link_;
+        target_marker.header.stamp = this->now();
+        target_marker.ns = "predicted_target_path";
+        target_marker.id = 2; // Unique ID to draw alongside the robot path
+        target_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        target_marker.action = visualization_msgs::msg::Marker::ADD;
+        target_marker.scale.x = 0.005;
+        target_marker.color.r = 0.0f;
+        target_marker.color.g = 1.0f;
+        target_marker.color.b = 1.0f; // Cyan color for target prediction
+        target_marker.color.a = 1.0f;
+
+        for (int k = 0; k <= horizon; ++k)
+        {
+            Eigen::Isometry3d pred = predictTargetPose(k);
+            geometry_msgs::msg::Point p;
+            p.x = pred.translation().x();
+            p.y = pred.translation().y();
+            p.z = pred.translation().z();
+            target_marker.points.push_back(p);
+        }
+        pub_ee_path_->publish(target_marker);
     }
 
     // ------------------------------------------------------------------
@@ -890,5 +1093,3 @@ void MotoMiniPlanningNode::mpcTimerCallback()
                           "ctrl  mode=%s  H=%d  solve=%.2fms  splice=%.1fms  worst_v=%.2fx",
                           mode_str, horizon, duration_ms, splice_to_send * 1000.0, worst_ratio);
 }
-
-void MotoMiniPlanningNode::buildAndPublishTrajectory() {}

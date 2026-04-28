@@ -92,12 +92,35 @@ motomini_planning_node:
     # ===========================================================================
     #  MPC TRACKING PARAMETERS
     # ===========================================================================
-    tracking_horizon: 5                   # number of horizon steps
+    tracking_horizon: 8                   # number of horizon steps; keep >=5 for smooth streaming
     tracking_dt: 0.02                      # MPC time step (seconds)
     tracking_w_cart: 10.0                  # Cartesian tracking weight
     tracking_w_vel: 1.0                    # Velocity smoothing weight
     tracking_w_acc: 0.5                    # Acceleration smoothing weight
     tracking_d_safe: 0.01                  # Collision safety margin (meters)
+    tracking_velocity_limit_scale: 0.65    # fraction of URDF joint velocity limits for real robot tracking
+    tracking_accel_limit: 8.0              # joint velocity slew limit (rad/s^2)
+    tracking_command_lead_limit: 0.12      # max command lead over measured joints (rad)
+    tracking_velocity_filter_alpha: 0.55   # higher = more responsive, lower = smoother
+    tracking_start_ramp_time: 0.6          # seconds to S-ramp from start scale to full tracking velocity
+    tracking_start_velocity_scale: 0.15    # initial fraction during ramp; avoids a hard first tick
+    tracking_target_pos_alpha: 0.35        # target pose smoothing; higher tracks target updates faster
+    tracking_target_rot_alpha: 0.20        # target orientation smoothing
+    tracking_output_dt: 0.004              # dense trajectory resolution sent to /path_command (seconds)
+    tracking_use_smooth_output: true       # cubic smooth output instead of coarse MPC knots
+    tracking_cart_pos_gain: 1.0            # Cartesian position step gain before speed clamp
+    tracking_cart_rot_gain: 0.5            # Cartesian orientation step gain before speed clamp
+    tracking_max_cart_speed: 0.25          # max Cartesian correction speed (m/s)
+    tracking_max_rot_speed: 1.0            # max orientation correction speed (rad/s)
+    tracking_orientation_weight: 0.0       # 0=position-only straight tracking, 1=full orientation tracking
     # 0 = DISCRETE, 1 = CONTINUOUS, 2 = LVS_CONTINUOUS
     tracking_coll_type: 0
     tracking_max_iter: 3                   # Max SQP iterations per tick
+
+motomini_traj_streamer:
+  ros__parameters:
+    rate_hz: 125.0                         # final /joint_command publish rate
+    interpolate_stream_output: true        # Hermite interpolate between cache samples
+    min_traj_update_interval_sec: 0.02     # accept new /path_command at most every 20 ms
+    splice_w_pos: 1.0                      # cache splice position matching weight
+    splice_w_vel: 0.5                      # cache splice velocity matching weight

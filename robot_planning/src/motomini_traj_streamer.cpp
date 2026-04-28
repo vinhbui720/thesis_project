@@ -118,14 +118,20 @@ class MotoMiniTrajStreamer : public rclcpp::Node
 public:
     MotoMiniTrajStreamer() : rclcpp::Node("motomini_traj_streamer")
     {
-        this->declare_parameter<double>("rate_hz", 50.0);
+        this->declare_parameter<double>("rate_hz", 125.0);
         this->declare_parameter<double>("splice_w_pos", 1.0);
         this->declare_parameter<double>("splice_w_vel", 0.5);
+        this->declare_parameter<bool>("interpolate_stream_output", true);
+        this->declare_parameter<double>("min_traj_update_interval_sec", 0.02);
 
         rate_hz_ = this->get_parameter("rate_hz").as_double();
         dt_ = 1.0 / std::max(1.0, rate_hz_);
         splice_w_pos_ = this->get_parameter("splice_w_pos").as_double();
         splice_w_vel_ = this->get_parameter("splice_w_vel").as_double();
+        interpolate_stream_output_ =
+            this->get_parameter("interpolate_stream_output").as_bool();
+        min_traj_update_interval_sec_ =
+            this->get_parameter("min_traj_update_interval_sec").as_double();
 
         joint_names_ = {"joint_1_s", "joint_2_l", "joint_3_u",
                         "joint_4_r", "joint_5_b", "joint_6_t"};
@@ -209,7 +215,10 @@ private:
         if (state_.load() != STATE_STREAMING) return;
 
         const double since_last = (this->now() - last_traj_accept_time_).seconds();
-        if (last_traj_accept_time_.nanoseconds() > 0 && since_last < MIN_TRAJ_UPDATE_INTERVAL_S) {
+        const double min_update_interval =
+            std::max(0.0, min_traj_update_interval_sec_);
+        if (last_traj_accept_time_.nanoseconds() > 0 &&
+            since_last < min_update_interval) {
             return;
         }
         last_traj_accept_time_ = this->now();
@@ -531,6 +540,69 @@ private:
         pub_stream_->publish(traj);
     }
 
+    void sampleCache(const std::shared_ptr<ProcessedCache> &cache,
+                     double elapsed,
+                     std::vector<double> &out_pos,
+                     std::vector<double> &out_vel) const
+    {
+        if (!cache || !cache->dense_filled || cache->pos.empty())
+            return;
+
+        if (elapsed <= 0.0)
+        {
+            for (size_t i = 0; i < n_joints_; ++i)
+            {
+                out_pos[i] = cache->pos.front()[i];
+                out_vel[i] = cache->vel.front()[i];
+            }
+            return;
+        }
+
+        if (elapsed >= cache->time.back())
+        {
+            for (size_t i = 0; i < n_joints_; ++i)
+            {
+                out_pos[i] = cache->pos.back()[i];
+                out_vel[i] = 0.0;
+            }
+            return;
+        }
+
+        const auto upper = std::upper_bound(cache->time.begin(),
+                                            cache->time.end(),
+                                            elapsed);
+        size_t idx = static_cast<size_t>(
+            std::distance(cache->time.begin(), upper));
+        idx = std::clamp(idx, static_cast<size_t>(1), cache->time.size() - 1);
+        const size_t i0 = idx - 1;
+        const size_t i1 = idx;
+
+        const double t0 = cache->time[i0];
+        const double t1 = cache->time[i1];
+        const double T = std::max(1e-9, t1 - t0);
+        const double local_t = elapsed - t0;
+
+        for (size_t i = 0; i < n_joints_; ++i)
+        {
+            if (interpolate_stream_output_)
+            {
+                HermiteBlend h;
+                h.p0 = cache->pos[i0][i];
+                h.v0 = cache->vel[i0][i];
+                h.p1 = cache->pos[i1][i];
+                h.v1 = cache->vel[i1][i];
+                h.T = T;
+                out_pos[i] = h.pos(local_t);
+                out_vel[i] = h.vel(local_t);
+            }
+            else
+            {
+                out_pos[i] = cache->pos[i0][i];
+                out_vel[i] = cache->vel[i0][i];
+            }
+        }
+    }
+
     // RT thread: pure O(1) cache lookup — no clamping, no integrator.
     // All smoothing is pre-computed offline by the worker thread.
     void doStream()
@@ -552,19 +624,7 @@ private:
         if (cache && cache->dense_filled && !cache->pos.empty()) {
             const double elapsed = (this->now() - traj_start_time_).seconds();
             if (elapsed >= 0.0) {
-                const size_t idx = static_cast<size_t>(elapsed / cache->dt);
-                if (idx >= cache->pos.size()) {
-                    // End of trajectory — hold last waypoint, zero velocity
-                    for (size_t i = 0; i < n_joints_; ++i) {
-                        out_pos[i] = cache->pos.back()[i];
-                        out_vel[i] = 0.0;
-                    }
-                } else {
-                    for (size_t i = 0; i < n_joints_; ++i) {
-                        out_pos[i] = cache->pos[idx][i];
-                        out_vel[i] = cache->vel[idx][i];
-                    }
-                }
+                sampleCache(cache, elapsed, out_pos, out_vel);
             }
         }
 
@@ -649,6 +709,8 @@ private:
     size_t n_joints_{6};
     double rate_hz_{50.0};
     double dt_{0.02};
+    bool interpolate_stream_output_{true};
+    double min_traj_update_interval_sec_{MIN_TRAJ_UPDATE_INTERVAL_S};
     rclcpp::Time stream_epoch_{0, 0, RCL_ROS_TIME};
 
     std::atomic<State> state_{STATE_WAIT_JOINT};
