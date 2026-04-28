@@ -215,6 +215,7 @@ ament_target_dependencies(online_collision_debugger
   rclcpp
   sensor_msgs
   std_msgs
+  geometry_msgs
   visualization_msgs
 )
 

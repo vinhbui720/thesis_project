@@ -15,6 +15,7 @@
  *   Sub:  /joint_states                    (sensor_msgs/JointState)
  *   Sub:  /motomini/target_pose            (geometry_msgs/PoseStamped)
  *   Sub:  /motomini/target_vel             (geometry_msgs/Twist — linear=world, angular=body)
+ *   Sub:  /motomini/collision_wrench       (geometry_msgs/WrenchStamped)
  *   Sub:  /pose_following/init_pose        (geometry_msgs/PoseStamped, latched)
  *   Pub:  /joint_path_command              (trajectory_msgs/JointTrajectory – arm init, one-time)
  *   Pub:  joint_command                    (trajectory_msgs/JointTrajectory – streaming)
@@ -118,6 +119,7 @@
 #include <Eigen/Dense>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -177,6 +179,7 @@ public:
         // Cartesian-velocity safety clamps applied to the integrator state.
         this->declare_parameter<double>("max_cart_linear_vel", DEFAULT_MAX_CART_LINEAR_VEL);
         this->declare_parameter<double>("max_cart_angular_vel", DEFAULT_MAX_CART_ANGULAR_VEL);
+        this->declare_parameter<double>("collision_wrench_timeout_sec", 0.2);
 
         // ----- Read parameters -----
         this->get_parameter("robot_description", urdf_xml_);
@@ -204,6 +207,7 @@ public:
         adaptive_alpha_ori_ = this->get_parameter("adaptive_alpha_ori").as_double();
         max_cart_linear_vel_ = this->get_parameter("max_cart_linear_vel").as_double();
         max_cart_angular_vel_ = this->get_parameter("max_cart_angular_vel").as_double();
+        collision_wrench_timeout_sec_ = this->get_parameter("collision_wrench_timeout_sec").as_double();
 
         const auto &overrides =
             this->get_node_parameters_interface()->get_parameter_overrides();
@@ -270,6 +274,10 @@ public:
             "/motomini/target_vel", 10,
             std::bind(&MotoMiniFeedbackStreamNode::targetVelCallback, this, std::placeholders::_1));
 
+        sub_collision_wrench_ = this->create_subscription<geometry_msgs::msg::WrenchStamped>(
+            "/motomini/collision_wrench", 10,
+            std::bind(&MotoMiniFeedbackStreamNode::collisionWrenchCallback, this, std::placeholders::_1));
+
         // ----- Services -----
         srv_start_ = this->create_service<std_srvs::srv::Trigger>(
             "/pose_following/start",
@@ -299,7 +307,9 @@ public:
         t_last_ = this->now();
         t_last_pose_cb_ = this->now();
         t_last_target_vel_cb_ = this->now();
+        t_last_collision_wrench_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         latest_target_vel_.setZero();
+        latest_collision_wrench_.setZero();
 
         // ----- Control loop -----
         auto period_ns = std::chrono::nanoseconds(
@@ -696,18 +706,18 @@ private:
 
         // --- Adaptive virtual-impedance gains (separate trans / rot) ---
         const double k_pos_var = s_w *
-            (k_pos_min_ + s_t * s_e_pos * (k_pos_max_ - k_pos_min_));
+                                 (k_pos_min_ + s_t * s_e_pos * (k_pos_max_ - k_pos_min_));
         const double m_pos_var = m_pos_max_ -
-            s_t * s_e_pos * (m_pos_max_ - m_pos_min_);
+                                 s_t * s_e_pos * (m_pos_max_ - m_pos_min_);
         const double d_pos_var = 2.0 * zeta_pos_ *
-            std::sqrt(std::max(1e-12, m_pos_var * k_pos_var));
+                                 std::sqrt(std::max(1e-12, m_pos_var * k_pos_var));
 
         const double k_ori_var = s_w *
-            (k_ori_min_ + s_t * s_e_ori * (k_ori_max_ - k_ori_min_));
+                                 (k_ori_min_ + s_t * s_e_ori * (k_ori_max_ - k_ori_min_));
         const double m_ori_var = m_ori_max_ -
-            s_t * s_e_ori * (m_ori_max_ - m_ori_min_);
+                                 s_t * s_e_ori * (m_ori_max_ - m_ori_min_);
         const double d_ori_var = 2.0 * zeta_ori_ *
-            std::sqrt(std::max(1e-12, m_ori_var * k_ori_var));
+                                 std::sqrt(std::max(1e-12, m_ori_var * k_ori_var));
 
         // --- Joint velocity θ̇: prefer driver field, fall back to numerical diff ---
         Eigen::VectorXd qdot = Eigen::VectorXd::Zero(q.size());
@@ -722,9 +732,17 @@ private:
                 auto it = std::find(last_joint_state_->name.begin(),
                                     last_joint_state_->name.end(),
                                     joint_names_[i]);
-                if (it == last_joint_state_->name.end()) { ok = false; break; }
+                if (it == last_joint_state_->name.end())
+                {
+                    ok = false;
+                    break;
+                }
                 const size_t idx = std::distance(last_joint_state_->name.begin(), it);
-                if (idx >= last_joint_state_->velocity.size()) { ok = false; break; }
+                if (idx >= last_joint_state_->velocity.size())
+                {
+                    ok = false;
+                    break;
+                }
                 qdot_drv[static_cast<Eigen::Index>(i)] = last_joint_state_->velocity[idx];
             }
             if (ok && qdot_drv.allFinite())
@@ -758,25 +776,20 @@ private:
 
         const Eigen::Matrix<double, 6, 1> velocity_error = xdot_actual - xdot_des;
 
-        // --- External/contact wrench placeholder. Future collision avoidance
-        //     or force feedback should write a Cartesian wrench here. The sign
-        //     convention below treats positive F_collision as a disturbance
-        //     that the virtual dynamics should yield against.
+        // --- Collision wrench from /motomini/collision_wrench ---
+        // The debug node publishes a repulsive push-away wrench. The callback
+        // stores the controller-side sign so this term can be used directly.
         Eigen::Matrix<double, 6, 1> F_collision;
         F_collision.setZero();
+        const double dt_collision_wrench =
+            (this->now() - t_last_collision_wrench_cb_).seconds();
+        if (dt_collision_wrench < collision_wrench_timeout_sec_)
+            F_collision = latest_collision_wrench_;
 
         // --- Virtual acceleration ẍ_ref = M⁻¹·(K·e − D·ė − F − D·ẋ_ref) ---
         Eigen::Matrix<double, 6, 1> xddot_ref;
-        xddot_ref.head<3>() = (k_pos_var * e_p_
-                               - d_pos_var * velocity_error.head<3>()
-                               - F_collision.head<3>()
-                               - d_pos_var * xdot_ref_.head<3>())
-                              / std::max(1e-9, m_pos_var);
-        xddot_ref.tail<3>() = (k_ori_var * e_o_
-                               - d_ori_var * velocity_error.tail<3>()
-                               - F_collision.tail<3>()
-                               - d_ori_var * xdot_ref_.tail<3>())
-                              / std::max(1e-9, m_ori_var);
+        xddot_ref.head<3>() = (k_pos_var * e_p_ - d_pos_var * velocity_error.head<3>() - F_collision.head<3>() - d_pos_var * xdot_ref_.head<3>()) / std::max(1e-9, m_pos_var);
+        xddot_ref.tail<3>() = (k_ori_var * e_o_ - d_ori_var * velocity_error.tail<3>() - F_collision.tail<3>() - d_ori_var * xdot_ref_.tail<3>()) / std::max(1e-9, m_ori_var);
 
         // --- Integrate ẋ_ref ---
         const double dt_safe =
@@ -804,6 +817,8 @@ private:
         xdot_ref_.setZero();
         have_q_prev_ctrl_ = false;
         q_prev_ctrl_.resize(0);
+        latest_collision_wrench_.setZero();
+        t_last_collision_wrench_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     }
 
     void resetControlWindow()
@@ -894,6 +909,20 @@ private:
                             "STATE_IDLE → STATE_POSE_FOLLOW (target_vel input)");
             }
         }
+    }
+
+    // Debug wrench is published as a repulsive push-away wrench. Cache the
+    // controller-side sign so the existing "- F_collision" term uses it
+    // directly without changing the main control law.
+    void collisionWrenchCallback(const geometry_msgs::msg::WrenchStamped::SharedPtr msg)
+    {
+        latest_collision_wrench_ << -msg->wrench.force.x,
+            -msg->wrench.force.y,
+            -msg->wrench.force.z,
+            -msg->wrench.torque.x,
+            -msg->wrench.torque.y,
+            -msg->wrench.torque.z;
+        t_last_collision_wrench_cb_ = this->now();
     }
 
     // Latched init target pose (published once before calling /init_start)
@@ -1244,7 +1273,7 @@ private:
     double max_cart_linear_vel_, max_cart_angular_vel_;
 
     // --- Virtual Cartesian-velocity integrator state ---
-    Eigen::Matrix<double, 6, 1> xdot_ref_{Eigen::Matrix<double,6,1>::Zero()};
+    Eigen::Matrix<double, 6, 1> xdot_ref_{Eigen::Matrix<double, 6, 1>::Zero()};
 
     // --- Numerical θ̇ history for the controller's velocity-error term ---
     Eigen::VectorXd q_prev_ctrl_;
@@ -1263,13 +1292,18 @@ private:
     Eigen::Vector3d e_o_;
 
     // --- Time ---
-    rclcpp::Time t_start_;             // reset at each IDLE → active transition
-    rclcpp::Time t_last_;              // last tick timestamp
-    rclcpp::Time t_last_pose_cb_;      // last desired-pose callback time
-    rclcpp::Time t_last_target_vel_cb_;// last target-velocity callback time
+    rclcpp::Time t_start_;              // reset at each IDLE → active transition
+    rclcpp::Time t_last_;               // last tick timestamp
+    rclcpp::Time t_last_pose_cb_;       // last desired-pose callback time
+    rclcpp::Time t_last_target_vel_cb_; // last target-velocity callback time
+    rclcpp::Time t_last_collision_wrench_cb_; // last collision-wrench callback time
 
     // --- Streaming target velocity (linear=base, angular=body) ---
-    Eigen::Matrix<double, 6, 1> latest_target_vel_{Eigen::Matrix<double,6,1>::Zero()};
+    Eigen::Matrix<double, 6, 1> latest_target_vel_{Eigen::Matrix<double, 6, 1>::Zero()};
+
+    // --- Latest collision wrench from /motomini/collision_wrench ---
+    Eigen::Matrix<double, 6, 1> latest_collision_wrench_{Eigen::Matrix<double, 6, 1>::Zero()};
+    double collision_wrench_timeout_sec_;
 
     // --- Numerical θ̇ history for feedback_vel (J·θ̇) ---
     Eigen::VectorXd q_prev_;
@@ -1291,6 +1325,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_vel_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_target_vel_;
+    rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr sub_collision_wrench_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_joint_state_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_desired_pose_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_init_pose_;

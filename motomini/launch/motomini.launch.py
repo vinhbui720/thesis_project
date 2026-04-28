@@ -13,6 +13,7 @@ def generate_launch_description():
     robot_planning_share = FindPackageShare("robot_planning")
     planning_params_yaml = PathJoinSubstitution([robot_planning_share, "config", "planning_params.yaml"])
     feedback_controller_yaml = PathJoinSubstitution([robot_planning_share, "config", "feedback_controller.yaml"])
+    collision_wrench_yaml = PathJoinSubstitution([robot_planning_share, "config", "collision_wrench.yaml"])
 
     # 2. Launch Configurations
     tool_type = LaunchConfiguration("tool_type")
@@ -226,8 +227,15 @@ def generate_launch_description():
             arguments=["-d", PathJoinSubstitution([motomini_share, "config", "motomini.rviz"])],
             parameters=common_params # <-- THIS IS THE CRITICAL ADDITION
         ),
-        # Collision Debugger
-        Node(package="robot_planning", executable="online_collision_debugger", parameters=common_params, condition=IfCondition(debug)),
+        # Collision Debugger (publishes /motomini/collision_wrench + RViz markers)
+        Node(
+            package="robot_planning",
+            executable="online_collision_debugger",
+            name="online_collision_debugger",
+            parameters=[*common_params, collision_wrench_yaml],
+            condition=IfCondition(debug),
+            output="screen",
+        ),
 
         # Manual Controller (FIXED: Uses FindPackageShare instead of hardcoded home path)
         Node(

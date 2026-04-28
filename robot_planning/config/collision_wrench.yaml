@@ -1,0 +1,177 @@
+###############################################################################
+# online_collision_debugger.yaml
+#
+# Purpose:
+#   Real-time Tesseract collision-distance monitor and virtual collision-wrench
+#   publisher for local obstacle/self-collision avoidance.
+#
+#   This node reads /joint_states, updates the Tesseract environment, computes
+#   closest contact pairs, converts distance + contact normal into a virtual
+#   repulsive force, and publishes a total collision wrench that can be consumed
+#   by the main impedance/admittance controller.
+#
+# Output wrench:
+#
+#   W_collision =
+#   [ Fx, Fy, Fz, Tx, Ty, Tz ]^T
+#
+#   For the current controller, usually only the force part is used:
+#
+#   F_collision = [ Fx, Fy, Fz ]^T
+#
+# Per-contact force model:
+#
+#   d_i  = contact distance
+#   n_i  = unit push-away direction
+#   d0   = collision_influence_distance
+#   ds   = collision_safe_distance
+#
+#   If d_i >= d0:
+#
+#       F_i = 0
+#
+#   If d_i < d0:
+#
+#       F_rep,i =
+#           collision_k_rep *
+#           (1 / d_i - 1 / d0) *
+#           (1 / d_i^2) *
+#           n_i
+#
+#   If d_i < ds, add extra hold force:
+#
+#       F_hold,i =
+#           collision_k_hold *
+#           (ds - d_i) *
+#           n_i
+#
+#   Total per-contact force:
+#
+#       F_i = F_rep,i + F_hold,i
+#
+#   Then clamp:
+#
+#       |F_i| <= collision_force_max_per_contact
+#
+# Total force:
+#
+#       F_total = sum_i F_i
+#
+#   Then clamp:
+#
+#       |F_total| <= collision_force_max_total
+#
+# Torque part of wrench:
+#
+#   p_i   = contact point
+#   p_ref = pose of wrench_reference_link
+#   r_i   = p_i - p_ref
+#
+#       T_i = r_i x F_i
+#
+#       T_total = sum_i T_i
+#
+#   Note:
+#     The first controller version can ignore torque and only use force.
+#     Torque is mainly useful later for whole-body/link-level avoidance.
+#
+# Important force-direction rule:
+#   Do not sum both sides of a contact pair blindly.
+#   Contact forces on link0 and link1 are equal and opposite, so summing both
+#   can cancel to zero. For controller avoidance, use the robot-side push force
+#   or the selected force_for_controller computed by this node.
+#
+# Parameter effects:
+#
+#   collision_threshold:
+#     Distance margin used by Tesseract contact checking. Contacts with distance
+#     below this value are returned/visualized. Usually keep this equal to or
+#     slightly larger than collision_influence_distance.
+#
+#   contact_point_radius:
+#     RViz sphere size for nearest contact points only. No control effect.
+#
+#   debug_markers_enabled:
+#     If true, publish RViz markers for distance lines, contact points, contact
+#     normals, and force arrows. If false, only computation/wrench publishing
+#     remains active.
+#
+#   publish_collision_wrench:
+#     If true, publish the final W_collision topic for the main controller.
+#
+#   publish_contact_debug_text:
+#     If true, publish readable contact/debug information as text.
+#
+#   marker_frame:
+#     Frame used for RViz markers.
+#
+#   wrench_frame:
+#     Frame used in the WrenchStamped message. This should match the frame used
+#     by the main controller for Cartesian force input.
+#
+#   wrench_reference_link:
+#     Link used as the reference point p_ref for torque calculation.
+#     Common choice: tool0.
+#
+#   collision_influence_distance:
+#     Distance d0 where repulsive force starts. Larger value makes avoidance
+#     start earlier. Smaller value makes avoidance react later.
+#
+#   collision_safe_distance:
+#     Distance ds where stronger hold force starts. Larger value is safer but
+#     more conservative.
+#
+#   collision_k_rep:
+#     Gain for smooth inverse-distance repulsive force. Increase for stronger
+#     early avoidance. Decrease if the robot is pushed away too aggressively.
+#
+#   collision_k_hold:
+#     Gain for close-range hold force. Increase if the robot still approaches
+#     too close. Decrease if near-contact behavior is too abrupt.
+#
+#   collision_force_max_per_contact:
+#     Saturation for each individual contact force. Prevents one bad/noisy
+#     contact from dominating the controller.
+#
+#   collision_force_max_total:
+#     Saturation for total published force. This is the final safety clamp before
+#     sending the wrench to the controller.
+#
+#   force_arrow_min_length:
+#     Minimum visible length for RViz force arrows.
+#
+#   force_arrow_max_length:
+#     Maximum visible length for RViz force arrows.
+#
+#   force_arrow_length_gain:
+#     Optional scale factor for force arrow length if the implementation uses
+#     direct length = gain * |F|. No control effect.
+###############################################################################
+online_collision_debugger:
+  ros__parameters:
+    # Contact detection
+    collision_threshold: 0.10
+    contact_point_radius: 0.008
+
+    # Output channels
+    debug_markers_enabled: true
+    publish_collision_wrench: true
+    publish_contact_debug_text: true
+
+    # Frames
+    marker_frame: world
+    wrench_frame: world
+    wrench_reference_link: tool0
+
+    # Force model
+    collision_influence_distance: 0.10
+    collision_safe_distance: 0.04
+    collision_k_rep: 0.0005
+    collision_k_hold: 50.0
+    collision_force_max_per_contact: 10.0
+    collision_force_max_total: 25.0
+
+    # Force-arrow shaping (length is proportional to |F|)
+    force_arrow_min_length: 0.01
+    force_arrow_max_length: 0.25
+    force_arrow_length_gain: 0.04
