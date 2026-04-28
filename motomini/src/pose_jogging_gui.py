@@ -12,7 +12,7 @@ import tkinter as tk
 from typing import Dict, List, Optional
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -50,7 +50,8 @@ class PoseJoggingNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self.target_pub = self.create_publisher(PoseStamped, "/user_defined/desired_path_point", 10)
+        self.target_pub = self.create_publisher(PoseStamped, "/motomini/target_pose", 10)
+        self.target_vel_pub = self.create_publisher(Twist, "/motomini/target_vel", 10)
         self.init_pose_pub = self.create_publisher(PoseStamped, "/pose_following/init_pose", 10)
 
         self.start_cli = self.create_client(Trigger, "/pose_following/start")
@@ -165,8 +166,12 @@ class PoseJoggingNode(Node):
             self.sync_target_to_current()
             return
 
-        lin = self.max_linear_speed * self.speed_scale * self.dt
-        ang = self.max_angular_speed * self.speed_scale * self.dt
+        # Per-tick increments (used for the integrated target pose).
+        lin_step = self.max_linear_speed * self.speed_scale * self.dt
+        ang_step = self.max_angular_speed * self.speed_scale * self.dt
+        # Instantaneous Cartesian velocity command (used for /motomini/target_vel).
+        lin_rate = self.max_linear_speed * self.speed_scale
+        ang_rate = self.max_angular_speed * self.speed_scale
 
         lin_vec = [self.pressed["x"], self.pressed["y"], self.pressed["z"]]
         lin_norm = math.sqrt(sum(v * v for v in lin_vec))
@@ -179,18 +184,53 @@ class PoseJoggingNode(Node):
             ang_vec = [v / ang_norm for v in ang_vec]
 
         with self._target_lock:
-            self.target_pos[0] += lin_vec[0] * lin
-            self.target_pos[1] += lin_vec[1] * lin
-            self.target_pos[2] += lin_vec[2] * lin
+            self.target_pos[0] += lin_vec[0] * lin_step
+            self.target_pos[1] += lin_vec[1] * lin_step
+            self.target_pos[2] += lin_vec[2] * lin_step
             if any(v != 0.0 for v in ang_vec):
-                droll = ang_vec[0] * ang
-                dpitch = ang_vec[1] * ang
-                dyaw = ang_vec[2] * ang
+                droll = ang_vec[0] * ang_step
+                dpitch = ang_vec[1] * ang_step
+                dyaw = ang_vec[2] * ang_step
                 self.target_quat = self._apply_rpy_delta(self.target_quat, droll, dpitch, dyaw)
 
         msg = self._make_pose_msg()
         if msg is not None:
             self.target_pub.publish(msg)
+
+        vmsg = Twist()
+        vmsg.linear.x = float(lin_vec[0] * lin_rate)
+        vmsg.linear.y = float(lin_vec[1] * lin_rate)
+        vmsg.linear.z = float(lin_vec[2] * lin_rate)
+        vmsg.angular.x = float(ang_vec[0] * ang_rate)
+        vmsg.angular.y = float(ang_vec[1] * ang_rate)
+        vmsg.angular.z = float(ang_vec[2] * ang_rate)
+        self.target_vel_pub.publish(vmsg)
+
+    # ------------------------------------------------------------------
+    # Snapshot helpers for GUI display (thread-safe reads of the target)
+    # ------------------------------------------------------------------
+    def get_target_xyz_rpy(self) -> Optional[List[float]]:
+        with self._target_lock:
+            if self.target_pos is None or self.target_quat is None:
+                return None
+            pos = list(self.target_pos)
+            quat = list(self.target_quat)
+        roll, pitch, yaw = self._quat_to_rpy(quat)
+        return [pos[0], pos[1], pos[2], roll, pitch, yaw]
+
+    @staticmethod
+    def _quat_to_rpy(quat: List[float]) -> List[float]:
+        # quat = [x, y, z, w]; ZYX intrinsic (roll about X, pitch about Y, yaw about Z).
+        x, y, z, w = quat
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+        sinp = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+        pitch = math.asin(sinp)
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        return [roll, pitch, yaw]
 
     @staticmethod
     def _apply_rpy_delta(quat: List[float], droll: float, dpitch: float, dyaw: float) -> List[float]:
@@ -220,10 +260,11 @@ class PoseJoggingGui:
         self.node = node
         self.root = tk.Tk()
         self.root.title("MotoMini Pose Jogging GUI")
-        self.root.geometry("560x540")
+        self.root.geometry("620x640")
 
         self._build_widgets()
         self._bind_keys()
+        self._schedule_target_refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_widgets(self) -> None:
@@ -232,7 +273,7 @@ class PoseJoggingGui:
         title.pack(pady=8)
 
         tip = tk.Label(self.root,
-                       text=("Streams target pose to /user_defined/desired_path_point.\n"
+                       text=("Streams target pose to /motomini/target_pose.\n"
                              "Hold buttons or hotkeys to nudge the target."),
                        font=("Helvetica", 10), justify="center")
         tip.pack(pady=4)
@@ -244,6 +285,13 @@ class PoseJoggingGui:
                   "Speed: 0 increase, p decrease, x stop"),
             justify="left", font=("Courier", 10))
         keymap.pack(pady=6)
+
+        # Live target-pose readout
+        self.target_label = tk.Label(
+            self.root,
+            text="target  xyz=[--, --, --]  rpy=[--, --, --]",
+            font=("Courier", 10), fg="#1a4f9c", justify="center")
+        self.target_label.pack(pady=4)
 
         # Service buttons
         svc_frame = tk.Frame(self.root)
@@ -319,6 +367,23 @@ class PoseJoggingGui:
     def _update_scale(self, delta: float) -> None:
         self.node.adjust_scale(delta)
         self.speed_var.set(self.node.speed_scale)
+
+    def _schedule_target_refresh(self) -> None:
+        self._refresh_target_label()
+        # Update at ~10 Hz — fast enough for live feedback, light on Tk.
+        self.root.after(100, self._schedule_target_refresh)
+
+    def _refresh_target_label(self) -> None:
+        snap = self.node.get_target_xyz_rpy()
+        if snap is None:
+            self.target_label.config(
+                text="target  xyz=[--, --, --]  rpy=[--, --, --]")
+            return
+        x, y, z, r, p, yw = snap
+        self.target_label.config(
+            text=(f"target  xyz=[{x:+.4f}, {y:+.4f}, {z:+.4f}] m   "
+                  f"rpy=[{math.degrees(r):+6.1f}, {math.degrees(p):+6.1f}, "
+                  f"{math.degrees(yw):+6.1f}] deg"))
 
     def _on_close(self) -> None:
         self.node.stop_all()

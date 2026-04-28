@@ -37,7 +37,7 @@ motomini_feedback_stream:
     # ===========================================================================
     # Manipulability threshold below which damping engages.
     # ↑ engages earlier (more conservative near singularities).
-    w0: 0.01
+    w0: 0.0005
 
     # Max SR damping coefficient at full singularity.
     # ↑ smoother through singularities but more lag.

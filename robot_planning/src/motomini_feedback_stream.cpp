@@ -12,10 +12,13 @@
  *
  * Topics:
  *   Sub:  /joint_states                    (sensor_msgs/JointState)
- *   Sub:  /user_defined/desired_path_point (geometry_msgs/PoseStamped)
+ *   Sub:  /motomini/target_pose            (geometry_msgs/PoseStamped)
+ *   Sub:  /motomini/target_vel             (geometry_msgs/Twist — linear=world, angular=body)
  *   Sub:  /pose_following/init_pose        (geometry_msgs/PoseStamped, latched)
  *   Pub:  /joint_path_command              (trajectory_msgs/JointTrajectory – arm init, one-time)
  *   Pub:  joint_command                    (trajectory_msgs/JointTrajectory – streaming)
+ *   Pub:  /motomini/feedback               (geometry_msgs/Twist — current EE xyz+rpy)
+ *   Pub:  /motomini/feedback_vel           (geometry_msgs/Twist — current Cartesian J·θ̇)
  *
  * Services:
  *   /pose_following/start      → reset to STATE_IDLE
@@ -80,6 +83,7 @@
 #define SAFETY_JOINT_PADDING_RAD (5.0 * M_PI / 180.0) // [rad] padding from hard limits
 #define ELASTIC_RAMP_RATE_FACTOR 10.0                 // ramp over this many seconds (×NODE_RATE)
 #define POSE_TIMEOUT_SEC 3.0                          // POSE_FOLLOW → IDLE if no pose [s]
+#define TARGET_VEL_TIMEOUT_SEC 0.5                    // stop integrating target_vel if stale [s]
 
 // ============================================================
 // SECTION 2 – INCLUDES
@@ -95,6 +99,7 @@
 #include <Eigen/Dense>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -160,18 +165,34 @@ public:
         pub_joint_cmd_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
             "joint_command", 10);
 
+        // Current EE pose (xyz + rpy) for plotting / comparison with target.
+        // linear  = (x, y, z)  [m]
+        // angular = (roll, pitch, yaw)  [rad]   ZYX intrinsic
+        pub_feedback_ = this->create_publisher<geometry_msgs::msg::Twist>(
+            "/motomini/feedback", 10);
+
+        // Current Cartesian velocity (J·θ̇) from joint feedback.
+        // linear  = (vx, vy, vz)  [m/s]      base frame
+        // angular = (ωx, ωy, ωz)  [rad/s]    base frame
+        pub_feedback_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(
+            "/motomini/feedback_vel", 10);
+
         // ----- Subscribers -----
         sub_joint_state_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 20,
             std::bind(&MotoMiniFeedbackStreamNode::jointStateCallback, this, std::placeholders::_1));
 
         sub_desired_pose_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-            "/user_defined/desired_path_point", 1,
+            "/motomini/target_pose", 1,
             std::bind(&MotoMiniFeedbackStreamNode::desiredPoseCallback, this, std::placeholders::_1));
 
         sub_init_pose_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/pose_following/init_pose", 1,
             std::bind(&MotoMiniFeedbackStreamNode::initPoseCallback, this, std::placeholders::_1));
+
+        sub_target_vel_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "/motomini/target_vel", 10,
+            std::bind(&MotoMiniFeedbackStreamNode::targetVelCallback, this, std::placeholders::_1));
 
         // ----- Services -----
         srv_start_ = this->create_service<std_srvs::srv::Trigger>(
@@ -205,6 +226,8 @@ public:
         t_start_ = this->now();
         t_last_ = this->now();
         t_last_pose_cb_ = this->now();
+        t_last_target_vel_cb_ = this->now();
+        latest_target_vel_.setZero();
 
         // ----- Control loop -----
         auto period_ns = std::chrono::nanoseconds(
@@ -337,6 +360,58 @@ private:
         pos = it->second.translation();
         rot = it->second.rotation();
         return true;
+    }
+
+    // Compute current EE pose from joint feedback and publish (xyz, rpy).
+    // RPY uses ZYX intrinsic (roll about X, pitch about Y, yaw about Z).
+    void publishFeedback()
+    {
+        Eigen::VectorXd q;
+        if (!currentJointVector(q))
+            return;
+        Eigen::Vector3d pos;
+        Eigen::Matrix3d rot;
+        if (!getEEPose(q, pos, rot))
+            return;
+
+        const Eigen::Vector3d rpy = rot.eulerAngles(0, 1, 2);
+
+        geometry_msgs::msg::Twist msg;
+        msg.linear.x = pos.x();
+        msg.linear.y = pos.y();
+        msg.linear.z = pos.z();
+        msg.angular.x = rpy.x();
+        msg.angular.y = rpy.y();
+        msg.angular.z = rpy.z();
+        pub_feedback_->publish(msg);
+
+        // Cartesian velocity = J(q) · θ̇.
+        // We derive θ̇ by numerical differentiation of observed joint positions,
+        // because many drivers/simulators leave the JointState.velocity field
+        // empty or zero. This guarantees the topic always reflects real motion.
+        const rclcpp::Time t_now = this->now();
+        Eigen::VectorXd qdot = Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_names_.size()));
+        if (have_q_prev_ && q_prev_.size() == q.size())
+        {
+            const double dt_q = (t_now - t_prev_q_).seconds();
+            if (dt_q > 1e-6)
+                qdot = (q - q_prev_) / dt_q;
+        }
+        q_prev_ = q;
+        t_prev_q_ = t_now;
+        have_q_prev_ = true;
+
+        const Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
+        const Eigen::VectorXd v_cart = J * qdot;
+
+        geometry_msgs::msg::Twist vmsg;
+        vmsg.linear.x = v_cart(0);
+        vmsg.linear.y = v_cart(1);
+        vmsg.linear.z = v_cart(2);
+        vmsg.angular.x = v_cart(3);
+        vmsg.angular.y = v_cart(4);
+        vmsg.angular.z = v_cart(5);
+        pub_feedback_vel_->publish(vmsg);
     }
 
     // ============================================================
@@ -536,6 +611,52 @@ private:
                     seed();
                 state_ = STATE_POSE_FOLLOW;
                 RCLCPP_INFO(this->get_logger(), "STATE_IDLE → STATE_POSE_FOLLOW");
+            }
+        }
+    }
+
+    // Streaming target velocity. Linear is base-frame, angular is body-frame
+    // (post-multiplied into the desired-pose quaternion). Integrated by the
+    // controller into desired_pose_ each tick while in STATE_POSE_FOLLOW.
+    void targetVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    {
+        latest_target_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
+            msg->angular.x, msg->angular.y, msg->angular.z;
+        t_last_target_vel_cb_ = this->now();
+
+        // Velocity-only entry: seed desired_pose_ from current EE and start tracking.
+        if (state_ == STATE_IDLE && latest_target_vel_.norm() > 0.0)
+        {
+            Eigen::VectorXd q;
+            Eigen::Vector3d ee_pos;
+            Eigen::Matrix3d ee_rot;
+            if (!currentJointVector(q) || !getEEPose(q, ee_pos, ee_rot))
+                return;
+            Eigen::Quaterniond qee(ee_rot);
+            desired_pose_.header.frame_id = base_link_;
+            desired_pose_.pose.position.x = ee_pos.x();
+            desired_pose_.pose.position.y = ee_pos.y();
+            desired_pose_.pose.position.z = ee_pos.z();
+            desired_pose_.pose.orientation.w = qee.w();
+            desired_pose_.pose.orientation.x = qee.x();
+            desired_pose_.pose.orientation.y = qee.y();
+            desired_pose_.pose.orientation.z = qee.z();
+            has_desired_pose_ = true;
+            t_last_pose_cb_ = this->now();
+
+            if (initTrackedPositions())
+            {
+                e_p_last_.setZero();
+                e_o_last_.setZero();
+                Kp_elastic_ = 0.0;
+                Ko_elastic_ = 0.0;
+                t_start_ = this->now();
+                t_last_ = this->now();
+                if (enable_seed_)
+                    seed();
+                state_ = STATE_POSE_FOLLOW;
+                RCLCPP_INFO(this->get_logger(),
+                            "STATE_IDLE → STATE_POSE_FOLLOW (target_vel input)");
             }
         }
     }
@@ -754,14 +875,14 @@ private:
         {
             last_state_ = state_;
             RCLCPP_INFO(this->get_logger(),
-                        "STATE_POSE_FOLLOW: tracking /user_defined/desired_path_point");
+                        "STATE_POSE_FOLLOW: tracking /motomini/target_pose");
         }
 
         if (!has_desired_pose_)
         {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                                  "STATE_POSE_FOLLOW: waiting for desired pose on "
-                                 "/user_defined/desired_path_point.");
+                                 "/motomini/target_pose.");
             return;
         }
 
@@ -792,6 +913,32 @@ private:
 
         double dt = (this->now() - t_last_).seconds();
         t_last_ = this->now();
+
+        // Integrate streaming target_vel into the desired pose.
+        // linear = base frame (added directly), angular = body frame (post-mul).
+        const double dt_vel = (this->now() - t_last_target_vel_cb_).seconds();
+        if (dt_vel < TARGET_VEL_TIMEOUT_SEC && latest_target_vel_.norm() > 0.0)
+        {
+            des_pos.x() += latest_target_vel_(0) * dt;
+            des_pos.y() += latest_target_vel_(1) * dt;
+            des_pos.z() += latest_target_vel_(2) * dt;
+            const Eigen::Quaterniond delta =
+                Eigen::AngleAxisd(latest_target_vel_(3) * dt, Eigen::Vector3d::UnitX()) *
+                Eigen::AngleAxisd(latest_target_vel_(4) * dt, Eigen::Vector3d::UnitY()) *
+                Eigen::AngleAxisd(latest_target_vel_(5) * dt, Eigen::Vector3d::UnitZ());
+            q_des = (q_des * delta).normalized();
+
+            // Persist the integrated target so the next pose-only callback
+            // doesn't snap the robot back to a stale absolute target.
+            desired_pose_.pose.position.x = des_pos.x();
+            desired_pose_.pose.position.y = des_pos.y();
+            desired_pose_.pose.position.z = des_pos.z();
+            desired_pose_.pose.orientation.w = q_des.w();
+            desired_pose_.pose.orientation.x = q_des.x();
+            desired_pose_.pose.orientation.y = q_des.y();
+            desired_pose_.pose.orientation.z = q_des.z();
+            t_last_pose_cb_ = this->now(); // velocity stream keeps follow alive
+        }
 
         Eigen::VectorXd theta_d;
         if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), theta_d))
@@ -834,6 +981,8 @@ private:
     // ============================================================
     void tick()
     {
+        publishFeedback();
+
         switch (state_)
         {
         case STATE_IDLE:
@@ -876,9 +1025,18 @@ private:
     Eigen::Vector3d e_o_, e_o_last_;
 
     // --- Time ---
-    rclcpp::Time t_start_;        // reset at each IDLE → active transition
-    rclcpp::Time t_last_;         // last tick timestamp
-    rclcpp::Time t_last_pose_cb_; // last desired-pose callback time
+    rclcpp::Time t_start_;             // reset at each IDLE → active transition
+    rclcpp::Time t_last_;              // last tick timestamp
+    rclcpp::Time t_last_pose_cb_;      // last desired-pose callback time
+    rclcpp::Time t_last_target_vel_cb_;// last target-velocity callback time
+
+    // --- Streaming target velocity (linear=base, angular=body) ---
+    Eigen::Matrix<double, 6, 1> latest_target_vel_{Eigen::Matrix<double,6,1>::Zero()};
+
+    // --- Numerical θ̇ history for feedback_vel (J·θ̇) ---
+    Eigen::VectorXd q_prev_;
+    rclcpp::Time t_prev_q_{0, 0, RCL_ROS_TIME};
+    bool have_q_prev_{false};
 
     // --- Trajectory integration ---
     std::vector<double> tracked_positions_;
@@ -892,6 +1050,9 @@ private:
     // --- ROS interfaces ---
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_path_cmd_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_joint_cmd_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_vel_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_target_vel_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_joint_state_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_desired_pose_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_init_pose_;
