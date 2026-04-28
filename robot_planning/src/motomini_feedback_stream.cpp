@@ -2,11 +2,12 @@
  * motomini_feedback_stream.cpp
  *
  * ROS2 Node: Real-time Cartesian pose following for MotoMini 6-DOF manipulator.
- * Uses Jacobian-based PD control with Singularity-Robust (SR) inverse.
+ * Uses an adaptive Cartesian admittance-inspired velocity controller with
+ * Singularity-Robust (SR) inverse Jacobian mapping.
  *
  * State Machine:
  *   STATE_IDLE       – no publishing, sync joint state
- *   STATE_INIT       – move to initial pose smoothly (elastic gain ramp-up)
+ *   STATE_INIT       – move to initial pose smoothly (adaptive warm-up)
  *   STATE_POSE_FOLLOW – track streaming desired pose
  *   STATE_STOP       – no publishing, velocity zeroed
  *
@@ -70,18 +71,36 @@
 #define JOINT_6_T_VEL_LIMIT_RADSEC (M_PI * 10.0 / 3.0)
 #define SAFETY_VELOCITY_ALPHA 0.65 // fraction of hardware limit to use
 
-// --- Controller Parameters (defaults; override via ROS params) ---
-#define DEFAULT_KP_MAX 3.5 // max proportional gain (position)
-#define DEFAULT_KO_MAX 2.5 // max proportional gain (orientation)
-#define DEFAULT_KDP 0.25   // derivative gain (position)
-#define DEFAULT_KDO 0.25   // derivative gain (orientation)
-#define DEFAULT_W0 0.01    // singularity threshold (manipulability)
-#define DEFAULT_K0 0.01    // SR damping coefficient
+// --- Legacy PD Parameters (accepted for backward-compatible YAML files) ---
+#define DEFAULT_LEGACY_KP_MAX 3.5
+#define DEFAULT_LEGACY_KO_MAX 2.5
+#define DEFAULT_LEGACY_KDP 0.25
+#define DEFAULT_LEGACY_KDO 0.25
+
+// --- Adaptive admittance defaults (override via ROS params) ---
+#define DEFAULT_M_POS_MIN 0.5
+#define DEFAULT_M_POS_MAX 5.0
+#define DEFAULT_K_POS_MIN 5.0
+#define DEFAULT_K_POS_MAX 50.0
+#define DEFAULT_ZETA_POS 0.9
+#define DEFAULT_M_ORI_MIN 0.2
+#define DEFAULT_M_ORI_MAX 2.0
+#define DEFAULT_K_ORI_MIN 2.0
+#define DEFAULT_K_ORI_MAX 20.0
+#define DEFAULT_ZETA_ORI 0.9
+#define DEFAULT_ADAPTIVE_LAMBDA 1.0
+#define DEFAULT_ADAPTIVE_ALPHA_POS 30.0
+#define DEFAULT_ADAPTIVE_ALPHA_ORI 6.0
+#define DEFAULT_MAX_CART_LINEAR_VEL 0.5
+#define DEFAULT_MAX_CART_ANGULAR_VEL 1.5
+
+// --- Singularity-Robust inverse defaults ---
+#define DEFAULT_W0 0.01 // singularity threshold (manipulability)
+#define DEFAULT_K0 0.01 // SR damping coefficient
 
 // --- Safety ---
 #define POSITION_ERROR_THRESHOLD 0.0005               // [m] init completion threshold
 #define SAFETY_JOINT_PADDING_RAD (5.0 * M_PI / 180.0) // [rad] padding from hard limits
-#define ELASTIC_RAMP_RATE_FACTOR 10.0                 // ramp over this many seconds (×NODE_RATE)
 #define POSE_TIMEOUT_SEC 3.0                          // POSE_FOLLOW → IDLE if no pose [s]
 #define TARGET_VEL_TIMEOUT_SEC 0.5                    // stop integrating target_vel if stale [s]
 
@@ -127,14 +146,37 @@ public:
         this->declare_parameter<std::string>("base_link", "base_link");
         this->declare_parameter<std::string>("ee_link", "tool0");
         this->declare_parameter<double>("rate_hz", NODE_RATE);
-        this->declare_parameter<double>("kp_max", DEFAULT_KP_MAX);
-        this->declare_parameter<double>("ko_max", DEFAULT_KO_MAX);
-        this->declare_parameter<double>("kdp", DEFAULT_KDP);
-        this->declare_parameter<double>("kdo", DEFAULT_KDO);
+        // Legacy PD params are declared so older YAML files still load. The
+        // active controller below uses the adaptive m/k/zeta parameters.
+        this->declare_parameter<double>("kp_max", DEFAULT_LEGACY_KP_MAX);
+        this->declare_parameter<double>("ko_max", DEFAULT_LEGACY_KO_MAX);
+        this->declare_parameter<double>("kdp", DEFAULT_LEGACY_KDP);
+        this->declare_parameter<double>("kdo", DEFAULT_LEGACY_KDO);
         this->declare_parameter<double>("w0", DEFAULT_W0);
         this->declare_parameter<double>("k0", DEFAULT_K0);
         this->declare_parameter<double>("theta_d_lim", 3.14);
         this->declare_parameter<bool>("enable_seed", false);
+
+        // ----- Adaptive impedance/admittance parameters -----
+        // Translational virtual mass / stiffness (clamps adapt with error).
+        this->declare_parameter<double>("m_pos_min", DEFAULT_M_POS_MIN);
+        this->declare_parameter<double>("m_pos_max", DEFAULT_M_POS_MAX);
+        this->declare_parameter<double>("k_pos_min", DEFAULT_K_POS_MIN);
+        this->declare_parameter<double>("k_pos_max", DEFAULT_K_POS_MAX);
+        this->declare_parameter<double>("zeta_pos", DEFAULT_ZETA_POS);
+        // Orientation virtual mass / stiffness.
+        this->declare_parameter<double>("m_ori_min", DEFAULT_M_ORI_MIN);
+        this->declare_parameter<double>("m_ori_max", DEFAULT_M_ORI_MAX);
+        this->declare_parameter<double>("k_ori_min", DEFAULT_K_ORI_MIN);
+        this->declare_parameter<double>("k_ori_max", DEFAULT_K_ORI_MAX);
+        this->declare_parameter<double>("zeta_ori", DEFAULT_ZETA_ORI);
+        // Adaptation profile.
+        this->declare_parameter<double>("adaptive_lambda", DEFAULT_ADAPTIVE_LAMBDA);
+        this->declare_parameter<double>("adaptive_alpha_pos", DEFAULT_ADAPTIVE_ALPHA_POS);
+        this->declare_parameter<double>("adaptive_alpha_ori", DEFAULT_ADAPTIVE_ALPHA_ORI);
+        // Cartesian-velocity safety clamps applied to the integrator state.
+        this->declare_parameter<double>("max_cart_linear_vel", DEFAULT_MAX_CART_LINEAR_VEL);
+        this->declare_parameter<double>("max_cart_angular_vel", DEFAULT_MAX_CART_ANGULAR_VEL);
 
         // ----- Read parameters -----
         this->get_parameter("robot_description", urdf_xml_);
@@ -143,15 +185,49 @@ public:
         base_link_ = this->get_parameter("base_link").as_string();
         ee_link_ = this->get_parameter("ee_link").as_string();
         rate_hz_ = this->get_parameter("rate_hz").as_double();
-        Kp_max_ = this->get_parameter("kp_max").as_double();
-        Ko_max_ = this->get_parameter("ko_max").as_double();
-        Kdp_ = this->get_parameter("kdp").as_double();
-        Kdo_ = this->get_parameter("kdo").as_double();
         w0_ = this->get_parameter("w0").as_double();
         k0_ = this->get_parameter("k0").as_double();
-        theta_d_limit_ = this->get_parameter("theta_d_lim").as_double();
         enable_seed_ = this->get_parameter("enable_seed").as_bool();
-        dt_ = 1.0 / std::max(1.0, rate_hz_);
+
+        m_pos_min_ = this->get_parameter("m_pos_min").as_double();
+        m_pos_max_ = this->get_parameter("m_pos_max").as_double();
+        k_pos_min_ = this->get_parameter("k_pos_min").as_double();
+        k_pos_max_ = this->get_parameter("k_pos_max").as_double();
+        zeta_pos_ = this->get_parameter("zeta_pos").as_double();
+        m_ori_min_ = this->get_parameter("m_ori_min").as_double();
+        m_ori_max_ = this->get_parameter("m_ori_max").as_double();
+        k_ori_min_ = this->get_parameter("k_ori_min").as_double();
+        k_ori_max_ = this->get_parameter("k_ori_max").as_double();
+        zeta_ori_ = this->get_parameter("zeta_ori").as_double();
+        adaptive_lambda_ = this->get_parameter("adaptive_lambda").as_double();
+        adaptive_alpha_pos_ = this->get_parameter("adaptive_alpha_pos").as_double();
+        adaptive_alpha_ori_ = this->get_parameter("adaptive_alpha_ori").as_double();
+        max_cart_linear_vel_ = this->get_parameter("max_cart_linear_vel").as_double();
+        max_cart_angular_vel_ = this->get_parameter("max_cart_angular_vel").as_double();
+
+        const auto &overrides =
+            this->get_node_parameters_interface()->get_parameter_overrides();
+        const bool legacy_kp_override = overrides.find("kp_max") != overrides.end();
+        const bool legacy_ko_override = overrides.find("ko_max") != overrides.end();
+        const bool new_k_pos_max_override = overrides.find("k_pos_max") != overrides.end();
+        const bool new_k_ori_max_override = overrides.find("k_ori_max") != overrides.end();
+
+        // Backward compatibility: if an old YAML only supplies kp_max/ko_max,
+        // map those values proportionally into the new maximum stiffness terms.
+        // New k_pos_max/k_ori_max parameters always take precedence.
+        if (legacy_kp_override && !new_k_pos_max_override)
+        {
+            const double legacy_kp = this->get_parameter("kp_max").as_double();
+            k_pos_max_ = DEFAULT_K_POS_MAX *
+                         std::max(0.0, legacy_kp) / DEFAULT_LEGACY_KP_MAX;
+        }
+        if (legacy_ko_override && !new_k_ori_max_override)
+        {
+            const double legacy_ko = this->get_parameter("ko_max").as_double();
+            k_ori_max_ = DEFAULT_K_ORI_MAX *
+                         std::max(0.0, legacy_ko) / DEFAULT_LEGACY_KO_MAX;
+        }
+        sanitizeAdaptiveParameters();
 
         // ----- Kinematics -----
         if (!initializeKinematics())
@@ -217,12 +293,8 @@ public:
         arm_init_sent_ = false;
         has_desired_pose_ = false;
         has_init_pose_ = false;
-        Kp_elastic_ = 0.0;
-        Ko_elastic_ = 0.0;
         e_p_.setZero();
-        e_p_last_.setZero();
         e_o_.setZero();
-        e_o_last_.setZero();
         t_start_ = this->now();
         t_last_ = this->now();
         t_last_pose_cb_ = this->now();
@@ -240,8 +312,15 @@ public:
                     "motomini_feedback_stream ready. group=%s ee=%s rate=%.0f Hz",
                     manipulator_group_.c_str(), ee_link_.c_str(), rate_hz_);
         RCLCPP_INFO(this->get_logger(),
-                    "Gains — Kp_max=%.2f Ko_max=%.2f Kdp=%.2f Kdo=%.2f w0=%.4f k0=%.4f",
-                    Kp_max_, Ko_max_, Kdp_, Kdo_, w0_, k0_);
+                    "Adaptive admittance: Mpos[%.3f, %.3f] Kpos[%.3f, %.3f] "
+                    "Mori[%.3f, %.3f] Kori[%.3f, %.3f]",
+                    m_pos_min_, m_pos_max_, k_pos_min_, k_pos_max_,
+                    m_ori_min_, m_ori_max_, k_ori_min_, k_ori_max_);
+        RCLCPP_INFO(this->get_logger(),
+                    "Damping/adaptation: zeta_pos=%.2f zeta_ori=%.2f "
+                    "lambda=%.2f alpha_pos=%.2f alpha_ori=%.2f w0=%.6f k0=%.6f",
+                    zeta_pos_, zeta_ori_, adaptive_lambda_,
+                    adaptive_alpha_pos_, adaptive_alpha_ori_, w0_, k0_);
         RCLCPP_INFO(this->get_logger(), "enable_seed=%s", enable_seed_ ? "true" : "false");
     }
 
@@ -289,10 +368,44 @@ private:
     static Eigen::MatrixXd calcSrInverse(const Eigen::MatrixXd &J,
                                          double w, double w0, double k0)
     {
-        double k = (w < w0) ? k0 * std::pow(1.0 - w / w0, 2.0) : 0.0;
+        const double w0_safe = std::max(1e-9, w0);
+        const double k = (w < w0_safe) ? k0 * std::pow(1.0 - w / w0_safe, 2.0) : 0.0;
         const Eigen::Index m = J.rows();
         const Eigen::MatrixXd I = Eigen::MatrixXd::Identity(m, m);
         return J.transpose() * (J * J.transpose() + k * I).inverse();
+    }
+
+    void sanitizeAdaptiveParameters()
+    {
+        m_pos_min_ = std::max(1e-6, m_pos_min_);
+        m_pos_max_ = std::max(1e-6, m_pos_max_);
+        if (m_pos_min_ > m_pos_max_)
+            std::swap(m_pos_min_, m_pos_max_);
+
+        k_pos_min_ = std::max(1e-6, k_pos_min_);
+        k_pos_max_ = std::max(1e-6, k_pos_max_);
+        if (k_pos_min_ > k_pos_max_)
+            std::swap(k_pos_min_, k_pos_max_);
+
+        m_ori_min_ = std::max(1e-6, m_ori_min_);
+        m_ori_max_ = std::max(1e-6, m_ori_max_);
+        if (m_ori_min_ > m_ori_max_)
+            std::swap(m_ori_min_, m_ori_max_);
+
+        k_ori_min_ = std::max(1e-6, k_ori_min_);
+        k_ori_max_ = std::max(1e-6, k_ori_max_);
+        if (k_ori_min_ > k_ori_max_)
+            std::swap(k_ori_min_, k_ori_max_);
+
+        zeta_pos_ = std::max(0.0, zeta_pos_);
+        zeta_ori_ = std::max(0.0, zeta_ori_);
+        adaptive_lambda_ = std::max(0.0, adaptive_lambda_);
+        adaptive_alpha_pos_ = std::max(0.0, adaptive_alpha_pos_);
+        adaptive_alpha_ori_ = std::max(0.0, adaptive_alpha_ori_);
+        max_cart_linear_vel_ = std::max(0.0, max_cart_linear_vel_);
+        max_cart_angular_vel_ = std::max(0.0, max_cart_angular_vel_);
+        w0_ = std::max(1e-9, w0_);
+        k0_ = std::max(0.0, k0_);
     }
 
     // Orientation error: rotation matrix → axis-angle vector
@@ -527,47 +640,179 @@ private:
 
     // ============================================================
     // CORE CONTROL STEP  (shared by STATE_INIT and STATE_POSE_FOLLOW)
+    //
+    // ADAPTIVE CARTESIAN ADMITTANCE-INSPIRED VELOCITY CONTROLLER.
+    //
+    // Virtual second-order dynamics shape the *reference* Cartesian
+    // velocity ẋ_ref:
+    //
+    //     ẍ_ref = M_d⁻¹ · ( K_d·e − D_e·ė − F_coll − D_d·ẋ_ref )
+    //     ẋ_ref ← ẋ_ref + ẍ_ref · dt
+    //     θ̇_cmd = J⁺_SR(q) · ẋ_ref
+    //
+    // Adaptive scaling:
+    //   s_t = 1 − exp(−λ·t)             (warm-up since activation)
+    //   s_e = tanh(α·|e|)                (error-magnitude weighting)
+    //   s_w = clamp(w/w0, 0.2, 1.0)      (manipulability — soften near singular)
+    //   K_d = s_w · [K_min + s_t·s_e·(K_max−K_min)]
+    //   M_d = M_max − s_t·s_e·(M_max−M_min)
+    //   D_d = 2ζ√(M_d·K_d)               (critical-damping coefficient;
+    //                                     used for both D_d and D_e here)
+    //
+    // NOTE: This is *admittance-style* — the underlying Yaskawa controller
+    // is still position/velocity-driven, so we shape the commanded ẋ_ref
+    // rather than closing a torque-level impedance loop.
     // ============================================================
     bool computeControlStep(const Eigen::VectorXd &q,
                             const Eigen::Vector3d &des_pos,
                             const Eigen::Matrix3d &des_rot,
+                            double dt,
                             Eigen::VectorXd &theta_d)
     {
-        // Forward kinematics
+        // --- Forward kinematics ---
         Eigen::Vector3d ee_pos;
         Eigen::Matrix3d ee_rot;
         if (!getEEPose(q, ee_pos, ee_rot))
             return false;
 
-        // Position and orientation errors
+        // --- Pose error (target − actual) ---
         e_p_ = des_pos - ee_pos;
         e_o_ = orientationError(des_rot, ee_rot);
 
-        // Elastic gain ramp-up (prevents large initial impulse)
-        const double ramp_step = 1.0 / (ELASTIC_RAMP_RATE_FACTOR * rate_hz_);
-        if (Kp_elastic_ < Kp_max_)
-            Kp_elastic_ = std::min(Kp_max_, Kp_elastic_ + Kp_max_ * ramp_step);
-        if (Ko_elastic_ < Ko_max_)
-            Ko_elastic_ = std::min(Ko_max_, Ko_elastic_ + Ko_max_ * ramp_step);
+        // --- Adaptive scaling factors ---
+        const double t_active = (this->now() - t_start_).seconds();
+        const double s_t = 1.0 - std::exp(-adaptive_lambda_ * std::max(0.0, t_active));
+        const double s_e_pos = std::tanh(adaptive_alpha_pos_ * e_p_.norm());
+        const double s_e_ori = std::tanh(adaptive_alpha_ori_ * e_o_.norm());
 
-        // PD Cartesian velocity command
-        Eigen::Matrix<double, 6, 1> v;
-        v.head<3>() = Kp_elastic_ * e_p_ + Kdp_ * (e_p_ - e_p_last_);
-        v.tail<3>() = Ko_elastic_ * e_o_ + Kdo_ * (e_o_ - e_o_last_);
-
-        // Save errors for derivative term next iteration
-        e_p_last_ = e_p_;
-        e_o_last_ = e_o_;
-
-        // Jacobian and SR-inverse
-        Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
-        double w = std::sqrt(std::max(0.0, (J * J.transpose()).determinant()));
+        // --- Jacobian + manipulability ---
+        const Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
+        const double w = std::sqrt(std::max(0.0, (J * J.transpose()).determinant()));
+        const double w0_safe = std::max(1e-9, w0_);
+        const double s_w = std::clamp(w / w0_safe, 0.2, 1.0);
         if (w <= w0_)
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                                  "Near singularity (w=%.6f ≤ w0=%.6f). SR-damping active.", w, w0_);
 
-        theta_d = calcSrInverse(J, w, w0_, k0_) * v;
+        // --- Adaptive virtual-impedance gains (separate trans / rot) ---
+        const double k_pos_var = s_w *
+            (k_pos_min_ + s_t * s_e_pos * (k_pos_max_ - k_pos_min_));
+        const double m_pos_var = m_pos_max_ -
+            s_t * s_e_pos * (m_pos_max_ - m_pos_min_);
+        const double d_pos_var = 2.0 * zeta_pos_ *
+            std::sqrt(std::max(1e-12, m_pos_var * k_pos_var));
+
+        const double k_ori_var = s_w *
+            (k_ori_min_ + s_t * s_e_ori * (k_ori_max_ - k_ori_min_));
+        const double m_ori_var = m_ori_max_ -
+            s_t * s_e_ori * (m_ori_max_ - m_ori_min_);
+        const double d_ori_var = 2.0 * zeta_ori_ *
+            std::sqrt(std::max(1e-12, m_ori_var * k_ori_var));
+
+        // --- Joint velocity θ̇: prefer driver field, fall back to numerical diff ---
+        Eigen::VectorXd qdot = Eigen::VectorXd::Zero(q.size());
+        bool used_driver = false;
+        if (last_joint_state_ &&
+            last_joint_state_->velocity.size() >= last_joint_state_->name.size())
+        {
+            Eigen::VectorXd qdot_drv(static_cast<Eigen::Index>(joint_names_.size()));
+            bool ok = true;
+            for (size_t i = 0; i < joint_names_.size(); ++i)
+            {
+                auto it = std::find(last_joint_state_->name.begin(),
+                                    last_joint_state_->name.end(),
+                                    joint_names_[i]);
+                if (it == last_joint_state_->name.end()) { ok = false; break; }
+                const size_t idx = std::distance(last_joint_state_->name.begin(), it);
+                if (idx >= last_joint_state_->velocity.size()) { ok = false; break; }
+                qdot_drv[static_cast<Eigen::Index>(i)] = last_joint_state_->velocity[idx];
+            }
+            if (ok && qdot_drv.allFinite())
+            {
+                qdot = qdot_drv;
+                used_driver = true;
+            }
+        }
+        if (!used_driver && have_q_prev_ctrl_ && q_prev_ctrl_.size() == q.size())
+        {
+            const double dt_q = (this->now() - t_prev_q_ctrl_).seconds();
+            if (dt_q > 1e-6)
+                qdot = (q - q_prev_ctrl_) / dt_q;
+        }
+        q_prev_ctrl_ = q;
+        t_prev_q_ctrl_ = this->now();
+        have_q_prev_ctrl_ = true;
+
+        const Eigen::Matrix<double, 6, 1> xdot_actual = J * qdot;
+
+        // --- Desired Cartesian velocity (target_vel if fresh, else 0) ---
+        Eigen::Matrix<double, 6, 1> xdot_des = Eigen::Matrix<double, 6, 1>::Zero();
+        const double dt_vel = (this->now() - t_last_target_vel_cb_).seconds();
+        if (dt_vel < TARGET_VEL_TIMEOUT_SEC)
+        {
+            xdot_des.head<3>() = latest_target_vel_.head<3>();
+            // /motomini/target_vel angular is body-frame. Convert it to the
+            // base frame before comparing with J(q)·θ̇.
+            xdot_des.tail<3>() = des_rot * latest_target_vel_.tail<3>();
+        }
+
+        const Eigen::Matrix<double, 6, 1> velocity_error = xdot_actual - xdot_des;
+
+        // --- External/contact wrench placeholder. Future collision avoidance
+        //     or force feedback should write a Cartesian wrench here. The sign
+        //     convention below treats positive F_collision as a disturbance
+        //     that the virtual dynamics should yield against.
+        Eigen::Matrix<double, 6, 1> F_collision;
+        F_collision.setZero();
+
+        // --- Virtual acceleration ẍ_ref = M⁻¹·(K·e − D·ė − F − D·ẋ_ref) ---
+        Eigen::Matrix<double, 6, 1> xddot_ref;
+        xddot_ref.head<3>() = (k_pos_var * e_p_
+                               - d_pos_var * velocity_error.head<3>()
+                               - F_collision.head<3>()
+                               - d_pos_var * xdot_ref_.head<3>())
+                              / std::max(1e-9, m_pos_var);
+        xddot_ref.tail<3>() = (k_ori_var * e_o_
+                               - d_ori_var * velocity_error.tail<3>()
+                               - F_collision.tail<3>()
+                               - d_ori_var * xdot_ref_.tail<3>())
+                              / std::max(1e-9, m_ori_var);
+
+        // --- Integrate ẋ_ref ---
+        const double dt_safe =
+            (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
+        xdot_ref_ += xddot_ref * dt_safe;
+
+        // --- Safety clamps on the integrator state ---
+        const double lin_n = xdot_ref_.head<3>().norm();
+        if (lin_n > max_cart_linear_vel_ && lin_n > 1e-9)
+            xdot_ref_.head<3>() *= max_cart_linear_vel_ / lin_n;
+        const double ang_n = xdot_ref_.tail<3>().norm();
+        if (ang_n > max_cart_angular_vel_ && ang_n > 1e-9)
+            xdot_ref_.tail<3>() *= max_cart_angular_vel_ / ang_n;
+
+        // --- SR-inverse Jacobian → joint velocity command ---
+        theta_d = calcSrInverse(J, w, w0_, k0_) * xdot_ref_;
+
         return true;
+    }
+
+    // Reset the virtual integrator state when entering IDLE/STOP or starting
+    // INIT/POSE_FOLLOW.
+    void resetVirtualState()
+    {
+        xdot_ref_.setZero();
+        have_q_prev_ctrl_ = false;
+        q_prev_ctrl_.resize(0);
+    }
+
+    void resetControlWindow()
+    {
+        resetVirtualState();
+        e_p_.setZero();
+        e_o_.setZero();
+        t_start_ = this->now();
+        t_last_ = this->now();
     }
 
     // ============================================================
@@ -601,12 +846,7 @@ private:
         {
             if (initTrackedPositions())
             {
-                e_p_last_.setZero();
-                e_o_last_.setZero();
-                Kp_elastic_ = 0.0;
-                Ko_elastic_ = 0.0;
-                t_start_ = this->now();
-                t_last_ = this->now();
+                resetControlWindow();
                 if (enable_seed_)
                     seed();
                 state_ = STATE_POSE_FOLLOW;
@@ -646,12 +886,7 @@ private:
 
             if (initTrackedPositions())
             {
-                e_p_last_.setZero();
-                e_o_last_.setZero();
-                Kp_elastic_ = 0.0;
-                Ko_elastic_ = 0.0;
-                t_start_ = this->now();
-                t_last_ = this->now();
+                resetControlWindow();
                 if (enable_seed_)
                     seed();
                 state_ = STATE_POSE_FOLLOW;
@@ -678,13 +913,10 @@ private:
                        std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
         state_ = STATE_IDLE;
+        resetControlWindow();
         tracked_positions_.clear();
         tracked_velocities_.clear();
         is_init_done_ = false;
-        Kp_elastic_ = 0.0;
-        Ko_elastic_ = 0.0;
-        e_p_last_.setZero();
-        e_o_last_.setZero();
         res->success = true;
         res->message = "Reset to STATE_IDLE";
         RCLCPP_INFO(this->get_logger(), "/start → STATE_IDLE");
@@ -695,10 +927,7 @@ private:
                       std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
         state_ = STATE_STOP;
-        Kp_elastic_ = 0.0;
-        Ko_elastic_ = 0.0;
-        e_p_last_.setZero();
-        e_o_last_.setZero();
+        resetControlWindow();
         res->success = true;
         res->message = "Stopped — STATE_STOP";
         RCLCPP_INFO(this->get_logger(), "/stop → STATE_STOP");
@@ -728,12 +957,7 @@ private:
             return;
         }
         is_init_done_ = false;
-        Kp_elastic_ = 0.0;
-        Ko_elastic_ = 0.0;
-        e_p_last_.setZero();
-        e_o_last_.setZero();
-        t_start_ = this->now();
-        t_last_ = this->now();
+        resetControlWindow();
         if (enable_seed_)
             seed();
         state_ = STATE_INIT;
@@ -752,6 +976,7 @@ private:
         if (last_state_ != state_)
         {
             last_state_ = state_;
+            resetVirtualState();
             RCLCPP_INFO(this->get_logger(), "STATE_IDLE: syncing joint state, no output.");
         }
         if (last_joint_state_)
@@ -764,8 +989,7 @@ private:
         if (last_state_ != state_)
         {
             last_state_ = state_;
-            Kp_elastic_ = 0.0;
-            Ko_elastic_ = 0.0;
+            resetVirtualState();
             RCLCPP_INFO(this->get_logger(),
                         "STATE_STOP: velocity zeroed, no output. Call /start to resume.");
         }
@@ -773,7 +997,7 @@ private:
             initTrackedPositions();
     }
 
-    // INIT — move to init_pose_ using full PD+SR-inverse with elastic ramp-up
+    // INIT — move to init_pose_ using adaptive admittance + SR-inverse
     void handleInit()
     {
         if (last_state_ != state_)
@@ -808,9 +1032,8 @@ private:
             dz < POSITION_ERROR_THRESHOLD)
         {
             is_init_done_ = true;
+            resetControlWindow();
             state_ = STATE_POSE_FOLLOW;
-            e_p_last_.setZero();
-            e_o_last_.setZero();
             RCLCPP_INFO(this->get_logger(),
                         "Init complete (err: %.5f, %.5f, %.5f m). STATE_INIT → STATE_POSE_FOLLOW",
                         dx, dy, dz);
@@ -833,7 +1056,7 @@ private:
         t_last_ = this->now();
 
         Eigen::VectorXd theta_d;
-        if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), theta_d))
+        if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt, theta_d))
             return;
 
         // Velocity safety
@@ -841,6 +1064,7 @@ private:
         {
             RCLCPP_WARN(this->get_logger(),
                         "[INIT] Joint velocity exceeded limit → STATE_STOP");
+            resetControlWindow();
             state_ = STATE_STOP;
             return;
         }
@@ -864,16 +1088,17 @@ private:
         publishTrajectory(tracked_positions_, tracked_velocities_);
 
         RCLCPP_DEBUG(this->get_logger(),
-                     "[INIT] err(%.4f,%.4f,%.4f) Kp_e=%.2f Ko_e=%.2f",
-                     dx, dy, dz, Kp_elastic_, Ko_elastic_);
+                     "[INIT] err(%.4f,%.4f,%.4f)",
+                     dx, dy, dz);
     }
 
-    // POSE_FOLLOW — track streaming desired_pose_ via PD+SR-inverse
+    // POSE_FOLLOW — track streaming desired_pose_ via adaptive admittance + SR-inverse
     void handlePoseFollow()
     {
         if (last_state_ != state_)
         {
             last_state_ = state_;
+            resetVirtualState();
             RCLCPP_INFO(this->get_logger(),
                         "STATE_POSE_FOLLOW: tracking /motomini/target_pose");
         }
@@ -892,6 +1117,7 @@ private:
         {
             RCLCPP_WARN(this->get_logger(),
                         "Pose input timeout (%.2f s > %.2f s) → STATE_IDLE", dt_cb, POSE_TIMEOUT_SEC);
+            resetControlWindow();
             state_ = STATE_IDLE;
             return;
         }
@@ -941,18 +1167,19 @@ private:
         }
 
         Eigen::VectorXd theta_d;
-        if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), theta_d))
+        if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt, theta_d))
             return;
 
         RCLCPP_DEBUG(this->get_logger(),
-                     "[FOLLOW] e_p=(%.4f,%.4f,%.4f) e_o=(%.4f,%.4f,%.4f) Kp_e=%.2f",
-                     e_p_(0), e_p_(1), e_p_(2), e_o_(0), e_o_(1), e_o_(2), Kp_elastic_);
+                     "[FOLLOW] e_p=(%.4f,%.4f,%.4f) e_o=(%.4f,%.4f,%.4f)",
+                     e_p_(0), e_p_(1), e_p_(2), e_o_(0), e_o_(1), e_o_(2));
 
         // Velocity safety
         if (!checkVelocityLimits(theta_d))
         {
             RCLCPP_WARN(this->get_logger(),
                         "[FOLLOW] Joint velocity exceeded limit → STATE_STOP");
+            resetControlWindow();
             state_ = STATE_STOP;
             return;
         }
@@ -1006,9 +1233,23 @@ private:
 
     // --- Configuration ---
     std::string urdf_xml_, srdf_xml_, manipulator_group_, base_link_, ee_link_;
-    double rate_hz_, dt_;
-    double Kp_max_, Ko_max_, Kdp_, Kdo_, w0_, k0_, theta_d_limit_;
+    double rate_hz_;
+    double w0_, k0_;
     bool enable_seed_;
+
+    // --- Adaptive Cartesian admittance gains ---
+    double m_pos_min_, m_pos_max_, k_pos_min_, k_pos_max_, zeta_pos_;
+    double m_ori_min_, m_ori_max_, k_ori_min_, k_ori_max_, zeta_ori_;
+    double adaptive_lambda_, adaptive_alpha_pos_, adaptive_alpha_ori_;
+    double max_cart_linear_vel_, max_cart_angular_vel_;
+
+    // --- Virtual Cartesian-velocity integrator state ---
+    Eigen::Matrix<double, 6, 1> xdot_ref_{Eigen::Matrix<double,6,1>::Zero()};
+
+    // --- Numerical θ̇ history for the controller's velocity-error term ---
+    Eigen::VectorXd q_prev_ctrl_;
+    rclcpp::Time t_prev_q_ctrl_{0, 0, RCL_ROS_TIME};
+    bool have_q_prev_ctrl_{false};
 
     // --- Runtime state ---
     State state_, last_state_;
@@ -1017,12 +1258,9 @@ private:
     bool has_desired_pose_;
     bool has_init_pose_;
 
-    // --- Controller gains (elastic ramp) ---
-    double Kp_elastic_, Ko_elastic_;
-
     // --- Control errors ---
-    Eigen::Vector3d e_p_, e_p_last_;
-    Eigen::Vector3d e_o_, e_o_last_;
+    Eigen::Vector3d e_p_;
+    Eigen::Vector3d e_o_;
 
     // --- Time ---
     rclcpp::Time t_start_;             // reset at each IDLE → active transition
