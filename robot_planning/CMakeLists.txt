@@ -214,6 +214,7 @@ target_link_libraries(online_collision_debugger
 ament_target_dependencies(online_collision_debugger
   rclcpp
   sensor_msgs
+  std_msgs
   visualization_msgs
 )
 
