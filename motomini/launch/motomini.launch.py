@@ -12,6 +12,7 @@ def generate_launch_description():
     motomini_share = FindPackageShare("motomini")
     robot_planning_share = FindPackageShare("robot_planning")
     planning_params_yaml = PathJoinSubstitution([robot_planning_share, "config", "planning_params.yaml"])
+    feedback_controller_yaml = PathJoinSubstitution([robot_planning_share, "config", "feedback_controller.yaml"])
 
     # 2. Launch Configurations
     tool_type = LaunchConfiguration("tool_type")
@@ -83,20 +84,21 @@ def generate_launch_description():
         # JointState to Trajectory node no longer needed:
         # motomini_vel_tracking now publishes JointTrajectory directly to /path_command
 
-        Node(
-            package="robot_planning",
-            executable="motomini_vel_tracking",
-            parameters=[*common_params, {
-                "manipulator_group": "manipulator",
-                "base_link": "world",
-                "ee_link": concrete_ee_link,
-                "vel_streaming": vel_streaming,
-            }],
-            condition=IfCondition(PythonExpression([
-                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
-            ])),
-            output="screen"
-        ),
+        # --- OLD velocity-based jogging chain (kept for reference) ---
+        # Node(
+        #     package="robot_planning",
+        #     executable="motomini_vel_tracking",
+        #     parameters=[*common_params, {
+        #         "manipulator_group": "manipulator",
+        #         "base_link": "world",
+        #         "ee_link": concrete_ee_link,
+        #         "vel_streaming": vel_streaming,
+        #     }],
+        #     condition=IfCondition(PythonExpression([
+        #         "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+        #     ])),
+        #     output="screen"
+        # ),
         Node(
             package="robot_planning",
             executable="motomini_traj_streamer",
@@ -105,17 +107,44 @@ def generate_launch_description():
             ])),
             output="screen"
         ),
+        # Node(
+        #     package="motomini",
+        #     executable="jogging_gui.py",
+        #     condition=IfCondition(PythonExpression([
+        #         "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+        #     ])),
+        #     output="screen"
+        # ),
+        # Node(
+        #     package="robot_planning",
+        #     executable="smooth_jogging_node",
+        #     condition=IfCondition(PythonExpression([
+        #         "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+        #     ])),
+        #     output="screen"
+        # ),
+
+        # --- NEW pose-based jogging chain (PD feedback controller + pose GUI) ---
         Node(
-            package="motomini",
-            executable="jogging_gui.py",
+            package="robot_planning",
+            executable="motomini_feedback_stream",
+            parameters=[*common_params, feedback_controller_yaml, {
+                "manipulator_group": "manipulator",
+                "base_link": "world",
+                "ee_link": concrete_ee_link,
+            }],
             condition=IfCondition(PythonExpression([
                 "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
             ])),
             output="screen"
         ),
         Node(
-            package="robot_planning",
-            executable="smooth_jogging_node",
+            package="motomini",
+            executable="pose_jogging_gui.py",
+            parameters=[{
+                "base_frame": "world",
+                "ee_frame": concrete_ee_link,
+            }],
             condition=IfCondition(PythonExpression([
                 "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
             ])),

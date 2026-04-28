@@ -1,0 +1,57 @@
+###############################################################################
+#  feedback_controller.yaml
+#  Runtime-tunable parameters for motomini_feedback_stream
+#  (Cartesian PD pose tracker with SR-inverse Jacobian).
+#  Edit and relaunch — no rebuild needed.
+###############################################################################
+
+motomini_feedback_stream:
+  ros__parameters:
+
+    # ===========================================================================
+    #  CONTROL LOOP
+    # ===========================================================================
+    # Loop frequency [Hz]. Changing this affects PD bandwidth — re-tune kdp/kdo
+    # if you move it (the D term operates on raw Δerror per tick).
+    rate_hz: 50.0
+
+    # ===========================================================================
+    #  PD GAINS — main tuning surface
+    # ===========================================================================
+    # Translational P gain  [rad/s per m of Cartesian error]
+    # ↑ stiffer / faster, but more frequent vel-limit trips.
+    kp_max: 3.5
+
+    # Rotational P gain  [rad/s per rad of orientation error]
+    ko_max: 2.5
+
+    # Translational D gain (acts on Δe_p per tick — already absorbs 1/dt).
+    # Raise to damp oscillation around setpoint. Too high = sluggish + noisy.
+    kdp: 0.25
+
+    # Rotational D gain (same convention as kdp).
+    kdo: 0.25
+
+    # ===========================================================================
+    #  SINGULARITY HANDLING (SR-inverse Jacobian)
+    # ===========================================================================
+    # Manipulability threshold below which damping engages.
+    # ↑ engages earlier (more conservative near singularities).
+    w0: 0.01
+
+    # Max SR damping coefficient at full singularity.
+    # ↑ smoother through singularities but more lag.
+    k0: 0.01
+
+    # ===========================================================================
+    #  STREAMING
+    # ===========================================================================
+    # Emit one zero-velocity seed pose at the start of every streaming session.
+    # Set true for stateful controllers that reject mid-stream first messages
+    # with INVALID_DATA_START_POS.
+    enable_seed: false
+
+    # Joint-velocity hard reject threshold (declared but currently unused;
+    # the runtime check uses per-joint hardware limits × SAFETY_VELOCITY_ALPHA
+    # defined at compile time in motomini_feedback_stream.cpp).
+    theta_d_lim: 3.14
