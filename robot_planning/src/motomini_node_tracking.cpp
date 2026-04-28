@@ -563,6 +563,20 @@ void MotoMiniPlanningNode::mpcTimerCallback()
         Eigen::VectorXd::Zero(n_joints);
     static bool lpf_primed = false;
 
+    auto compute_worst_velocity_ratio = [&]() {
+        double ratio = 0.0;
+        for (size_t k = 1; k < q_traj.size(); ++k)
+            for (int j = 0; j < n_joints; ++j)
+            {
+                const double v = std::abs(q_traj[k][j] - q_traj[k - 1][j]) / mpc_dt_;
+                const double r = v / std::max(v_max[j], 1e-6);
+                ratio = std::max(ratio, r);
+            }
+        return ratio;
+    };
+
+    double worst_ratio = compute_worst_velocity_ratio();
+
     // DISABLE LPF during collision/scaling to ensure immediate escape response
     bool disable_lpf = (worst_ratio > 0.8);
 
@@ -580,19 +594,7 @@ void MotoMiniPlanningNode::mpcTimerCallback()
         q_traj[1] = q1;
     }
 
-    double worst_ratio = 0.0;
-    int worst_joint = -1;
-    for (size_t k = 1; k < q_traj.size(); ++k)
-        for (int j = 0; j < n_joints; ++j)
-        {
-            const double v = std::abs(q_traj[k][j] - q_traj[k - 1][j]) / mpc_dt_;
-            const double r = v / std::max(v_max[j], 1e-6);
-            if (r > worst_ratio)
-            {
-                worst_ratio = r;
-                worst_joint = j;
-            }
-        }
+    worst_ratio = compute_worst_velocity_ratio();
 
     // ADAPTIVE SCALING: If the move is too fast, scale the WHOLE trajectory down
     // so the worst joint is exactly at 100% v_max. This prevents the "stuck" freeze.
