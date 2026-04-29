@@ -150,8 +150,8 @@
 online_collision_debugger:
   ros__parameters:
     # Contact detection
-    collision_threshold: 0.10
-    contact_point_radius: 0.008
+    collision_threshold: 0.05
+    contact_point_radius: 0.004
 
     # Output channels
     debug_markers_enabled: true
@@ -164,18 +164,18 @@ online_collision_debugger:
     wrench_reference_link: tool0
 
     # Force model
-    collision_influence_distance: 0.10
-    collision_safe_distance: 0.04
-    collision_k_rep: 0.0005
-    collision_k_hold: 50.0
-    collision_force_max_per_contact: 10.0
-    collision_force_max_total: 25.0
+    collision_influence_distance: 0.05
+    collision_safe_distance: 0.02
+    collision_k_rep:  0.0002
+    collision_k_hold: 15.0
+    collision_force_max_per_contact: 8.0
+    collision_force_max_total: 12.0
 
     # Force-arrow shaping (length is proportional to |F|)
     force_arrow_min_length: 0.01
     force_arrow_max_length: 0.25
     force_arrow_length_gain: 0.04
 
-    collision_guard_distance: 0.03
-    collision_task_distance: 0.005
+    collision_guard_distance: 0.02
+    collision_task_distance: 0.003
     collision_stop_distance: 0.001

@@ -152,8 +152,8 @@
     # Tuning:
     #   Increase mass for slower, smoother motion.
     #   Decrease mass for faster response, but watch joint velocity trips.
-    m_pos_min: 0.35
-    m_pos_max: 1.2
+    m_pos_min: 0.02
+    m_pos_max: 0.08 
 
     # Translational virtual stiffness.
     # k_pos_min is the soft baseline; k_pos_max is the fastest tracking value.
@@ -162,8 +162,8 @@
     #   Raise k_pos_max for faster position convergence.
     #   Lower k_pos_min if the robot feels too aggressive near the target.
     #   Lower k_pos_max if startup or large-error moves hit velocity limits.
-    k_pos_min: 40.0
-    k_pos_max: 160.0
+    k_pos_min: 120.0
+    k_pos_max: 250.0
 
     # Translational damping ratio used by D = 2*zeta*sqrt(M*K).
     # Tuning:
@@ -177,16 +177,16 @@
     # ===========================================================================
     # Orientation virtual inertia.
     # Tuning is the same idea as m_pos_* but for angular motion.
-    m_ori_min: 0.1
-    m_ori_max: 1.0
+    m_ori_min: 0.02
+    m_ori_max: 0.15
 
     # Orientation virtual stiffness.
     # Tuning:
     #   Raise k_ori_max if orientation lags.
     #   Lower k_ori_max if wrist joints hit velocity limits or oscillate.
     #   Lower k_ori_min for a softer settle near the target orientation.
-    k_ori_min: 5.0
-    k_ori_max: 35.0
+    k_ori_min: 2.0
+    k_ori_max: 15.0
 
     # Orientation damping ratio.
     # Tuning:
@@ -201,7 +201,7 @@
     # Tuning:
     #   Higher value reaches full adaptive strength sooner.
     #   Lower value makes mode starts softer.
-    adaptive_lambda: 4.0
+    adaptive_lambda: 15.0
 
     # Error scaling: s_e = tanh(alpha * |error|).
     # Tuning:
@@ -210,8 +210,8 @@
     # Examples:
     #   alpha_pos=30 reaches strong adaptation around 3-5 cm.
     #   alpha_ori=6 reaches strong adaptation around 0.2-0.4 rad.
-    adaptive_alpha_pos: 15.0
-    adaptive_alpha_ori: 10.0
+    adaptive_alpha_pos: 60.0
+    adaptive_alpha_ori: 5.0
 
     # ===========================================================================
     # CARTESIAN VELOCITY SAFETY LIMITS
@@ -220,8 +220,8 @@
     # Tuning:
     #   Lower these first if the robot feels abrupt.
     #   Raise only after confirming joint velocity safety does not trip.
-    max_cart_linear_vel: 0.8    # [m/s]
-    max_cart_angular_vel: 2.0   # [rad/s]
+    max_cart_linear_vel: 1.0    # [m/s]
+    max_cart_angular_vel: 4.0   # [rad/s]
 
     # ===========================================================================
     # SINGULARITY HANDLING (SR-INVERSE JACOBIAN)
@@ -231,7 +231,7 @@
     # Tuning:
     #   Raise w0 to become more conservative near singularities.
     #   Lower w0 if the controller becomes too soft in normal poses.
-    w0: 0.0005
+    w0: 0.001
 
     # Max SR damping coefficient at full singularity.
     # Tuning:
@@ -268,7 +268,7 @@
     enable_collision_projection: true
     collision_goal_suppression: true
     collision_guard_distance: 0.03
-    collision_task_distance: 0.005
+    collision_task_distance: 0.015
     collision_stop_distance: 0.001
     collision_projection_max_gamma: 1.0
     collision_constraint_timeout_sec: 0.2

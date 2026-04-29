@@ -77,6 +77,7 @@ def generate_launch_description():
                 "tracking_rate_hz": tracking_rate_hz,
                 "planning_chunk_size": planning_chunk_size,
                 "planning_parallel_chunks": planning_parallel_chunks,
+                "real_robot": real_robot,
             }],
             condition=IfCondition(vel_streaming),
             output="screen"
@@ -133,6 +134,7 @@ def generate_launch_description():
                 "manipulator_group": "manipulator",
                 "base_link": "world",
                 "ee_link": concrete_ee_link,
+                "real_robot": real_robot,
             }],
             condition=IfCondition(PythonExpression([
                 "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"

@@ -145,8 +145,10 @@ public:
         : rclcpp::Node("motomini_feedback_stream")
     {
         // ----- Declare ROS parameters -----
-        this->declare_parameter<std::string>("robot_description", "");
-        this->declare_parameter<std::string>("robot_description_semantic", "");
+        this->declare_parameter<std::string>("robot_description",
+                                             "package://robot_planning/urdf/motoman_motomini.urdf");
+        this->declare_parameter<std::string>("robot_description_semantic",
+                                             "package://robot_planning/urdf/motoman_motomini.srdf");
         this->declare_parameter<std::string>("manipulator_group", "manipulator");
         this->declare_parameter<std::string>("base_link", "base_link");
         this->declare_parameter<std::string>("ee_link", "tool0");
@@ -196,6 +198,12 @@ public:
         this->declare_parameter<double>("collision_constraint_timeout_sec", 0.2);
         this->declare_parameter<double>("collision_force_scale", 1.0);
         this->declare_parameter<double>("collision_force_max", 5.0);
+        this->declare_parameter<bool>("real_robot", true);
+        this->declare_parameter<double>("velocity_filter_cutoff_hz", 15.0);
+        this->declare_parameter<double>("max_cart_linear_acc", 0.8);
+        this->declare_parameter<double>("max_cart_angular_acc", 2.5);
+        this->declare_parameter<double>("measured_cart_linear_vel_limit", 1.0);
+        this->declare_parameter<double>("measured_cart_angular_vel_limit", 3.0);
 
         // ----- Read parameters -----
         this->get_parameter("robot_description", urdf_xml_);
@@ -236,6 +244,15 @@ public:
             this->get_parameter("collision_constraint_timeout_sec").as_double();
         collision_force_scale_ = this->get_parameter("collision_force_scale").as_double();
         collision_force_max_ = this->get_parameter("collision_force_max").as_double();
+        real_robot_ = this->get_parameter("real_robot").as_bool();
+        velocity_filter_cutoff_hz_ =
+            this->get_parameter("velocity_filter_cutoff_hz").as_double();
+        max_cart_linear_acc_ = this->get_parameter("max_cart_linear_acc").as_double();
+        max_cart_angular_acc_ = this->get_parameter("max_cart_angular_acc").as_double();
+        measured_cart_linear_vel_limit_ =
+            this->get_parameter("measured_cart_linear_vel_limit").as_double();
+        measured_cart_angular_vel_limit_ =
+            this->get_parameter("measured_cart_angular_vel_limit").as_double();
 
         collision_stop_distance_ = std::max(0.0, collision_stop_distance_);
         collision_task_distance_ =
@@ -246,6 +263,13 @@ public:
             std::clamp(collision_projection_max_gamma_, 0.0, 1.0);
         collision_force_scale_ = std::max(0.0, collision_force_scale_);
         collision_force_max_ = std::max(0.0, collision_force_max_);
+        velocity_filter_cutoff_hz_ = std::max(1.0, velocity_filter_cutoff_hz_);
+        max_cart_linear_acc_ = std::max(0.0, max_cart_linear_acc_);
+        max_cart_angular_acc_ = std::max(0.0, max_cart_angular_acc_);
+        measured_cart_linear_vel_limit_ =
+            std::max(0.0, measured_cart_linear_vel_limit_);
+        measured_cart_angular_vel_limit_ =
+            std::max(0.0, measured_cart_angular_vel_limit_);
 
         const auto &overrides =
             this->get_node_parameters_interface()->get_parameter_overrides();
@@ -273,7 +297,10 @@ public:
 
         // ----- Kinematics -----
         if (!initializeKinematics())
-            throw std::runtime_error("Failed to initialize Tesseract kinematics");
+        {
+            RCLCPP_ERROR(this->get_logger(), "Failed to initialize Tesseract kinematics. Check if URDF/SRDF is valid.");
+            throw std::runtime_error("Tesseract kinematics initialization failed");
+        }
 
         // ----- Publishers -----
         // One-time arm controller initialisation burst
@@ -416,6 +443,8 @@ private:
             return false;
 
         joint_names_ = manip_->getJointNames();
+        qdot_filtered_ =
+            Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_names_.size()));
         return !joint_names_.empty();
     }
 
@@ -469,6 +498,13 @@ private:
         adaptive_alpha_ori_ = std::max(0.0, adaptive_alpha_ori_);
         max_cart_linear_vel_ = std::max(0.0, max_cart_linear_vel_);
         max_cart_angular_vel_ = std::max(0.0, max_cart_angular_vel_);
+        velocity_filter_cutoff_hz_ = std::max(1.0, velocity_filter_cutoff_hz_);
+        max_cart_linear_acc_ = std::max(0.0, max_cart_linear_acc_);
+        max_cart_angular_acc_ = std::max(0.0, max_cart_angular_acc_);
+        measured_cart_linear_vel_limit_ =
+            std::max(0.0, measured_cart_linear_vel_limit_);
+        measured_cart_angular_vel_limit_ =
+            std::max(0.0, measured_cart_angular_vel_limit_);
         w0_ = std::max(1e-9, w0_);
         k0_ = std::max(0.0, k0_);
     }
@@ -511,6 +547,128 @@ private:
                 last_joint_state_->position[std::distance(last_joint_state_->name.begin(), it)];
         }
         return true;
+    }
+
+    Eigen::VectorXd filterJointVelocity(const Eigen::VectorXd &qdot_raw, double dt)
+    {
+        if (qdot_raw.size() == 0 || !qdot_raw.allFinite())
+            return Eigen::VectorXd::Zero(qdot_raw.size());
+
+        const rclcpp::Time now = this->now();
+        if (qdot_filtered_.size() != qdot_raw.size())
+        {
+            qdot_filtered_ = qdot_raw;
+            first_velocity_read_ = false;
+            t_last_velocity_filter_update_ = now;
+            have_velocity_filter_update_ = true;
+            return qdot_filtered_;
+        }
+
+        if (!first_velocity_read_ && have_velocity_filter_update_)
+        {
+            const double cache_age = (now - t_last_velocity_filter_update_).seconds();
+            const double same_cycle_window = 0.5 / std::max(1.0, rate_hz_);
+            if (cache_age >= 0.0 && cache_age < same_cycle_window)
+                return qdot_filtered_;
+        }
+
+        const double dt_safe =
+            (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
+        const double max_cutoff = std::max(1.0, 0.45 * std::max(1.0, rate_hz_));
+        const double cutoff =
+            std::clamp(velocity_filter_cutoff_hz_, 1.0, max_cutoff);
+        const double rc = 1.0 / (2.0 * M_PI * cutoff);
+        const double alpha = dt_safe / (rc + dt_safe);
+
+        if (first_velocity_read_)
+        {
+            qdot_filtered_ = qdot_raw;
+            first_velocity_read_ = false;
+        }
+        else
+        {
+            qdot_filtered_ = alpha * qdot_raw + (1.0 - alpha) * qdot_filtered_;
+        }
+
+        t_last_velocity_filter_update_ = now;
+        have_velocity_filter_update_ = true;
+        return qdot_filtered_;
+    }
+
+    bool getMeasuredJointVelocity(const Eigen::VectorXd &q,
+                                  double dt_hint,
+                                  Eigen::VectorXd &qdot_out,
+                                  Eigen::VectorXd &q_prev,
+                                  rclcpp::Time &t_prev_q,
+                                  bool &have_q_prev)
+    {
+        qdot_out = Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_names_.size()));
+
+        bool velocity_valid = false;
+        if (last_joint_state_ &&
+            last_joint_state_->velocity.size() >= joint_names_.size())
+        {
+            Eigen::VectorXd qdot_driver(static_cast<Eigen::Index>(joint_names_.size()));
+            velocity_valid = true;
+            for (size_t i = 0; i < joint_names_.size(); ++i)
+            {
+                auto it = std::find(last_joint_state_->name.begin(),
+                                    last_joint_state_->name.end(),
+                                    joint_names_[i]);
+                if (it == last_joint_state_->name.end())
+                {
+                    velocity_valid = false;
+                    break;
+                }
+
+                const size_t idx =
+                    static_cast<size_t>(std::distance(last_joint_state_->name.begin(), it));
+                if (idx >= last_joint_state_->velocity.size())
+                {
+                    velocity_valid = false;
+                    break;
+                }
+
+                const double v = last_joint_state_->velocity[idx];
+                if (!std::isfinite(v))
+                {
+                    velocity_valid = false;
+                    break;
+                }
+
+                qdot_driver[static_cast<Eigen::Index>(i)] = v;
+            }
+
+            if (velocity_valid && qdot_driver.allFinite())
+            {
+                qdot_out = qdot_driver;
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "SUCCESS: Using TRUE hardware velocity from MotoMini!");
+            }
+        }
+
+        const rclcpp::Time now = this->now();
+        const double dt_prev = have_q_prev ? (now - t_prev_q).seconds() : dt_hint;
+        if (!velocity_valid)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "WARNING: Hardware velocity missing! Falling back to calculated lag-velocity.");
+            if (have_q_prev && q_prev.size() == q.size() && dt_prev > 1e-6)
+                qdot_out = (q - q_prev) / dt_prev;
+            else
+                qdot_out.setZero();
+        }
+
+        q_prev = q;
+        t_prev_q = now;
+        have_q_prev = true;
+
+        const double filter_dt =
+            (dt_prev > 1e-6 && dt_prev < 1.0) ? dt_prev : dt_hint;
+        if (real_robot_)
+            qdot_out = filterJointVelocity(qdot_out, filter_dt);
+
+        return qdot_out.allFinite();
     }
 
     // Seed tracked_positions_ / tracked_velocities_ from the real joint state
@@ -563,21 +721,11 @@ private:
         msg.angular.z = rpy.z();
         pub_feedback_->publish(msg);
 
-        // Cartesian velocity = J(q) · θ̇.
-        // We derive θ̇ by numerical differentiation of observed joint positions,
-        // because many drivers/simulators leave the JointState.velocity field
-        // empty or zero. This guarantees the topic always reflects real motion.
-        const rclcpp::Time t_now = this->now();
-        Eigen::VectorXd qdot = Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_names_.size()));
-        if (have_q_prev_ && q_prev_.size() == q.size())
-        {
-            const double dt_q = (t_now - t_prev_q_).seconds();
-            if (dt_q > 1e-6)
-                qdot = (q - q_prev_) / dt_q;
-        }
-        q_prev_ = q;
-        t_prev_q_ = t_now;
-        have_q_prev_ = true;
+        const double dt_hint = have_q_prev_ ? (this->now() - t_prev_q_).seconds()
+                                            : (1.0 / std::max(1.0, rate_hz_));
+        Eigen::VectorXd qdot;
+        if (!getMeasuredJointVelocity(q, dt_hint, qdot, q_prev_, t_prev_q_, have_q_prev_))
+            return;
 
         const Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
         const Eigen::VectorXd v_cart = J * qdot;
@@ -617,6 +765,67 @@ private:
             }
         }
         return true;
+    }
+
+    bool checkCartesianVelocitySafety(const Eigen::Matrix<double, 6, 1> &xdot_actual)
+    {
+        const double linear = xdot_actual.head<3>().norm();
+        const double angular = xdot_actual.tail<3>().norm();
+
+        if (measured_cart_linear_vel_limit_ > 0.0 &&
+            linear > measured_cart_linear_vel_limit_)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                                 "Measured Cartesian linear velocity %.4f m/s exceeds limit %.4f m/s",
+                                 linear, measured_cart_linear_vel_limit_);
+            return false;
+        }
+
+        if (measured_cart_angular_vel_limit_ > 0.0 &&
+            angular > measured_cart_angular_vel_limit_)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                                 "Measured Cartesian angular velocity %.4f rad/s exceeds limit %.4f rad/s",
+                                 angular, measured_cart_angular_vel_limit_);
+            return false;
+        }
+
+        return true;
+    }
+
+    void clampCartesianVelocity(Eigen::Matrix<double, 6, 1> &xdot) const
+    {
+        const double lin_n = xdot.head<3>().norm();
+        if (lin_n > max_cart_linear_vel_ && lin_n > 1e-9)
+            xdot.head<3>() *= max_cart_linear_vel_ / lin_n;
+
+        const double ang_n = xdot.tail<3>().norm();
+        if (ang_n > max_cart_angular_vel_ && ang_n > 1e-9)
+            xdot.tail<3>() *= max_cart_angular_vel_ / ang_n;
+    }
+
+    void limitCartesianAcceleration(Eigen::Matrix<double, 6, 1> &xdot_next,
+                                    const Eigen::Matrix<double, 6, 1> &xdot_prev,
+                                    double dt) const
+    {
+        const double dt_safe =
+            (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
+
+        if (max_cart_linear_acc_ > 0.0)
+        {
+            const Eigen::Vector3d dv_lin = xdot_next.head<3>() - xdot_prev.head<3>();
+            const double max_dv_lin = max_cart_linear_acc_ * dt_safe;
+            if (dv_lin.norm() > max_dv_lin && dv_lin.norm() > 1e-9)
+                xdot_next.head<3>() = xdot_prev.head<3>() + dv_lin.normalized() * max_dv_lin;
+        }
+
+        if (max_cart_angular_acc_ > 0.0)
+        {
+            const Eigen::Vector3d dv_ang = xdot_next.tail<3>() - xdot_prev.tail<3>();
+            const double max_dv_ang = max_cart_angular_acc_ * dt_safe;
+            if (dv_ang.norm() > max_dv_ang && dv_ang.norm() > 1e-9)
+                xdot_next.tail<3>() = xdot_prev.tail<3>() + dv_ang.normalized() * max_dv_ang;
+        }
     }
 
     bool checkPositionLimits(const std::vector<double> &pos) const
@@ -711,7 +920,7 @@ private:
     // Virtual second-order dynamics shape the *reference* Cartesian
     // velocity ẋ_ref:
     //
-    //     ẍ_ref = M_d⁻¹ · ( K_d·e − D_e·ė − F_coll − D_d·ẋ_ref )
+    //     ẍ_ref = M_d⁻¹ · ( K_d·e + D_e·(ẋ_des−ẋ_ref) − F_coll − D_d·ẋ_ref )
     //     ẋ_ref ← ẋ_ref + ẍ_ref · dt
     //     θ̇_cmd = J⁺_SR(q) · ẋ_ref
     //
@@ -774,49 +983,21 @@ private:
         const double d_ori_var = 2.0 * zeta_ori_ *
                                  std::sqrt(std::max(1e-12, m_ori_var * k_ori_var));
 
-        // --- Joint velocity θ̇: prefer driver field, fall back to numerical diff ---
-        Eigen::VectorXd qdot = Eigen::VectorXd::Zero(q.size());
-        bool used_driver = false;
-        if (last_joint_state_ &&
-            last_joint_state_->velocity.size() >= last_joint_state_->name.size())
-        {
-            Eigen::VectorXd qdot_drv(static_cast<Eigen::Index>(joint_names_.size()));
-            bool ok = true;
-            for (size_t i = 0; i < joint_names_.size(); ++i)
-            {
-                auto it = std::find(last_joint_state_->name.begin(),
-                                    last_joint_state_->name.end(),
-                                    joint_names_[i]);
-                if (it == last_joint_state_->name.end())
-                {
-                    ok = false;
-                    break;
-                }
-                const size_t idx = std::distance(last_joint_state_->name.begin(), it);
-                if (idx >= last_joint_state_->velocity.size())
-                {
-                    ok = false;
-                    break;
-                }
-                qdot_drv[static_cast<Eigen::Index>(i)] = last_joint_state_->velocity[idx];
-            }
-            if (ok && qdot_drv.allFinite())
-            {
-                qdot = qdot_drv;
-                used_driver = true;
-            }
-        }
-        if (!used_driver && have_q_prev_ctrl_ && q_prev_ctrl_.size() == q.size())
-        {
-            const double dt_q = (this->now() - t_prev_q_ctrl_).seconds();
-            if (dt_q > 1e-6)
-                qdot = (q - q_prev_ctrl_) / dt_q;
-        }
-        q_prev_ctrl_ = q;
-        t_prev_q_ctrl_ = this->now();
-        have_q_prev_ctrl_ = true;
+        // --- Measured joint velocity: filtered for safety/telemetry only. ---
+        const double dt_safe =
+            (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
+        Eigen::VectorXd qdot;
+        if (!getMeasuredJointVelocity(q, dt_safe, qdot, q_prev_ctrl_, t_prev_q_ctrl_, have_q_prev_ctrl_))
+            return false;
 
         const Eigen::Matrix<double, 6, 1> xdot_actual = J * qdot;
+        if (!checkCartesianVelocitySafety(xdot_actual))
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Measured Cartesian velocity safety exceeded → STATE_STOP");
+            state_ = STATE_STOP;
+            return false;
+        }
 
         // --- Desired Cartesian velocity (target_vel if fresh, else 0) ---
         Eigen::Matrix<double, 6, 1> xdot_des = Eigen::Matrix<double, 6, 1>::Zero();
@@ -825,11 +1006,11 @@ private:
         {
             xdot_des.head<3>() = latest_target_vel_.head<3>();
             // /motomini/target_vel angular is body-frame. Convert it to the
-            // base frame before comparing with J(q)·θ̇.
+            // base frame before applying reference-state damping.
             xdot_des.tail<3>() = des_rot * latest_target_vel_.tail<3>();
         }
 
-        const Eigen::Matrix<double, 6, 1> velocity_error = xdot_actual - xdot_des;
+        const Eigen::Matrix<double, 6, 1> edot_ref = xdot_des - xdot_ref_;
 
         // --- Collision wrench from /motomini/collision_wrench ---
         // The debug node publishes a repulsive push-away wrench. The callback
@@ -875,10 +1056,10 @@ private:
             gamma = std::min(gamma, collision_projection_max_gamma_);
         }
 
-        // Goal force = K·e − D·ė. Strip the "into obstacle" component so the
+        // Goal force = K·e + D·(ẋ_des−ẋ_ref). Strip the "into obstacle" component so the
         // tracker stops actively pulling the EE deeper while still allowing
         // tangent and away motion.
-        Eigen::Vector3d F_goal_pos = k_pos_var * e_p_ - d_pos_var * velocity_error.head<3>();
+        Eigen::Vector3d F_goal_pos = k_pos_var * e_p_ + d_pos_var * edot_ref.head<3>();
         if (collision_goal_suppression_ && gamma > 0.0)
         {
             const double goal_into = F_goal_pos.dot(n_away);
@@ -888,13 +1069,14 @@ private:
 
         // --- Virtual acceleration ẍ_ref = M⁻¹·(F_goal_safe − F_coll − D·ẋ_ref) ---
         Eigen::Matrix<double, 6, 1> xddot_ref;
-        xddot_ref.head<3>() = (F_goal_pos - F_collision.head<3>() - d_pos_var * xdot_ref_.head<3>()) / std::max(1e-9, m_pos_var);
-        xddot_ref.tail<3>() = (k_ori_var * e_o_ - d_ori_var * velocity_error.tail<3>() - F_collision.tail<3>() - d_ori_var * xdot_ref_.tail<3>()) / std::max(1e-9, m_ori_var);
+        xddot_ref.head<3>() = (F_goal_pos - F_collision.head<3>()) / std::max(1e-9, m_pos_var);
+        xddot_ref.tail<3>() = (k_ori_var * e_o_ + d_ori_var * edot_ref.tail<3>() - F_collision.tail<3>() - d_ori_var * xdot_ref_.tail<3>()) / std::max(1e-9, m_ori_var);
 
         // --- Integrate ẋ_ref ---
-        const double dt_safe =
-            (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
-        xdot_ref_ += xddot_ref * dt_safe;
+        const Eigen::Matrix<double, 6, 1> xdot_prev = xdot_ref_;
+        Eigen::Matrix<double, 6, 1> xdot_next = xdot_ref_ + xddot_ref * dt_safe;
+        limitCartesianAcceleration(xdot_next, xdot_prev, dt_safe);
+        xdot_ref_ = xdot_next;
 
         // --- Velocity projection: hard "no deeper into obstacle" rule on the
         //     translational part of the integrator state. Tangent and away
@@ -907,16 +1089,45 @@ private:
         }
 
         // --- Safety clamps on the integrator state ---
-        const double lin_n = xdot_ref_.head<3>().norm();
-        if (lin_n > max_cart_linear_vel_ && lin_n > 1e-9)
-            xdot_ref_.head<3>() *= max_cart_linear_vel_ / lin_n;
-        const double ang_n = xdot_ref_.tail<3>().norm();
-        if (ang_n > max_cart_angular_vel_ && ang_n > 1e-9)
-            xdot_ref_.tail<3>() *= max_cart_angular_vel_ / ang_n;
+        clampCartesianVelocity(xdot_ref_);
 
         // --- SR-inverse Jacobian → joint velocity command ---
         theta_d = calcSrInverse(J, w, w0_, k0_) * xdot_ref_;
 
+        return true;
+    }
+
+    bool initializeReferenceVelocityFromMeasuredState()
+    {
+        Eigen::VectorXd q;
+        if (!currentJointVector(q))
+        {
+            xdot_ref_.setZero();
+            return false;
+        }
+
+        Eigen::VectorXd qdot;
+        if (!getMeasuredJointVelocity(q,
+                                      1.0 / std::max(1.0, rate_hz_),
+                                      qdot,
+                                      q_prev_ctrl_,
+                                      t_prev_q_ctrl_,
+                                      have_q_prev_ctrl_))
+        {
+            xdot_ref_.setZero();
+            return false;
+        }
+
+        const Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
+        const Eigen::VectorXd xdot_measured = J * qdot;
+        if (xdot_measured.size() != 6 || !xdot_measured.allFinite())
+        {
+            xdot_ref_.setZero();
+            return false;
+        }
+
+        xdot_ref_ = xdot_measured;
+        clampCartesianVelocity(xdot_ref_);
         return true;
     }
 
@@ -927,6 +1138,10 @@ private:
         xdot_ref_.setZero();
         have_q_prev_ctrl_ = false;
         q_prev_ctrl_.resize(0);
+        first_velocity_read_ = true;
+        qdot_filtered_.resize(0);
+        have_velocity_filter_update_ = false;
+        t_last_velocity_filter_update_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         latest_collision_wrench_.setZero();
         t_last_collision_wrench_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         latest_collision_distance_ = std::numeric_limits<double>::infinity();
@@ -976,6 +1191,7 @@ private:
             if (initTrackedPositions())
             {
                 resetControlWindow();
+                initializeReferenceVelocityFromMeasuredState();
                 if (enable_seed_)
                     seed();
                 state_ = STATE_POSE_FOLLOW;
@@ -1016,6 +1232,7 @@ private:
             if (initTrackedPositions())
             {
                 resetControlWindow();
+                initializeReferenceVelocityFromMeasuredState();
                 if (enable_seed_)
                     seed();
                 state_ = STATE_POSE_FOLLOW;
@@ -1117,6 +1334,7 @@ private:
         }
         is_init_done_ = false;
         resetControlWindow();
+        initializeReferenceVelocityFromMeasuredState();
         if (enable_seed_)
             seed();
         state_ = STATE_INIT;
@@ -1162,6 +1380,7 @@ private:
         if (last_state_ != state_)
         {
             last_state_ = state_;
+            initializeReferenceVelocityFromMeasuredState();
             RCLCPP_INFO(this->get_logger(), "STATE_INIT: moving to init pose...");
         }
 
@@ -1192,6 +1411,7 @@ private:
         {
             is_init_done_ = true;
             resetControlWindow();
+            initializeReferenceVelocityFromMeasuredState();
             state_ = STATE_POSE_FOLLOW;
             RCLCPP_INFO(this->get_logger(),
                         "Init complete (err: %.5f, %.5f, %.5f m). STATE_INIT → STATE_POSE_FOLLOW",
@@ -1228,11 +1448,21 @@ private:
             return;
         }
 
-        // Integrate
+        if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
+            !initTrackedPositions())
+        {
+            return;
+        }
+
+        // Stateless overwrite: anchor every command to the measured joint state.
         std::vector<double> prev_pos = tracked_positions_;
+        const double dt_safe =
+            (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
         for (size_t i = 0; i < tracked_positions_.size(); ++i)
         {
-            tracked_positions_[i] += theta_d[static_cast<Eigen::Index>(i)] * dt;
+            tracked_positions_[i] =
+                q[static_cast<Eigen::Index>(i)] +
+                theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
             tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
         }
 
@@ -1257,7 +1487,7 @@ private:
         if (last_state_ != state_)
         {
             last_state_ = state_;
-            resetVirtualState();
+            initializeReferenceVelocityFromMeasuredState();
             RCLCPP_INFO(this->get_logger(),
                         "STATE_POSE_FOLLOW: tracking /motomini/target_pose");
         }
@@ -1298,19 +1528,21 @@ private:
 
         double dt = (this->now() - t_last_).seconds();
         t_last_ = this->now();
+        const double dt_safe =
+            (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
 
         // Integrate streaming target_vel into the desired pose.
         // linear = base frame (added directly), angular = body frame (post-mul).
         const double dt_vel = (this->now() - t_last_target_vel_cb_).seconds();
         if (dt_vel < TARGET_VEL_TIMEOUT_SEC && latest_target_vel_.norm() > 0.0)
         {
-            des_pos.x() += latest_target_vel_(0) * dt;
-            des_pos.y() += latest_target_vel_(1) * dt;
-            des_pos.z() += latest_target_vel_(2) * dt;
+            des_pos.x() += latest_target_vel_(0) * dt_safe;
+            des_pos.y() += latest_target_vel_(1) * dt_safe;
+            des_pos.z() += latest_target_vel_(2) * dt_safe;
             const Eigen::Quaterniond delta =
-                Eigen::AngleAxisd(latest_target_vel_(3) * dt, Eigen::Vector3d::UnitX()) *
-                Eigen::AngleAxisd(latest_target_vel_(4) * dt, Eigen::Vector3d::UnitY()) *
-                Eigen::AngleAxisd(latest_target_vel_(5) * dt, Eigen::Vector3d::UnitZ());
+                Eigen::AngleAxisd(latest_target_vel_(3) * dt_safe, Eigen::Vector3d::UnitX()) *
+                Eigen::AngleAxisd(latest_target_vel_(4) * dt_safe, Eigen::Vector3d::UnitY()) *
+                Eigen::AngleAxisd(latest_target_vel_(5) * dt_safe, Eigen::Vector3d::UnitZ());
             q_des = (q_des * delta).normalized();
 
             // Persist the integrated target so the next pose-only callback
@@ -1326,7 +1558,7 @@ private:
         }
 
         Eigen::VectorXd theta_d;
-        if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt, theta_d))
+        if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt_safe, theta_d))
             return;
 
         RCLCPP_DEBUG(this->get_logger(),
@@ -1343,11 +1575,19 @@ private:
             return;
         }
 
+        if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
+            !initTrackedPositions())
+        {
+            return;
+        }
+
         // Integrate: stateless overwrite — always base on actual joint state
         std::vector<double> prev_pos = tracked_positions_;
         for (size_t i = 0; i < tracked_positions_.size(); ++i)
         {
-            tracked_positions_[i] += theta_d[static_cast<Eigen::Index>(i)] * dt;
+            tracked_positions_[i] =
+                q[static_cast<Eigen::Index>(i)] +
+                theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
             tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
         }
 
@@ -1395,6 +1635,12 @@ private:
     double rate_hz_;
     double w0_, k0_;
     bool enable_seed_;
+    bool real_robot_{true};
+    double velocity_filter_cutoff_hz_{15.0};
+    double max_cart_linear_acc_{0.8};
+    double max_cart_angular_acc_{2.5};
+    double measured_cart_linear_vel_limit_{1.0};
+    double measured_cart_angular_vel_limit_{3.0};
 
     // --- Adaptive Cartesian admittance gains ---
     double m_pos_min_, m_pos_max_, k_pos_min_, k_pos_max_, zeta_pos_;
@@ -1405,10 +1651,14 @@ private:
     // --- Virtual Cartesian-velocity integrator state ---
     Eigen::Matrix<double, 6, 1> xdot_ref_{Eigen::Matrix<double, 6, 1>::Zero()};
 
-    // --- Numerical θ̇ history for the controller's velocity-error term ---
+    // --- Measured θ̇ history for safety/start initialization ---
     Eigen::VectorXd q_prev_ctrl_;
     rclcpp::Time t_prev_q_ctrl_{0, 0, RCL_ROS_TIME};
     bool have_q_prev_ctrl_{false};
+    Eigen::VectorXd qdot_filtered_;
+    bool first_velocity_read_{true};
+    rclcpp::Time t_last_velocity_filter_update_{0, 0, RCL_ROS_TIME};
+    bool have_velocity_filter_update_{false};
 
     // --- Runtime state ---
     State state_, last_state_;
@@ -1422,10 +1672,10 @@ private:
     Eigen::Vector3d e_o_;
 
     // --- Time ---
-    rclcpp::Time t_start_;              // reset at each IDLE → active transition
-    rclcpp::Time t_last_;               // last tick timestamp
-    rclcpp::Time t_last_pose_cb_;       // last desired-pose callback time
-    rclcpp::Time t_last_target_vel_cb_; // last target-velocity callback time
+    rclcpp::Time t_start_;                    // reset at each IDLE → active transition
+    rclcpp::Time t_last_;                     // last tick timestamp
+    rclcpp::Time t_last_pose_cb_;             // last desired-pose callback time
+    rclcpp::Time t_last_target_vel_cb_;       // last target-velocity callback time
     rclcpp::Time t_last_collision_wrench_cb_; // last collision-wrench callback time
 
     // --- Streaming target velocity (linear=base, angular=body) ---

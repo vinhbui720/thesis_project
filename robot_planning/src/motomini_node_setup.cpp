@@ -46,6 +46,8 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<bool>("debug", false);
     this->declare_parameter<bool>("use_ompl", false);
     this->declare_parameter<double>("tf_poll_rate_hz", 200.0);
+    this->declare_parameter<int>("planning_chunk_size", 20);
+    this->declare_parameter<int>("planning_parallel_chunks", 2);
 
     // Embedded feedback-stream controller parameters. Names intentionally
     // match motomini_feedback_stream.cpp so the same tuning values can be used.
@@ -73,6 +75,11 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("adaptive_alpha_ori", 6.0);
     this->declare_parameter<double>("max_cart_linear_vel", 0.5);
     this->declare_parameter<double>("max_cart_angular_vel", 1.5);
+    this->declare_parameter<double>("max_cart_linear_acc", 0.8);
+    this->declare_parameter<double>("max_cart_angular_acc", 2.5);
+    this->declare_parameter<double>("velocity_filter_cutoff_hz", 15.0);
+    this->declare_parameter<double>("measured_cart_linear_vel_limit", 1.0);
+    this->declare_parameter<double>("measured_cart_angular_vel_limit", 3.0);
     this->declare_parameter<double>("collision_wrench_timeout_sec", 0.2);
     this->declare_parameter<bool>("enable_collision_projection", true);
     this->declare_parameter<bool>("collision_goal_suppression", true);
@@ -84,6 +91,43 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("collision_force_scale", 1.0);
     this->declare_parameter<double>("collision_force_max", 5.0);
     this->declare_parameter<bool>("real_robot", true);
+
+    this->declare_parameter<std::string>("move_instruction_type", "FREESPACE");
+    this->declare_parameter<double>("ompl_planning_time", 10.0);
+    this->declare_parameter<int>("ompl_max_solutions", 5);
+    this->declare_parameter<bool>("ompl_simplify", true);
+    this->declare_parameter<double>("ompl_longest_valid_segment", 0.005);
+    this->declare_parameter<double>("ompl_rrt_range_1", 0.05);
+    this->declare_parameter<double>("ompl_rrt_range_2", 0.10);
+
+    // TrajOptIfopt Defaults (matched to struct and working YAML)
+    this->declare_parameter<double>("ifopt_cart_coeff_x", 100.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_y", 100.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_z", 100.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_rx", 0.0); // 0.0 = Free rotation by default
+    this->declare_parameter<double>("ifopt_cart_coeff_ry", 0.0);
+    this->declare_parameter<double>("ifopt_cart_coeff_rz", 0.0);
+    this->declare_parameter<double>("ifopt_joint_cost_coeff", 5.0);
+    this->declare_parameter<double>("ifopt_coll_cost_margin", 0.02);
+    this->declare_parameter<double>("ifopt_coll_cost_coeff", 500.0);
+    this->declare_parameter<double>("ifopt_coll_margin_buffer", 0.02);
+    this->declare_parameter<int>("ifopt_coll_eval_type", 2);
+    this->declare_parameter<double>("ifopt_coll_lvs_length", 0.005);
+    this->declare_parameter<double>("ifopt_smooth_vel_coeff", 0.1);
+    this->declare_parameter<double>("ifopt_smooth_acc_coeff", 1.0);
+    this->declare_parameter<double>("ifopt_smooth_jerk_coeff", 1.0);
+    this->declare_parameter<int>("ifopt_max_iter", 300);
+    this->declare_parameter<double>("ifopt_min_approx_improve", 1e-6);
+    this->declare_parameter<double>("ifopt_min_trust_box_size", 1e-5);
+    this->declare_parameter<double>("ifopt_initial_trust_box_size", 0.5);
+    this->declare_parameter<bool>("ifopt_joint_cost_enable", true);
+    this->declare_parameter<bool>("ifopt_cart_constraint_enable", true);
+    this->declare_parameter<bool>("ifopt_cart_cost_enable", false);
+    this->declare_parameter<bool>("ifopt_coll_constraint_enable", false);
+    this->declare_parameter<bool>("ifopt_coll_cost_enable", true);
+    this->declare_parameter<bool>("ifopt_smooth_vel_enable", true);
+    this->declare_parameter<bool>("ifopt_smooth_acc_enable", true);
+    this->declare_parameter<bool>("ifopt_smooth_jerk_enable", true);
 
     rate_hz_ = std::max(1.0, this->get_parameter("rate_hz").as_double());
     w0_ = this->get_parameter("w0").as_double();
@@ -104,6 +148,14 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     adaptive_alpha_ori_ = this->get_parameter("adaptive_alpha_ori").as_double();
     max_cart_linear_vel_ = this->get_parameter("max_cart_linear_vel").as_double();
     max_cart_angular_vel_ = this->get_parameter("max_cart_angular_vel").as_double();
+    max_cart_linear_acc_ = this->get_parameter("max_cart_linear_acc").as_double();
+    max_cart_angular_acc_ = this->get_parameter("max_cart_angular_acc").as_double();
+    velocity_filter_cutoff_hz_ =
+        this->get_parameter("velocity_filter_cutoff_hz").as_double();
+    measured_cart_linear_vel_limit_ =
+        this->get_parameter("measured_cart_linear_vel_limit").as_double();
+    measured_cart_angular_vel_limit_ =
+        this->get_parameter("measured_cart_angular_vel_limit").as_double();
     collision_wrench_timeout_sec_ =
         this->get_parameter("collision_wrench_timeout_sec").as_double();
     enable_collision_projection_ =
@@ -186,53 +238,16 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         joint_names_ = manip_->getJointNames();
         joint_limits_ = manip_->getLimits().joint_limits;
         velocity_limits_ = manip_->getLimits().velocity_limits;
+        qdot_filtered_ =
+            Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_names_.size()));
     }
 
     // ---- Offline chunked planning parameters ----
-    this->declare_parameter<int>("planning_chunk_size", 20);
-    this->declare_parameter<int>("planning_parallel_chunks", 2);
     planner_->configureChunking(
         this->get_parameter("planning_chunk_size").as_int(),
         this->get_parameter("planning_parallel_chunks").as_int());
 
     // ---- Runtime-tunable planning hyperparameters (from planning_params.yaml) ----
-    this->declare_parameter<std::string>("move_instruction_type", "FREESPACE");
-    this->declare_parameter<double>("ompl_planning_time", 10.0);
-    this->declare_parameter<int>("ompl_max_solutions", 5);
-    this->declare_parameter<bool>("ompl_simplify", true);
-    this->declare_parameter<double>("ompl_longest_valid_segment", 0.005);
-    this->declare_parameter<double>("ompl_rrt_range_1", 0.05);
-    this->declare_parameter<double>("ompl_rrt_range_2", 0.10);
-    
-    // TrajOptIfopt Defaults (matched to struct and working YAML)
-    this->declare_parameter<double>("ifopt_cart_coeff_x", 100.0);
-    this->declare_parameter<double>("ifopt_cart_coeff_y", 100.0);
-    this->declare_parameter<double>("ifopt_cart_coeff_z", 100.0);
-    this->declare_parameter<double>("ifopt_cart_coeff_rx", 0.0); // 0.0 = Free rotation by default
-    this->declare_parameter<double>("ifopt_cart_coeff_ry", 0.0);
-    this->declare_parameter<double>("ifopt_cart_coeff_rz", 0.0);
-    this->declare_parameter<double>("ifopt_joint_cost_coeff", 5.0);
-    this->declare_parameter<double>("ifopt_coll_cost_margin", 0.02);
-    this->declare_parameter<double>("ifopt_coll_cost_coeff", 500.0);
-    this->declare_parameter<double>("ifopt_coll_margin_buffer", 0.02);
-    this->declare_parameter<int>("ifopt_coll_eval_type", 2);
-    this->declare_parameter<double>("ifopt_coll_lvs_length", 0.005);
-    this->declare_parameter<double>("ifopt_smooth_vel_coeff", 0.1);
-    this->declare_parameter<double>("ifopt_smooth_acc_coeff", 1.0);
-    this->declare_parameter<double>("ifopt_smooth_jerk_coeff", 1.0);
-    this->declare_parameter<int>("ifopt_max_iter", 300);
-    this->declare_parameter<double>("ifopt_min_approx_improve", 1e-6);
-    this->declare_parameter<double>("ifopt_min_trust_box_size", 1e-5);
-    this->declare_parameter<double>("ifopt_initial_trust_box_size", 0.5);
-    this->declare_parameter<bool>("ifopt_joint_cost_enable", true);
-    this->declare_parameter<bool>("ifopt_cart_constraint_enable", true);
-    this->declare_parameter<bool>("ifopt_cart_cost_enable", false);
-    this->declare_parameter<bool>("ifopt_coll_constraint_enable", false);
-    this->declare_parameter<bool>("ifopt_coll_cost_enable", true);
-    this->declare_parameter<bool>("ifopt_smooth_vel_enable", true);
-    this->declare_parameter<bool>("ifopt_smooth_acc_enable", true);
-    this->declare_parameter<bool>("ifopt_smooth_jerk_enable", true);
-    
     {
         Vinhtesseract_examples::MotoMiniPlanning::PlanningConfig cfg;
         const std::string instr = this->get_parameter("move_instruction_type").as_string();
@@ -509,7 +524,12 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
             else if (n == "ompl_rrt_range_2") cfg.ompl_rrt_range_2 = p.as_double();
             else if (n == "planning_chunk_size") { new_chunk_size = static_cast<int>(p.as_int()); chunk_changed = true; }
             else if (n == "planning_parallel_chunks") { new_parallel = static_cast<int>(p.as_int()); chunk_changed = true; }
-            else if (n == "real_robot") { real_robot_ = p.as_bool(); }
+            else if (n == "real_robot") { real_robot_ = p.as_bool(); first_velocity_read_ = true; qdot_filtered_.resize(0); have_velocity_filter_update_ = false; }
+            else if (n == "velocity_filter_cutoff_hz") { velocity_filter_cutoff_hz_ = p.as_double(); sanitizeTrackingParameters(); }
+            else if (n == "max_cart_linear_acc") { max_cart_linear_acc_ = p.as_double(); sanitizeTrackingParameters(); }
+            else if (n == "max_cart_angular_acc") { max_cart_angular_acc_ = p.as_double(); sanitizeTrackingParameters(); }
+            else if (n == "measured_cart_linear_vel_limit") { measured_cart_linear_vel_limit_ = p.as_double(); sanitizeTrackingParameters(); }
+            else if (n == "measured_cart_angular_vel_limit") { measured_cart_angular_vel_limit_ = p.as_double(); sanitizeTrackingParameters(); }
             else if (n == "ee_link" || n == "tool_param")
             {
                 ee_link_ = p.as_string();

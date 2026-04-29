@@ -157,10 +157,14 @@ private:
     Eigen::MatrixX2d velocity_limits_;
     std::vector<std::string> joint_names_;
 
-    // ---- Numerical θ̇ history for Cartesian feedback (J·θ̇) ----
+    // ---- Measured θ̇ history for Cartesian feedback (J·θ̇) ----
     Eigen::VectorXd q_prev_;
     rclcpp::Time t_prev_q_{0, 0, RCL_ROS_TIME};
     bool have_q_prev_{false};
+    Eigen::VectorXd qdot_filtered_;
+    bool first_velocity_read_{true};
+    rclcpp::Time t_last_velocity_filter_update_{0, 0, RCL_ROS_TIME};
+    bool have_velocity_filter_update_{false};
 
     enum class TrackingStreamState
     {
@@ -210,6 +214,11 @@ private:
     double adaptive_alpha_ori_{6.0};
     double max_cart_linear_vel_{0.5};
     double max_cart_angular_vel_{1.5};
+    double max_cart_linear_acc_{0.8};
+    double max_cart_angular_acc_{2.5};
+    double velocity_filter_cutoff_hz_{15.0};
+    double measured_cart_linear_vel_limit_{1.0};
+    double measured_cart_angular_vel_limit_{3.0};
     double w0_{0.01};
     double k0_{0.01};
 
@@ -217,7 +226,7 @@ private:
     Eigen::Vector3d e_p_{Eigen::Vector3d::Zero()};
     Eigen::Vector3d e_o_{Eigen::Vector3d::Zero()};
 
-    // ---- Numerical θ̇ history for the controller velocity-error term ----
+    // ---- Measured θ̇ history for safety/start initialization ----
     Eigen::VectorXd q_prev_ctrl_;
     rclcpp::Time t_prev_q_ctrl_{0, 0, RCL_ROS_TIME};
     bool have_q_prev_ctrl_{false};
@@ -255,6 +264,14 @@ private:
     void collisionNormalCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg);
     void sanitizeTrackingParameters();
     bool currentJointVector(Eigen::VectorXd &q) const;
+    Eigen::VectorXd filterJointVelocity(const Eigen::VectorXd &qdot_raw, double dt);
+    bool getMeasuredJointVelocity(const Eigen::VectorXd &q,
+                                  double dt_hint,
+                                  Eigen::VectorXd &qdot_out,
+                                  Eigen::VectorXd &q_prev,
+                                  rclcpp::Time &t_prev_q,
+                                  bool &have_q_prev);
+    bool initializeReferenceVelocityFromMeasuredState();
     bool initTrackedPositions();
     bool getEEPose(const Eigen::VectorXd &q, Eigen::Vector3d &pos, Eigen::Matrix3d &rot) const;
     bool computeControlStep(const Eigen::VectorXd &q,
@@ -263,6 +280,11 @@ private:
                             double dt,
                             Eigen::VectorXd &theta_d);
     bool checkVelocityLimits(const Eigen::VectorXd &theta_d) const;
+    bool checkCartesianVelocitySafety(const Eigen::Matrix<double, 6, 1> &xdot_actual);
+    void clampCartesianVelocity(Eigen::Matrix<double, 6, 1> &xdot) const;
+    void limitCartesianAcceleration(Eigen::Matrix<double, 6, 1> &xdot_next,
+                                    const Eigen::Matrix<double, 6, 1> &xdot_prev,
+                                    double dt) const;
     bool checkPositionLimits(const std::vector<double> &pos,
                              const std::vector<double> &reference = {}) const;
     void publishStreamPoint(rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr &pub,

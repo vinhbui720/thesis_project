@@ -14,38 +14,36 @@
                 izz="0.001" />
         </inertial>
     </link>
+    <link name="test_obstacle">
+        <visual>
+            <geometry>
+                <box size="0.03 0.03 0.25" />
+            </geometry>
+        </visual>
+        <collision>
+            <geometry>
+                <box size="0.038 0.038 0.258" />
+            </geometry>
+        </collision>
+        <inertial>
+            <mass value="0.1" />
+            <origin xyz="0 0 0" />
+            <inertia ixx="0.001" ixy="0" ixz="0"
+                iyy="0.001" iyz="0"
+                izz="0.001" />
+        </inertial>
+    </link>
+    <joint name="obstacle_joint" type="fixed">
+        <parent link="workcell" />
+        <child link="test_obstacle" />
+        <origin xyz="0.27 -0.05 0.08" rpy="0 0 0" />
+    </joint>
     <joint name="world_depth_camera_joint" type="fixed">
         <parent link="workcell" />
         <child link="world_depth_camera_link" />
         <origin xyz="0.212 -0.027 0.0" rpy="0 3.14159 1.57142857143" />
     </joint>
-    <link name="obstacle">
-        <visual>
-            <geometry>
-                <box size="0.1 0.1 0.1"/>
-            </geometry>
-            <material>
-                <color rgba="0.8 0.2 0.2 1"/>
-            </material>
-        </visual>
-        <collision>
-            <geometry>
-                <box size="0.1 0.1 0.1"/>
-            </geometry>
-        </collision>
-        <inertial>
-            <mass value="1.0"/>
-            <origin xyz="0 0 0"/>
-            <inertia ixx="0.01" ixy="0" ixz="0"
-                     iyy="0.01" iyz="0"
-                     izz="0.01"/>
-        </inertial>
-    </link>
-    <joint name="obstacle_joint" type="fixed">
-        <parent link="workcell"/>
-        <child link="obstacle"/>
-        <origin xyz="0.5 0 0.05" rpy="0 0 0"/>
-    </joint>
+
     <gazebo reference="world_depth_camera_link">
         <sensor name="realsense_d435" type="rgbd_camera">
             <topic>camera</topic>
