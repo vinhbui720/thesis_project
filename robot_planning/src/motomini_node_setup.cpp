@@ -18,17 +18,13 @@
 #include <tesseract_rosutils/utils.h>
 #include <tesseract_scene_graph/graph.h>
 #include <tesseract_kinematics/core/kinematic_group.h>
-#include <tesseract_task_composer/core/task_composer_plugin_factory.h>
-#include <tesseract_task_composer/core/task_composer_executor.h>
 #include <tesseract_common/resource_locator.h>
-#include <trajopt_ifopt/constraints/collision/discrete_collision_evaluators.h>
 
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
 #include <Eigen/Geometry>
 #include <chrono>
-#include <filesystem>
 
 using namespace Vinhtesseract_examples;
 
@@ -50,69 +46,101 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<bool>("debug", false);
     this->declare_parameter<bool>("use_ompl", false);
     this->declare_parameter<double>("tf_poll_rate_hz", 200.0);
-    
-    // ---- Tracking/MPC parameters ----
-    this->declare_parameter<int>("tracking_horizon", 10);
-    this->declare_parameter<double>("tracking_dt", 0.02);
-    this->declare_parameter<double>("tracking_w_cart", 20.0);
-    this->declare_parameter<double>("tracking_w_vel", 1.0);
-    this->declare_parameter<double>("tracking_w_acc", 0.5);
-    this->declare_parameter<double>("tracking_d_safe", 0.01);
-    this->declare_parameter<int>("tracking_coll_type", 0); // 0=DISCRETE, 1=CONTINUOUS
-    this->declare_parameter<int>("tracking_max_iter", 10);
-    this->declare_parameter<double>("tracking_velocity_limit_scale", 0.65);
-    this->declare_parameter<double>("tracking_accel_limit", 8.0);
-    this->declare_parameter<double>("tracking_command_lead_limit", 0.12);
-    this->declare_parameter<double>("tracking_velocity_filter_alpha", 0.55);
-    this->declare_parameter<double>("tracking_start_ramp_time", 0.6);
-    this->declare_parameter<double>("tracking_start_velocity_scale", 0.15);
-    this->declare_parameter<double>("tracking_target_pos_alpha", 0.35);
-    this->declare_parameter<double>("tracking_target_rot_alpha", 0.20);
-    this->declare_parameter<double>("tracking_output_dt", 0.004);
-    this->declare_parameter<bool>("tracking_use_smooth_output", true);
-    this->declare_parameter<double>("tracking_cart_pos_gain", 1.0);
-    this->declare_parameter<double>("tracking_cart_rot_gain", 0.5);
-    this->declare_parameter<double>("tracking_max_cart_speed", 0.25);
-    this->declare_parameter<double>("tracking_max_rot_speed", 1.0);
-    this->declare_parameter<double>("tracking_orientation_weight", 0.0);
 
-    mpc_horizon_n_ = this->get_parameter("tracking_horizon").as_int();
-    mpc_dt_ = this->get_parameter("tracking_dt").as_double();
-    mpc_w_cart_ = this->get_parameter("tracking_w_cart").as_double();
-    mpc_w_vel_ = this->get_parameter("tracking_w_vel").as_double();
-    mpc_w_acc_ = this->get_parameter("tracking_w_acc").as_double();
-    mpc_d_safe_ = this->get_parameter("tracking_d_safe").as_double();
-    mpc_max_iter_ = this->get_parameter("tracking_max_iter").as_int();
-    mpc_coll_type_ = this->get_parameter("tracking_coll_type").as_int();
-    tracking_velocity_limit_scale_ =
-        this->get_parameter("tracking_velocity_limit_scale").as_double();
-    tracking_accel_limit_ = this->get_parameter("tracking_accel_limit").as_double();
-    tracking_command_lead_limit_ =
-        this->get_parameter("tracking_command_lead_limit").as_double();
-    tracking_velocity_filter_alpha_ =
-        this->get_parameter("tracking_velocity_filter_alpha").as_double();
-    tracking_start_ramp_time_ =
-        this->get_parameter("tracking_start_ramp_time").as_double();
-    tracking_start_velocity_scale_ =
-        this->get_parameter("tracking_start_velocity_scale").as_double();
-    tracking_target_pos_alpha_ =
-        this->get_parameter("tracking_target_pos_alpha").as_double();
-    tracking_target_rot_alpha_ =
-        this->get_parameter("tracking_target_rot_alpha").as_double();
-    tracking_output_dt_ =
-        this->get_parameter("tracking_output_dt").as_double();
-    tracking_use_smooth_output_ =
-        this->get_parameter("tracking_use_smooth_output").as_bool();
-    tracking_cart_pos_gain_ =
-        this->get_parameter("tracking_cart_pos_gain").as_double();
-    tracking_cart_rot_gain_ =
-        this->get_parameter("tracking_cart_rot_gain").as_double();
-    tracking_max_cart_speed_ =
-        this->get_parameter("tracking_max_cart_speed").as_double();
-    tracking_max_rot_speed_ =
-        this->get_parameter("tracking_max_rot_speed").as_double();
-    tracking_orientation_weight_ =
-        this->get_parameter("tracking_orientation_weight").as_double();
+    // Embedded feedback-stream controller parameters. Names intentionally
+    // match motomini_feedback_stream.cpp so the same tuning values can be used.
+    this->declare_parameter<double>("rate_hz", 50.0);
+    this->declare_parameter<double>("w0", 0.01);
+    this->declare_parameter<double>("k0", 0.01);
+    this->declare_parameter<double>("theta_d_lim", 3.14);
+    this->declare_parameter<bool>("enable_seed", false);
+    this->declare_parameter<double>("kp_max", 3.5);
+    this->declare_parameter<double>("ko_max", 2.5);
+    this->declare_parameter<double>("kdp", 0.25);
+    this->declare_parameter<double>("kdo", 0.25);
+    this->declare_parameter<double>("m_pos_min", 0.5);
+    this->declare_parameter<double>("m_pos_max", 5.0);
+    this->declare_parameter<double>("k_pos_min", 5.0);
+    this->declare_parameter<double>("k_pos_max", 50.0);
+    this->declare_parameter<double>("zeta_pos", 0.9);
+    this->declare_parameter<double>("m_ori_min", 0.2);
+    this->declare_parameter<double>("m_ori_max", 2.0);
+    this->declare_parameter<double>("k_ori_min", 2.0);
+    this->declare_parameter<double>("k_ori_max", 20.0);
+    this->declare_parameter<double>("zeta_ori", 0.9);
+    this->declare_parameter<double>("adaptive_lambda", 1.0);
+    this->declare_parameter<double>("adaptive_alpha_pos", 30.0);
+    this->declare_parameter<double>("adaptive_alpha_ori", 6.0);
+    this->declare_parameter<double>("max_cart_linear_vel", 0.5);
+    this->declare_parameter<double>("max_cart_angular_vel", 1.5);
+    this->declare_parameter<double>("collision_wrench_timeout_sec", 0.2);
+    this->declare_parameter<bool>("enable_collision_projection", true);
+    this->declare_parameter<bool>("collision_goal_suppression", true);
+    this->declare_parameter<double>("collision_guard_distance", 0.03);
+    this->declare_parameter<double>("collision_task_distance", 0.005);
+    this->declare_parameter<double>("collision_stop_distance", 0.001);
+    this->declare_parameter<double>("collision_projection_max_gamma", 1.0);
+    this->declare_parameter<double>("collision_constraint_timeout_sec", 0.2);
+    this->declare_parameter<double>("collision_force_scale", 1.0);
+    this->declare_parameter<double>("collision_force_max", 5.0);
+
+    rate_hz_ = std::max(1.0, this->get_parameter("rate_hz").as_double());
+    w0_ = this->get_parameter("w0").as_double();
+    k0_ = this->get_parameter("k0").as_double();
+    enable_seed_ = this->get_parameter("enable_seed").as_bool();
+    m_pos_min_ = this->get_parameter("m_pos_min").as_double();
+    m_pos_max_ = this->get_parameter("m_pos_max").as_double();
+    k_pos_min_ = this->get_parameter("k_pos_min").as_double();
+    k_pos_max_ = this->get_parameter("k_pos_max").as_double();
+    zeta_pos_ = this->get_parameter("zeta_pos").as_double();
+    m_ori_min_ = this->get_parameter("m_ori_min").as_double();
+    m_ori_max_ = this->get_parameter("m_ori_max").as_double();
+    k_ori_min_ = this->get_parameter("k_ori_min").as_double();
+    k_ori_max_ = this->get_parameter("k_ori_max").as_double();
+    zeta_ori_ = this->get_parameter("zeta_ori").as_double();
+    adaptive_lambda_ = this->get_parameter("adaptive_lambda").as_double();
+    adaptive_alpha_pos_ = this->get_parameter("adaptive_alpha_pos").as_double();
+    adaptive_alpha_ori_ = this->get_parameter("adaptive_alpha_ori").as_double();
+    max_cart_linear_vel_ = this->get_parameter("max_cart_linear_vel").as_double();
+    max_cart_angular_vel_ = this->get_parameter("max_cart_angular_vel").as_double();
+    collision_wrench_timeout_sec_ =
+        this->get_parameter("collision_wrench_timeout_sec").as_double();
+    enable_collision_projection_ =
+        this->get_parameter("enable_collision_projection").as_bool();
+    collision_goal_suppression_ =
+        this->get_parameter("collision_goal_suppression").as_bool();
+    collision_guard_distance_ =
+        this->get_parameter("collision_guard_distance").as_double();
+    collision_task_distance_ =
+        this->get_parameter("collision_task_distance").as_double();
+    collision_stop_distance_ =
+        this->get_parameter("collision_stop_distance").as_double();
+    collision_projection_max_gamma_ =
+        this->get_parameter("collision_projection_max_gamma").as_double();
+    collision_constraint_timeout_sec_ =
+        this->get_parameter("collision_constraint_timeout_sec").as_double();
+    collision_force_scale_ =
+        this->get_parameter("collision_force_scale").as_double();
+    collision_force_max_ =
+        this->get_parameter("collision_force_max").as_double();
+
+    const auto &overrides =
+        this->get_node_parameters_interface()->get_parameter_overrides();
+    const bool legacy_kp_override = overrides.find("kp_max") != overrides.end();
+    const bool legacy_ko_override = overrides.find("ko_max") != overrides.end();
+    const bool new_k_pos_max_override = overrides.find("k_pos_max") != overrides.end();
+    const bool new_k_ori_max_override = overrides.find("k_ori_max") != overrides.end();
+    if (legacy_kp_override && !new_k_pos_max_override)
+    {
+        const double legacy_kp = this->get_parameter("kp_max").as_double();
+        k_pos_max_ = 50.0 * std::max(0.0, legacy_kp) / 3.5;
+    }
+    if (legacy_ko_override && !new_k_ori_max_override)
+    {
+        const double legacy_ko = this->get_parameter("ko_max").as_double();
+        k_ori_max_ = 20.0 * std::max(0.0, legacy_ko) / 2.5;
+    }
+    sanitizeTrackingParameters();
 
     bool online_mode = this->get_parameter("online_mode").as_bool();
     bool debug = this->get_parameter("debug").as_bool();
@@ -143,31 +171,20 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         manipulator_group, base_link_, ee_link_,
         debug, /*ifopt=*/true, use_ompl, online_mode);
 
-    // ---- Setup MPC State for Tracking Mode ----
+    // ---- Cache the kinematic group for FK / Jacobian when publishing feedback ----
     manip_ = env_->getKinematicGroup(manipulator_group);
     if (!manip_)
     {
-        RCLCPP_WARN(this->get_logger(), "Failed to find KinematicGroup %s", manipulator_group.c_str());
+        RCLCPP_WARN(this->get_logger(),
+                    "Failed to find KinematicGroup %s — feedback topics will stay idle.",
+                    manipulator_group.c_str());
     }
     else
     {
-        int n_dof = manip_->numJoints();
-        horizon_joints_.assign(static_cast<size_t>(mpc_horizon_n_), Eigen::VectorXd::Zero(n_dof));
-        current_joints_ = Eigen::VectorXd::Zero(n_dof);
-        mpc_collision_cache_ = std::make_shared<trajopt_ifopt::CollisionCache>(static_cast<size_t>(mpc_horizon_n_) * 4);
+        joint_names_ = manip_->getJointNames();
         joint_limits_ = manip_->getLimits().joint_limits;
         velocity_limits_ = manip_->getLimits().velocity_limits;
-
-        std::shared_ptr<const tesseract_common::ResourceLocator> locator = env_->getResourceLocator();
-        std::filesystem::path config_path(
-            locator->locateResource("package://tesseract_task_composer/config/task_composer_plugins.yaml")
-                ->getFilePath());
-        task_factory_ = std::make_unique<tesseract_planning::TaskComposerPluginFactory>(config_path, *locator);
-        task_executor_ = task_factory_->createTaskComposerExecutor("TaskflowExecutor");
     }
-    current_target_pose_ = Eigen::Isometry3d::Identity();
-    target_velocity_linear_.setZero();
-    target_velocity_angular_.setZero();
 
     // ---- Offline chunked planning parameters ----
     this->declare_parameter<int>("planning_chunk_size", 20);
@@ -291,10 +308,6 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         "/target_poses", 10,
         std::bind(&MotoMiniPlanningNode::targetPosesCallback, this, std::placeholders::_1));
 
-    sub_tracking_target_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/tracking_target_pose", 10,
-        std::bind(&MotoMiniPlanningNode::targetPoseCallback, this, std::placeholders::_1));
-
     sub_start_ = this->create_subscription<std_msgs::msg::Bool>(
         "/start", 10,
         std::bind(&MotoMiniPlanningNode::startCallback, this, std::placeholders::_1));
@@ -307,13 +320,51 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         "/tracking_control", 10,
         std::bind(&MotoMiniPlanningNode::trackingControlCallback, this, std::placeholders::_1));
 
+    sub_desired_pose_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+        "/motomini/target_pose", 1,
+        std::bind(&MotoMiniPlanningNode::desiredPoseCallback, this, std::placeholders::_1));
+
+    sub_init_pose_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+        "/pose_following/init_pose", 1,
+        std::bind(&MotoMiniPlanningNode::initPoseCallback, this, std::placeholders::_1));
+
+    sub_target_vel_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        "/motomini/target_vel", 10,
+        std::bind(&MotoMiniPlanningNode::targetVelCallback, this, std::placeholders::_1));
+
+    sub_collision_wrench_ = this->create_subscription<geometry_msgs::msg::WrenchStamped>(
+        "/motomini/collision_wrench", 10,
+        std::bind(&MotoMiniPlanningNode::collisionWrenchCallback, this, std::placeholders::_1));
+
+    sub_collision_distance_ = this->create_subscription<std_msgs::msg::Float64>(
+        "/motomini/collision_distance", 10,
+        std::bind(&MotoMiniPlanningNode::collisionDistanceCallback, this, std::placeholders::_1));
+
+    sub_collision_normal_ = this->create_subscription<geometry_msgs::msg::Vector3Stamped>(
+        "/motomini/collision_normal", 10,
+        std::bind(&MotoMiniPlanningNode::collisionNormalCallback, this, std::placeholders::_1));
+
     pub_status_ = this->create_publisher<std_msgs::msg::String>("/optimization_status", 10);
     pub_trajectory_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/path_command", 10);
-    pub_tracking_stream_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_command", 10);
+    pub_stream_path_cmd_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
+        "/joint_path_command", 10);
+    pub_stream_joint_cmd_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>(
+        "joint_command", 10);
     pub_tracked_pose_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
         "/motomini/tracked_tip_pose", 10);
     pub_online_cmd_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
         "/motomini/online_joint_command", 100);
+
+    // Always-on Cartesian feedback (mirrors motomini_feedback_stream).
+    pub_feedback_ = this->create_publisher<geometry_msgs::msg::Twist>(
+        "/motomini/feedback", 10);
+    pub_feedback_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(
+        "/motomini/feedback_vel", 10);
+
+    traj_stream_start_client_ =
+        this->create_client<std_srvs::srv::Trigger>("/pose_following/start");
+    traj_stream_stop_client_ =
+        this->create_client<std_srvs::srv::Trigger>("/pose_following/stop");
 
     planner_->setCommandCallback([this](const Eigen::VectorXd &cmd)
                                  {
@@ -366,27 +417,17 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         std::chrono::milliseconds(100),
         std::bind(&MotoMiniPlanningNode::monitorExecution, this));
 
-    mpc_timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(static_cast<int>(mpc_dt_ * 1000.0)),
-        std::bind(&MotoMiniPlanningNode::mpcTimerCallback, this));
-
-    // PERFORMANCE: Cache the tracking task node once
-    if (task_factory_)
-    {
-        mpc_task_ = task_factory_->createTaskComposerNode("TrajOptIfoptPipeline");
-    }
+    const auto feedback_period = std::chrono::nanoseconds(
+        static_cast<int64_t>(1e9 / rate_hz_));
+    feedback_timer_ = this->create_wall_timer(
+        feedback_period,
+        std::bind(&MotoMiniPlanningNode::feedbackTimerCallback, this));
 
     param_callback_handle_ = this->add_on_set_parameters_callback(
         std::bind(&MotoMiniPlanningNode::onParameterChange, this, std::placeholders::_1));
-
-    // Start the background avoidance worker thread
-    startAvoidanceWorker();
 }
 
-MotoMiniPlanningNode::~MotoMiniPlanningNode()
-{
-    stopAvoidanceWorker();
-}
+MotoMiniPlanningNode::~MotoMiniPlanningNode() = default;
 
 void MotoMiniPlanningNode::postInit()
 {
@@ -466,29 +507,6 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
             else if (n == "ompl_rrt_range_2") cfg.ompl_rrt_range_2 = p.as_double();
             else if (n == "planning_chunk_size") { new_chunk_size = static_cast<int>(p.as_int()); chunk_changed = true; }
             else if (n == "planning_parallel_chunks") { new_parallel = static_cast<int>(p.as_int()); chunk_changed = true; }
-            else if (n == "tracking_horizon") mpc_horizon_n_ = static_cast<int>(p.as_int());
-            else if (n == "tracking_dt") mpc_dt_ = p.as_double();
-            else if (n == "tracking_w_cart") mpc_w_cart_ = p.as_double();
-            else if (n == "tracking_w_vel") mpc_w_vel_ = p.as_double();
-            else if (n == "tracking_w_acc") mpc_w_acc_ = p.as_double();
-            else if (n == "tracking_d_safe") mpc_d_safe_ = p.as_double();
-            else if (n == "tracking_coll_type") mpc_coll_type_ = static_cast<int>(p.as_int());
-            else if (n == "tracking_max_iter") mpc_max_iter_ = static_cast<int>(p.as_int());
-            else if (n == "tracking_velocity_limit_scale") tracking_velocity_limit_scale_ = p.as_double();
-            else if (n == "tracking_accel_limit") tracking_accel_limit_ = p.as_double();
-            else if (n == "tracking_command_lead_limit") tracking_command_lead_limit_ = p.as_double();
-            else if (n == "tracking_velocity_filter_alpha") tracking_velocity_filter_alpha_ = p.as_double();
-            else if (n == "tracking_start_ramp_time") tracking_start_ramp_time_ = p.as_double();
-            else if (n == "tracking_start_velocity_scale") tracking_start_velocity_scale_ = p.as_double();
-            else if (n == "tracking_target_pos_alpha") tracking_target_pos_alpha_ = p.as_double();
-            else if (n == "tracking_target_rot_alpha") tracking_target_rot_alpha_ = p.as_double();
-            else if (n == "tracking_output_dt") tracking_output_dt_ = p.as_double();
-            else if (n == "tracking_use_smooth_output") tracking_use_smooth_output_ = p.as_bool();
-            else if (n == "tracking_cart_pos_gain") tracking_cart_pos_gain_ = p.as_double();
-            else if (n == "tracking_cart_rot_gain") tracking_cart_rot_gain_ = p.as_double();
-            else if (n == "tracking_max_cart_speed") tracking_max_cart_speed_ = p.as_double();
-            else if (n == "tracking_max_rot_speed") tracking_max_rot_speed_ = p.as_double();
-            else if (n == "tracking_orientation_weight") tracking_orientation_weight_ = p.as_double();
             else if (n == "ee_link" || n == "tool_param")
             {
                 ee_link_ = p.as_string();

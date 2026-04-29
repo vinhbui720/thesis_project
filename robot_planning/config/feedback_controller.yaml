@@ -130,7 +130,9 @@
 #     without changing publishers, subscribers, or trajectory output logic.
 ###############################################################################
 
-motomini_feedback_stream:
+# Shared by the standalone motomini_feedback_stream node and the embedded
+# tracking mode inside motomini_planning_node.
+/**:
   ros__parameters:
 
     # ===========================================================================
@@ -261,3 +263,14 @@ motomini_feedback_stream:
     # still uses per-joint hardware limits times SAFETY_VELOCITY_ALPHA from
     # motomini_feedback_stream.cpp.
     theta_d_lim: 3.14
+
+
+    enable_collision_projection: true
+    collision_goal_suppression: true
+    collision_guard_distance: 0.03
+    collision_task_distance: 0.005
+    collision_stop_distance: 0.001
+    collision_projection_max_gamma: 1.0
+    collision_constraint_timeout_sec: 0.2
+    collision_force_scale: 1.0
+    collision_force_max: 5.0

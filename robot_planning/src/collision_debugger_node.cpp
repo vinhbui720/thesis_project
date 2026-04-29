@@ -1,10 +1,13 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <sstream>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <string>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -46,6 +49,11 @@ public:
         this->declare_parameter<double>("collision_force_max_per_contact", 10.0);
         this->declare_parameter<double>("collision_force_max_total", 25.0);
 
+        // Safety zones consumed by the controller (close-work design)
+        this->declare_parameter<double>("collision_guard_distance", 0.03);
+        this->declare_parameter<double>("collision_task_distance", 0.005);
+        this->declare_parameter<double>("collision_stop_distance", 0.001);
+
         // Force-arrow shaping
         this->declare_parameter<double>("force_arrow_min_length", 0.01);
         this->declare_parameter<double>("force_arrow_max_length", 0.25);
@@ -73,6 +81,10 @@ public:
         collision_force_max_per_contact_ = this->get_parameter("collision_force_max_per_contact").as_double();
         collision_force_max_total_ = this->get_parameter("collision_force_max_total").as_double();
 
+        collision_guard_distance_ = this->get_parameter("collision_guard_distance").as_double();
+        collision_task_distance_ = this->get_parameter("collision_task_distance").as_double();
+        collision_stop_distance_ = this->get_parameter("collision_stop_distance").as_double();
+
         force_arrow_min_length_ = this->get_parameter("force_arrow_min_length").as_double();
         force_arrow_max_length_ = this->get_parameter("force_arrow_max_length").as_double();
         force_arrow_length_gain_ = this->get_parameter("force_arrow_length_gain").as_double();
@@ -87,6 +99,10 @@ public:
         collision_force_max_total_ = std::max(0.0, collision_force_max_total_);
         force_arrow_min_length_ = std::max(1e-4, force_arrow_min_length_);
         force_arrow_max_length_ = std::max(force_arrow_min_length_, force_arrow_max_length_);
+
+        collision_stop_distance_ = std::max(0.0, collision_stop_distance_);
+        collision_task_distance_ = std::max(collision_stop_distance_, collision_task_distance_);
+        collision_guard_distance_ = std::max(collision_task_distance_, collision_guard_distance_);
 
         // The contact manager margin must cover the force influence distance,
         // otherwise far-but-relevant contacts are filtered before we see them.
@@ -121,6 +137,10 @@ public:
         contact_debug_pub_ = this->create_publisher<std_msgs::msg::String>("collision_debug_contacts", 10);
         collision_wrench_pub_ = this->create_publisher<geometry_msgs::msg::WrenchStamped>(
             "/motomini/collision_wrench", 10);
+        collision_distance_pub_ = this->create_publisher<std_msgs::msg::Float64>(
+            "/motomini/collision_distance", 10);
+        collision_normal_pub_ = this->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+            "/motomini/collision_normal", 10);
 
         joint_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10,
@@ -128,8 +148,9 @@ public:
 
         RCLCPP_INFO(this->get_logger(),
                     "Online Collision Debugger started. threshold=%.3f m, influence=%.3f m, safe=%.3f m, "
-                    "markers=%s, wrench=%s",
+                    "guard=%.3f m, task=%.3f m, stop=%.3f m, markers=%s, wrench=%s",
                     threshold_, collision_influence_distance_, collision_safe_distance_,
+                    collision_guard_distance_, collision_task_distance_, collision_stop_distance_,
                     debug_markers_enabled_ ? "on" : "off",
                     publish_collision_wrench_ ? "on" : "off");
     }
@@ -162,6 +183,26 @@ private:
             return v;
 
         return v * (max_norm / n);
+    }
+
+    std::string classifyZone(double d) const
+    {
+        if (d <= collision_stop_distance_)
+            return "STOP";
+        if (d <= collision_task_distance_)
+            return "TASK";
+        if (d <= collision_guard_distance_)
+            return "GUARD";
+        if (d <= collision_influence_distance_)
+            return "INFLUENCE";
+        return "FREE";
+    }
+
+    double computeProjectionGamma(double d) const
+    {
+        const double span =
+            std::max(1e-6, collision_guard_distance_ - collision_task_distance_);
+        return 1.0 - std::clamp((d - collision_task_distance_) / span, 0.0, 1.0);
     }
 
     Eigen::Vector3d computeCollisionForce(double distance,
@@ -418,6 +459,76 @@ private:
         collision_wrench_pub_->publish(msg);
     }
 
+    // Publish closest-contact constraint data so the controller can run
+    // velocity projection and goal-force suppression. When no contact is
+    // active, advertise a large distance and zero normal so the controller
+    // disables the projection.
+    void publishCollisionConstraint(bool has_contact,
+                                    double distance,
+                                    const Eigen::Vector3d &n_away)
+    {
+        std_msgs::msg::Float64 dist_msg;
+        dist_msg.data = has_contact
+                            ? distance
+                            : std::max(collision_influence_distance_,
+                                       contact_margin_) +
+                                  1.0;
+        collision_distance_pub_->publish(dist_msg);
+
+        geometry_msgs::msg::Vector3Stamped n_msg;
+        n_msg.header.stamp = this->now();
+        n_msg.header.frame_id = wrench_frame_;
+        if (has_contact && n_away.allFinite() && n_away.norm() > 1e-9)
+        {
+            const Eigen::Vector3d n = n_away.normalized();
+            n_msg.vector.x = n.x();
+            n_msg.vector.y = n.y();
+            n_msg.vector.z = n.z();
+        }
+        else
+        {
+            n_msg.vector.x = 0.0;
+            n_msg.vector.y = 0.0;
+            n_msg.vector.z = 0.0;
+        }
+        collision_normal_pub_->publish(n_msg);
+    }
+
+    void addInfoTextMarker(visualization_msgs::msg::MarkerArray &marker_array,
+                           const Eigen::Vector3d &anchor,
+                           double d_min,
+                           const std::string &zone,
+                           double force_norm,
+                           double gamma,
+                           const Eigen::Vector3d &n_away,
+                           int &id_counter)
+    {
+        visualization_msgs::msg::Marker text_marker;
+        text_marker.header.frame_id = marker_frame_;
+        text_marker.header.stamp = this->now();
+        text_marker.ns = "collision_info";
+        text_marker.id = id_counter++;
+        text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+        text_marker.action = visualization_msgs::msg::Marker::ADD;
+        text_marker.pose.position = toPoint(anchor + Eigen::Vector3d(0.0, 0.0, 0.08));
+        text_marker.pose.orientation.w = 1.0;
+        text_marker.scale.z = 0.022;
+        text_marker.color.r = 1.0;
+        text_marker.color.g = 1.0;
+        text_marker.color.b = 1.0;
+        text_marker.color.a = 1.0;
+
+        std::ostringstream ss;
+        ss << std::fixed
+           << "d_min: " << std::setprecision(4) << d_min << " m\n"
+           << "zone: " << zone << "\n"
+           << "|F|: " << std::setprecision(2) << force_norm << "\n"
+           << "gamma: " << std::setprecision(2) << gamma << "\n"
+           << "n_away: " << vecToString(n_away);
+        text_marker.text = ss.str();
+        marker_array.markers.push_back(text_marker);
+    }
+
     void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr msg)
     {
         if (!env_ || !contact_manager_)
@@ -459,12 +570,21 @@ private:
         Eigen::Vector3d total_force = Eigen::Vector3d::Zero();
         Eigen::Vector3d total_torque = Eigen::Vector3d::Zero();
 
+        // Closest-contact tracking for the controller-facing constraint topic.
+        double closest_distance = std::numeric_limits<double>::infinity();
+        Eigen::Vector3d closest_n_away = Eigen::Vector3d::Zero();
+        Eigen::Vector3d closest_contact_point = Eigen::Vector3d::Zero();
+        bool has_closest = false;
+
         auto acm = env_->getAllowedCollisionMatrix();
 
         debug_stream << std::fixed << std::setprecision(6);
         debug_stream << "threshold_m=" << threshold_
                      << " influence_m=" << collision_influence_distance_
-                     << " safe_m=" << collision_safe_distance_;
+                     << " safe_m=" << collision_safe_distance_
+                     << " guard_m=" << collision_guard_distance_
+                     << " task_m=" << collision_task_distance_
+                     << " stop_m=" << collision_stop_distance_;
 
         for (const auto &pair : contact_results)
         {
@@ -505,6 +625,25 @@ private:
                 total_force += force_for_controller;
                 total_torque += (contact_point - wrench_ref).cross(force_for_controller);
 
+                // n_away MUST track the wrench's controller-facing direction.
+                // The two per-link forces have identical magnitude (same d,
+                // same model), so the wrench's tie-breaker always keeps
+                // force_on_link0; deriving n_away from force_for_controller
+                // guarantees the same sign and avoids a flipped-normal bug
+                // where the controller would project away the safe motion.
+                Eigen::Vector3d n_away_for_contact = Eigen::Vector3d::Zero();
+                if (force_for_controller.allFinite() &&
+                    force_for_controller.norm() > 1e-9)
+                    n_away_for_contact = force_for_controller.normalized();
+
+                if (result.distance < closest_distance)
+                {
+                    closest_distance = result.distance;
+                    closest_n_away = n_away_for_contact;
+                    closest_contact_point = contact_point;
+                    has_closest = true;
+                }
+
                 if (debug_markers_enabled_)
                 {
                     addDistanceLine(marker_array, result, id_counter);
@@ -539,15 +678,32 @@ private:
 
         total_force = clampNorm(total_force, collision_force_max_total_);
 
+        const std::string zone =
+            has_closest ? classifyZone(closest_distance) : std::string("FREE");
+        const double gamma_dbg =
+            has_closest ? computeProjectionGamma(closest_distance) : 0.0;
+
         debug_stream << "\ncontact_count=" << contact_counter
                      << " total_force=" << vecToString(total_force)
-                     << " total_torque=" << vecToString(total_torque);
+                     << " total_torque=" << vecToString(total_torque)
+                     << " closest_d=" << closest_distance
+                     << " zone=" << zone
+                     << " gamma=" << gamma_dbg
+                     << " n_away=" << vecToString(closest_n_away);
 
         publishCollisionWrench(total_force, total_torque);
+        publishCollisionConstraint(has_closest, closest_distance, closest_n_away);
 
         if (debug_markers_enabled_)
         {
             addTotalForceArrow(marker_array, wrench_ref, total_force, id_counter);
+            const Eigen::Vector3d text_anchor =
+                has_closest ? closest_contact_point : wrench_ref;
+            addInfoTextMarker(marker_array, text_anchor,
+                              has_closest ? closest_distance
+                                          : std::numeric_limits<double>::infinity(),
+                              zone, total_force.norm(), gamma_dbg,
+                              closest_n_away, id_counter);
             marker_pub_->publish(marker_array);
         }
 
@@ -562,6 +718,8 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr contact_debug_pub_;
     rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr collision_wrench_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr collision_distance_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr collision_normal_pub_;
     std::shared_ptr<tesseract_environment::Environment> env_;
 
     tesseract_collision::DiscreteContactManager::Ptr contact_manager_;
@@ -585,6 +743,10 @@ private:
     double collision_k_hold_;
     double collision_force_max_per_contact_;
     double collision_force_max_total_;
+
+    double collision_guard_distance_;
+    double collision_task_distance_;
+    double collision_stop_distance_;
 
     double force_arrow_min_length_;
     double force_arrow_max_length_;

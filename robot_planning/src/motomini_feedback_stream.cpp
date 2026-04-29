@@ -111,6 +111,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -119,10 +120,12 @@
 #include <Eigen/Dense>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
@@ -181,6 +184,19 @@ public:
         this->declare_parameter<double>("max_cart_angular_vel", DEFAULT_MAX_CART_ANGULAR_VEL);
         this->declare_parameter<double>("collision_wrench_timeout_sec", 0.2);
 
+        // Close-work collision safety: distance/normal-driven projection that
+        // sits on top of the soft repulsive wrench. Disabled by default in the
+        // sense that, with no constraint topic published, gamma stays at 0.
+        this->declare_parameter<bool>("enable_collision_projection", true);
+        this->declare_parameter<bool>("collision_goal_suppression", true);
+        this->declare_parameter<double>("collision_guard_distance", 0.03);
+        this->declare_parameter<double>("collision_task_distance", 0.005);
+        this->declare_parameter<double>("collision_stop_distance", 0.001);
+        this->declare_parameter<double>("collision_projection_max_gamma", 1.0);
+        this->declare_parameter<double>("collision_constraint_timeout_sec", 0.2);
+        this->declare_parameter<double>("collision_force_scale", 1.0);
+        this->declare_parameter<double>("collision_force_max", 5.0);
+
         // ----- Read parameters -----
         this->get_parameter("robot_description", urdf_xml_);
         this->get_parameter("robot_description_semantic", srdf_xml_);
@@ -208,6 +224,28 @@ public:
         max_cart_linear_vel_ = this->get_parameter("max_cart_linear_vel").as_double();
         max_cart_angular_vel_ = this->get_parameter("max_cart_angular_vel").as_double();
         collision_wrench_timeout_sec_ = this->get_parameter("collision_wrench_timeout_sec").as_double();
+
+        enable_collision_projection_ = this->get_parameter("enable_collision_projection").as_bool();
+        collision_goal_suppression_ = this->get_parameter("collision_goal_suppression").as_bool();
+        collision_guard_distance_ = this->get_parameter("collision_guard_distance").as_double();
+        collision_task_distance_ = this->get_parameter("collision_task_distance").as_double();
+        collision_stop_distance_ = this->get_parameter("collision_stop_distance").as_double();
+        collision_projection_max_gamma_ =
+            this->get_parameter("collision_projection_max_gamma").as_double();
+        collision_constraint_timeout_sec_ =
+            this->get_parameter("collision_constraint_timeout_sec").as_double();
+        collision_force_scale_ = this->get_parameter("collision_force_scale").as_double();
+        collision_force_max_ = this->get_parameter("collision_force_max").as_double();
+
+        collision_stop_distance_ = std::max(0.0, collision_stop_distance_);
+        collision_task_distance_ =
+            std::max(collision_stop_distance_, collision_task_distance_);
+        collision_guard_distance_ =
+            std::max(collision_task_distance_, collision_guard_distance_);
+        collision_projection_max_gamma_ =
+            std::clamp(collision_projection_max_gamma_, 0.0, 1.0);
+        collision_force_scale_ = std::max(0.0, collision_force_scale_);
+        collision_force_max_ = std::max(0.0, collision_force_max_);
 
         const auto &overrides =
             this->get_node_parameters_interface()->get_parameter_overrides();
@@ -278,6 +316,14 @@ public:
             "/motomini/collision_wrench", 10,
             std::bind(&MotoMiniFeedbackStreamNode::collisionWrenchCallback, this, std::placeholders::_1));
 
+        sub_collision_distance_ = this->create_subscription<std_msgs::msg::Float64>(
+            "/motomini/collision_distance", 10,
+            std::bind(&MotoMiniFeedbackStreamNode::collisionDistanceCallback, this, std::placeholders::_1));
+
+        sub_collision_normal_ = this->create_subscription<geometry_msgs::msg::Vector3Stamped>(
+            "/motomini/collision_normal", 10,
+            std::bind(&MotoMiniFeedbackStreamNode::collisionNormalCallback, this, std::placeholders::_1));
+
         // ----- Services -----
         srv_start_ = this->create_service<std_srvs::srv::Trigger>(
             "/pose_following/start",
@@ -332,6 +378,15 @@ public:
                     zeta_pos_, zeta_ori_, adaptive_lambda_,
                     adaptive_alpha_pos_, adaptive_alpha_ori_, w0_, k0_);
         RCLCPP_INFO(this->get_logger(), "enable_seed=%s", enable_seed_ ? "true" : "false");
+        RCLCPP_INFO(this->get_logger(),
+                    "Collision safety: projection=%s goal_suppress=%s "
+                    "guard=%.3f task=%.3f stop=%.3f max_gamma=%.2f "
+                    "force_scale=%.2f force_max=%.2f",
+                    enable_collision_projection_ ? "on" : "off",
+                    collision_goal_suppression_ ? "on" : "off",
+                    collision_guard_distance_, collision_task_distance_,
+                    collision_stop_distance_, collision_projection_max_gamma_,
+                    collision_force_scale_, collision_force_max_);
     }
 
 private:
@@ -786,15 +841,70 @@ private:
         if (dt_collision_wrench < collision_wrench_timeout_sec_)
             F_collision = latest_collision_wrench_;
 
-        // --- Virtual acceleration ẍ_ref = M⁻¹·(K·e − D·ė − F − D·ẋ_ref) ---
+        // Scale + clamp the soft repulsive force so it stays small relative to
+        // the goal force during close work. The hard "no deeper" rule is
+        // enforced separately by the velocity projection below.
+        F_collision.head<3>() *= collision_force_scale_;
+        const double f_norm = F_collision.head<3>().norm();
+        if (collision_force_max_ > 0.0 && f_norm > collision_force_max_ && f_norm > 1e-9)
+            F_collision.head<3>() *= collision_force_max_ / f_norm;
+
+        // --- Close-work safety projection: distance/normal from the collision
+        //     node feed a blended velocity & goal-force suppression. ---
+        const double dt_dist =
+            (this->now() - t_last_collision_distance_cb_).seconds();
+        const double dt_norm =
+            (this->now() - t_last_collision_normal_cb_).seconds();
+        const bool collision_constraint_active =
+            (dt_dist < collision_constraint_timeout_sec_) &&
+            (dt_norm < collision_constraint_timeout_sec_) &&
+            latest_collision_normal_.allFinite() &&
+            (latest_collision_normal_.norm() > 1e-6) &&
+            std::isfinite(latest_collision_distance_);
+
+        double gamma = 0.0;
+        Eigen::Vector3d n_away = Eigen::Vector3d::Zero();
+        if (collision_constraint_active)
+        {
+            n_away = latest_collision_normal_.normalized();
+            const double span =
+                std::max(1e-6, collision_guard_distance_ - collision_task_distance_);
+            gamma = 1.0 - std::clamp(
+                              (latest_collision_distance_ - collision_task_distance_) / span,
+                              0.0, 1.0);
+            gamma = std::min(gamma, collision_projection_max_gamma_);
+        }
+
+        // Goal force = K·e − D·ė. Strip the "into obstacle" component so the
+        // tracker stops actively pulling the EE deeper while still allowing
+        // tangent and away motion.
+        Eigen::Vector3d F_goal_pos = k_pos_var * e_p_ - d_pos_var * velocity_error.head<3>();
+        if (collision_goal_suppression_ && gamma > 0.0)
+        {
+            const double goal_into = F_goal_pos.dot(n_away);
+            if (goal_into < 0.0)
+                F_goal_pos -= gamma * goal_into * n_away;
+        }
+
+        // --- Virtual acceleration ẍ_ref = M⁻¹·(F_goal_safe − F_coll − D·ẋ_ref) ---
         Eigen::Matrix<double, 6, 1> xddot_ref;
-        xddot_ref.head<3>() = (k_pos_var * e_p_ - d_pos_var * velocity_error.head<3>() - F_collision.head<3>() - d_pos_var * xdot_ref_.head<3>()) / std::max(1e-9, m_pos_var);
+        xddot_ref.head<3>() = (F_goal_pos - F_collision.head<3>() - d_pos_var * xdot_ref_.head<3>()) / std::max(1e-9, m_pos_var);
         xddot_ref.tail<3>() = (k_ori_var * e_o_ - d_ori_var * velocity_error.tail<3>() - F_collision.tail<3>() - d_ori_var * xdot_ref_.tail<3>()) / std::max(1e-9, m_ori_var);
 
         // --- Integrate ẋ_ref ---
         const double dt_safe =
             (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
         xdot_ref_ += xddot_ref * dt_safe;
+
+        // --- Velocity projection: hard "no deeper into obstacle" rule on the
+        //     translational part of the integrator state. Tangent and away
+        //     motion stay untouched. ---
+        if (enable_collision_projection_ && gamma > 0.0)
+        {
+            const double v_into = xdot_ref_.head<3>().dot(n_away);
+            if (v_into < 0.0)
+                xdot_ref_.head<3>() -= gamma * v_into * n_away;
+        }
 
         // --- Safety clamps on the integrator state ---
         const double lin_n = xdot_ref_.head<3>().norm();
@@ -819,6 +929,10 @@ private:
         q_prev_ctrl_.resize(0);
         latest_collision_wrench_.setZero();
         t_last_collision_wrench_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        latest_collision_distance_ = std::numeric_limits<double>::infinity();
+        latest_collision_normal_.setZero();
+        t_last_collision_distance_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        t_last_collision_normal_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     }
 
     void resetControlWindow()
@@ -923,6 +1037,22 @@ private:
             -msg->wrench.torque.y,
             -msg->wrench.torque.z;
         t_last_collision_wrench_cb_ = this->now();
+    }
+
+    // Closest-contact distance from the collision node. Used together with
+    // the n_away normal to compute the safety projection blend factor gamma.
+    void collisionDistanceCallback(const std_msgs::msg::Float64::SharedPtr msg)
+    {
+        latest_collision_distance_ = msg->data;
+        t_last_collision_distance_cb_ = this->now();
+    }
+
+    // Closest-contact push-away normal in the wrench / base frame. A zero
+    // vector means "no active constraint" and disables the projection.
+    void collisionNormalCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
+    {
+        latest_collision_normal_ << msg->vector.x, msg->vector.y, msg->vector.z;
+        t_last_collision_normal_cb_ = this->now();
     }
 
     // Latched init target pose (published once before calling /init_start)
@@ -1305,6 +1435,22 @@ private:
     Eigen::Matrix<double, 6, 1> latest_collision_wrench_{Eigen::Matrix<double, 6, 1>::Zero()};
     double collision_wrench_timeout_sec_;
 
+    // --- Close-work safety projection (distance/normal driven) ---
+    bool enable_collision_projection_{true};
+    bool collision_goal_suppression_{true};
+    double collision_guard_distance_{0.03};
+    double collision_task_distance_{0.005};
+    double collision_stop_distance_{0.001};
+    double collision_projection_max_gamma_{1.0};
+    double collision_constraint_timeout_sec_{0.2};
+    double collision_force_scale_{1.0};
+    double collision_force_max_{5.0};
+
+    double latest_collision_distance_{std::numeric_limits<double>::infinity()};
+    Eigen::Vector3d latest_collision_normal_{Eigen::Vector3d::Zero()};
+    rclcpp::Time t_last_collision_distance_cb_{0, 0, RCL_ROS_TIME};
+    rclcpp::Time t_last_collision_normal_cb_{0, 0, RCL_ROS_TIME};
+
     // --- Numerical θ̇ history for feedback_vel (J·θ̇) ---
     Eigen::VectorXd q_prev_;
     rclcpp::Time t_prev_q_{0, 0, RCL_ROS_TIME};
@@ -1326,6 +1472,8 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_vel_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_target_vel_;
     rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr sub_collision_wrench_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr sub_collision_distance_;
+    rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr sub_collision_normal_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_joint_state_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_desired_pose_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_init_pose_;

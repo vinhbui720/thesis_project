@@ -2,10 +2,8 @@
  * @file motomini_node_publish.cpp
  * @brief MotoMiniPlanningNode — trajectory and status publishing helpers.
  *
- *   publishStatus()             — string status to /optimization_status
- *   publishTrajectory()         — full JointTrajectory to /joint_path_command
- *   publishTrackingTrajectory() — sends only the forward target point (strips the
- *                                 leading current-state point that causes back-step jerk)
+ *   publishStatus()      — string status to /optimization_status
+ *   publishTrajectory()  — full JointTrajectory to /path_command
  *
  * @author Bùi Quang Vinh
  */
@@ -33,14 +31,14 @@ void MotoMiniPlanningNode::publishStatus(const std::string &status)
 //   enforces a minimum inter-point time spacing, and stamps the message
 //   slightly in the future so it never arrives "in the past".
 // ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::publishTrajectory(
+bool MotoMiniPlanningNode::publishTrajectory(
     const tesseract_common::JointTrajectory &tess_traj,
     const std::vector<std::string> &joint_names,
     double start_delay_sec,
     double min_step_dt_sec)
 {
     if (tess_traj.empty())
-        return;
+        return false;
 
     // The six joints expected by the Motoman controller (in order)
     static const std::vector<std::string> controlled_joints = {
@@ -108,64 +106,10 @@ void MotoMiniPlanningNode::publishTrajectory(
         ros_msg.points.push_back(point);
     }
 
+    const bool all_points_staged = ros_msg.points.size() == tess_traj.size();
+    if (!all_points_staged)
+        return false;
+
     pub_trajectory_->publish(ros_msg);
-}
-
-// ---------------------------------------------------------------------------
-// publishTrackingTrajectory
-//   Similar to publishTrajectory but uses pub_tracking_stream_ (/joint_command)
-//   and often sends only the first lookahead point for minimum latency.
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::publishTrackingTrajectory(
-    const tesseract_common::JointTrajectory &tess_traj,
-    const std::vector<std::string> &joint_names)
-{
-    if (tess_traj.empty())
-        return;
-
-    static const std::vector<std::string> controlled_joints = {
-        "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
-
-    trajectory_msgs::msg::JointTrajectory ros_msg;
-    ros_msg.header.stamp = this->now();
-    ros_msg.header.frame_id = "world";
-    ros_msg.joint_names = controlled_joints;
-
-    // Mapping
-    std::array<int, 6> source_indices{};
-    source_indices.fill(-1);
-    for (size_t i = 0; i < controlled_joints.size(); ++i)
-    {
-        auto it = std::find(joint_names.begin(), joint_names.end(), controlled_joints[i]);
-        if (it != joint_names.end())
-            source_indices[i] = static_cast<int>(std::distance(joint_names.begin(), it));
-    }
-
-    // We only publish the FIRST predicted point of the solved horizon (the lookahead)
-    // Sending the whole horizon to /joint_command is redundant if we re-solve at 50Hz.
-    // Usually tess_traj[0] is the anchor (current position), so we send tess_traj[1].
-    size_t idx = (tess_traj.size() > 1) ? 1 : 0;
-    const auto &state = tess_traj[idx];
-
-    trajectory_msgs::msg::JointTrajectoryPoint point;
-    point.time_from_start = rclcpp::Duration::from_seconds(mpc_dt_);
-
-    for (size_t i = 0; i < controlled_joints.size(); ++i)
-    {
-        const int src = source_indices[i];
-        double pos = 0.0, vel = 0.0, acc = 0.0;
-        if (src >= 0 && src < state.position.size())
-            pos = state.position[src];
-        if (src >= 0 && src < state.velocity.size())
-            vel = state.velocity[src];
-        if (src >= 0 && src < state.acceleration.size())
-            acc = state.acceleration[src];
-
-        point.positions.push_back(pos);
-        point.velocities.push_back(vel);
-        point.accelerations.push_back(acc);
-    }
-    ros_msg.points.push_back(point);
-
-    pub_tracking_stream_->publish(ros_msg);
+    return true;
 }

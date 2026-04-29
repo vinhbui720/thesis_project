@@ -175,3 +175,7 @@ online_collision_debugger:
     force_arrow_min_length: 0.01
     force_arrow_max_length: 0.25
     force_arrow_length_gain: 0.04
+
+    collision_guard_distance: 0.03
+    collision_task_distance: 0.005
+    collision_stop_distance: 0.001

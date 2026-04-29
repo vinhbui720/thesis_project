@@ -126,6 +126,7 @@ target_link_libraries(motomini_planning_node
 ament_target_dependencies(motomini_planning_node
   rclcpp
   std_msgs
+  std_srvs
   sensor_msgs
   geometry_msgs
   tf2_ros

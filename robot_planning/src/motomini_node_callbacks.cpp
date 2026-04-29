@@ -7,8 +7,7 @@
  *   targetPosesCallback     — accumulate Cartesian waypoints
  *   clearCallback           — flush waypoint buffer, cancel any running planner
  *   startCallback           — validate inputs, run full offline planner, start monitor
- *   trackingControlCallback — enable / disable real-time tracking
- *   monitorExecution        — 10 Hz joint-error check; detects timeout and goal reached
+ *   monitorExecution        — clears the busy flag after the published trajectory duration
  *   publishWaypointsTFs     — broadcast waypoint debug TF frames
  *
  * @author Bùi Quang Vinh
@@ -29,24 +28,6 @@ void MotoMiniPlanningNode::jointStateCallback(
     const sensor_msgs::msg::JointState::SharedPtr msg)
 {
     last_joint_state_ = msg;
-
-    // Fast capture for MPC anchor
-    {
-        std::lock_guard<std::mutex> lock(_mpc_state_mutex);
-        if (manip_) {
-            const auto& joint_names = manip_->getJointNames();
-            if (current_joints_.size() != static_cast<long>(joint_names.size())) {
-                current_joints_.resize(static_cast<long>(joint_names.size()));
-            }
-            for (size_t i = 0; i < joint_names.size(); ++i) {
-                auto it = std::find(msg->name.begin(), msg->name.end(), joint_names[i]);
-                if (it != msg->name.end()) {
-                    size_t idx = static_cast<size_t>(std::distance(msg->name.begin(), it));
-                    current_joints_[static_cast<std::ptrdiff_t>(i)] = msg->position[idx];
-                }
-            }
-        }
-    }
 
     // Thread-safe environment update for the online SQP solver
     bool online_mode = this->get_parameter("online_mode").as_bool();
@@ -110,7 +91,7 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
     if (tracking_enabled_)
     {
         RCLCPP_WARN(this->get_logger(),
-                    "Tracking is active. Send /tracking_control false first.");
+                    "Tracking stream is active. Send /tracking_control false before /start.");
         publishStatus("Failed: Tracking active");
         return;
     }
@@ -172,22 +153,33 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
             // the last chunk would ever fully execute if we published per-chunk.
             static const std::vector<std::string> planned_joints = {
                 "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
-            publishTrajectory(*traj_ptr, planned_joints);
+            const bool all_waypoints_published =
+                publishTrajectory(*traj_ptr, planned_joints);
+            if (!all_waypoints_published)
+            {
+                publishStatus("Failed: Trajectory Publish Error");
+                RCLCPP_ERROR(this->get_logger(),
+                             "Trajectory publish failed before all planned points were staged.");
+                return;
+            }
 
-            // Set up execution monitor
-            target_joint_names_ = last_joint_state_->name;
-            Eigen::VectorXd final_pos = traj_ptr->back().position;
-            final_joint_target_.assign(final_pos.data(), final_pos.data() + final_pos.size());
-            expected_execution_duration_ = traj_ptr->back().time;
+            // Status is publish-based: once all planned points are in the
+            // outgoing JointTrajectory, the planner has completed its job.
+            expected_execution_duration_ = std::max(0.0, traj_ptr->back().time);
             execution_start_time_ = this->now();
             is_executing_ = true;
 
-            bool online_mode = this->get_parameter("online_mode").as_bool();
-            publishStatus(online_mode ? "Optimization Success. Executing ONLINE..."
-                                      : "Optimization Success. Executing STATIC...");
+            const bool online_mode = this->get_parameter("online_mode").as_bool();
+            publishStatus("Success");
             RCLCPP_INFO(this->get_logger(),
-                        "Full trajectory published: %zu pts, %.2f s. Monitoring joints...",
-                        traj_ptr->size(), traj_ptr->back().time);
+                        "Full trajectory published: %zu pts, %.2f s. Status marked Success after all points were staged%s.",
+                        traj_ptr->size(), traj_ptr->back().time,
+                        online_mode ? " (online mode)" : "");
+            if (online_mode)
+            {
+                RCLCPP_INFO(this->get_logger(),
+                            "Online planner remains active until the published trajectory duration completes.");
+            }
         }
         else
         {
@@ -201,87 +193,22 @@ void MotoMiniPlanningNode::startCallback(const std_msgs::msg::Bool::SharedPtr ms
 }
 
 // ---------------------------------------------------------------------------
-// trackingControlCallback — runtime mode switch: true = tracking, false = planning
-// ---------------------------------------------------------------------------
-void MotoMiniPlanningNode::trackingControlCallback(
-    const std_msgs::msg::Bool::SharedPtr msg)
-{
-    tracking_enabled_ = msg->data;
-    if (msg->data)
-    {
-        // Reset target initialization so tracking re-locks onto the current tip position.
-        {
-            std::lock_guard<std::mutex> lock(_mpc_target_mutex);
-            target_initialized_ = false;
-        }
-
-        // Initialize MPC horizon with current robot position to avoid jumps
-        {
-            std::lock_guard<std::mutex> lock(_mpc_state_mutex);
-            if (current_joints_.size() > 0) {
-                if (horizon_joints_.size() != static_cast<size_t>(mpc_horizon_n_))
-                    horizon_joints_.resize(static_cast<size_t>(mpc_horizon_n_));
-                for (auto& q : horizon_joints_) q = current_joints_;
-                last_tracking_velocity_command_ =
-                    Eigen::VectorXd::Zero(current_joints_.size());
-            }
-        }
-        tracking_start_time_ = this->now();
-        has_tracking_velocity_command_ = false;
-        mode_.store(ControllerMode::TRACKING);
-        avoidance_traj_valid_.store(false);
-        RCLCPP_INFO(this->get_logger(), "Mode → TRACKING");
-        publishStatus("Mode: Tracking");
-    }
-    else
-    {
-        has_tracking_velocity_command_ = false;
-        RCLCPP_INFO(this->get_logger(), "Mode → PLANNING (use /target_poses + /start)");
-        publishStatus("Mode: Planning");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// monitorExecution — 10 Hz joint-error check
+// monitorExecution — keep the node busy until the published trajectory duration
+// has elapsed. Status success is decided when the trajectory is published, not
+// by checking final joint error against /joint_states.
 // ---------------------------------------------------------------------------
 void MotoMiniPlanningNode::monitorExecution()
 {
-    if (!is_executing_ || !last_joint_state_)
+    if (!is_executing_)
         return;
 
-    // Timeout check
     const double elapsed = (this->now() - execution_start_time_).seconds();
-    if (elapsed > expected_execution_duration_ + TIMEOUT_BUFFER)
+    if (elapsed >= expected_execution_duration_)
     {
         is_executing_ = false;
         planner_->stopOnlinePlanner();
-        publishStatus("Failed: Execution Timeout");
-        RCLCPP_ERROR(this->get_logger(), "Robot did not reach target within expected time.");
-        return;
-    }
-
-    // Joint-error check
-    double max_error = 0.0;
-    for (size_t i = 0; i < target_joint_names_.size(); ++i)
-    {
-        auto it = std::find(last_joint_state_->name.begin(),
-                            last_joint_state_->name.end(),
-                            target_joint_names_[i]);
-        if (it == last_joint_state_->name.end())
-            continue;
-        const size_t idx = static_cast<size_t>(std::distance(last_joint_state_->name.begin(), it));
-        const double error = std::abs(last_joint_state_->position[idx] - final_joint_target_[i]);
-        if (error > max_error)
-            max_error = error;
-    }
-
-    if (max_error < JOINT_TOLERANCE)
-    {
-        is_executing_ = false;
-        planner_->stopOnlinePlanner();
-        publishStatus("Success");
         RCLCPP_INFO(this->get_logger(),
-                    "Robot reached target! (Max error: %.4f rad)", max_error);
+                    "Published trajectory duration elapsed; ending planner busy state without final-target error check.");
     }
 }
 

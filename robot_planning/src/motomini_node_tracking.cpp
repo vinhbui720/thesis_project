@@ -1,1095 +1,1040 @@
+/**
+ * @file motomini_node_tracking.cpp
+ * @brief MotoMiniPlanningNode — embedded feedback-stream tracking controller.
+ *
+ * This adapts the control structure from motomini_feedback_stream.cpp into the
+ * planning node. The standalone feedback-stream file remains unchanged.
+ *
+ * Mode switch:
+ *   /tracking_control true  -> enable streaming controller
+ *   /tracking_control false -> disable streaming controller and return to planning
+ *
+ * Streaming topics intentionally match motomini_feedback_stream.cpp:
+ *   Sub: /motomini/target_pose, /motomini/target_vel,
+ *        /pose_following/init_pose, /motomini/collision_*
+ *   Pub: /joint_path_command, joint_command,
+ *        /motomini/feedback, /motomini/feedback_vel
+ */
+
 #include <robot_planning/motomini_planning_node.h>
 
-// ROS / Tesseract
-#include <tesseract_rosutils/utils.h>
-#include <tesseract_kinematics/core/utils.h>
-#include <tesseract_common/joint_state.h>
-#include <tesseract_environment/environment.h>
-#include <tesseract_state_solver/state_solver.h>
+#include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 
-// TrajOpt (used only by the background avoidance worker)
-#include <trajopt_sqp/trajopt_qp_problem.h>
-#include <trajopt_sqp/trust_region_sqp_solver.h>
-#include <trajopt_sqp/osqp_eigen_solver.h>
-#include <trajopt_common/collision_types.h>
-
-#include <trajopt_ifopt/variable_sets/joint_position_variable.h>
-#include <trajopt_ifopt/constraints/cartesian_position_constraint.h>
-#include <trajopt_ifopt/constraints/joint_position_constraint.h>
-#include <trajopt_ifopt/constraints/joint_velocity_constraint.h>
-#include <trajopt_ifopt/constraints/joint_acceleration_constraint.h>
-#include <tesseract_collision/core/types.h>
-#include <tesseract_collision/core/discrete_contact_manager.h>
-#include <trajopt_ifopt/costs/squared_cost.h>
-
-#include <tesseract_command_language/composite_instruction.h>
-#include <tesseract_command_language/state_waypoint.h>
-#include <tesseract_command_language/cartesian_waypoint.h>
-#include <tesseract_command_language/move_instruction.h>
-#include <tesseract_command_language/utils.h>
-#include <tesseract_motion_planners/core/utils.h>
-#include <tesseract_common/manipulator_info.h>
-#include <tesseract_common/profile_dictionary.h>
-
-#include <tesseract_task_composer/core/task_composer_context.h>
-#include <tesseract_task_composer/core/task_composer_data_storage.h>
-#include <tesseract_task_composer/core/task_composer_node.h>
-#include <tesseract_task_composer/core/task_composer_executor.h>
-#include <tesseract_task_composer/core/task_composer_future.h>
-#include <tesseract_task_composer/core/task_composer_plugin_factory.h>
-
-#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_default_composite_profile.h>
-#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_default_move_profile.h>
-#include <tesseract_motion_planners/trajopt_ifopt/profile/trajopt_ifopt_osqp_solver_profile.h>
-
-#include <tf2/LinearMath/Quaternion.h>
-#include <tf2_eigen/tf2_eigen.hpp>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
-// ============================================================================
-// FREE-FUNCTION HELPERS
-// ============================================================================
-
-inline double shortestAngularDistance(double from, double to)
+namespace
 {
-    double diff = std::fmod(to - from + M_PI, 2.0 * M_PI);
-    if (diff < 0)
-        diff += 2.0 * M_PI;
-    return diff - M_PI;
+constexpr int NUMBER_OF_JOINT = 6;
+constexpr double SAFETY_VELOCITY_ALPHA = 0.65;
+constexpr double SAFETY_JOINT_PADDING_RAD = 5.0 * M_PI / 180.0;
+constexpr double POSITION_ERROR_THRESHOLD = 0.0005;
+constexpr double POSE_TIMEOUT_SEC = 3.0;
+constexpr double TARGET_VEL_TIMEOUT_SEC = 0.5;
+
+const std::array<std::string, NUMBER_OF_JOINT> FALLBACK_JOINT_NAMES = {
+    "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+
+const std::array<double, NUMBER_OF_JOINT> FALLBACK_LOWER = {
+    -170.0 * M_PI / 180.0,
+    -85.0 * M_PI / 180.0,
+    -175.0 * M_PI / 180.0,
+    -140.0 * M_PI / 180.0,
+    -30.0 * M_PI / 180.0,
+    -360.0 * M_PI / 180.0};
+
+const std::array<double, NUMBER_OF_JOINT> FALLBACK_UPPER = {
+    170.0 * M_PI / 180.0,
+    90.0 * M_PI / 180.0,
+    120.0 * M_PI / 180.0,
+    140.0 * M_PI / 180.0,
+    210.0 * M_PI / 180.0,
+    360.0 * M_PI / 180.0};
+
+const std::array<double, NUMBER_OF_JOINT> FALLBACK_VELOCITY = {
+    M_PI * 7.0 / 4.0,
+    M_PI * 7.0 / 4.0,
+    M_PI * 7.0 / 3.0,
+    M_PI * 10.0 / 3.0,
+    M_PI * 10.0 / 3.0,
+    M_PI * 10.0 / 3.0};
+
+Eigen::MatrixXd calcSrInverse(const Eigen::MatrixXd &jacobian,
+                              double manipulability,
+                              double w0,
+                              double k0)
+{
+    const double w0_safe = std::max(1e-9, w0);
+    const double damping =
+        (manipulability < w0_safe)
+            ? k0 * std::pow(1.0 - manipulability / w0_safe, 2.0)
+            : 0.0;
+    const Eigen::Index rows = jacobian.rows();
+    const Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(rows, rows);
+    return jacobian.transpose() *
+           (jacobian * jacobian.transpose() + damping * identity).inverse();
 }
 
-inline double wrapAngle(double angle)
+Eigen::Vector3d orientationError(const Eigen::Matrix3d &desired,
+                                 const Eigen::Matrix3d &current)
 {
-    double w = std::fmod(angle + M_PI, 2.0 * M_PI);
-    if (w < 0)
-        w += 2.0 * M_PI;
-    return w - M_PI;
+    const Eigen::Matrix3d error = desired * current.transpose();
+    const double angle =
+        std::acos(std::clamp(0.5 * (error.trace() - 1.0), -1.0, 1.0));
+    if (std::abs(angle) < 1e-8)
+        return Eigen::Vector3d::Zero();
+
+    Eigen::Vector3d axis(error(2, 1) - error(1, 2),
+                         error(0, 2) - error(2, 0),
+                         error(1, 0) - error(0, 1));
+    axis /= (2.0 * std::sin(angle));
+    return angle * axis;
 }
 
-Eigen::VectorXd angularDifference(const Eigen::VectorXd &from,
-                                  const Eigen::VectorXd &to,
-                                  const std::vector<bool> &is_continuous)
+Eigen::Quaterniond normalizedQuaternion(const geometry_msgs::msg::Quaternion &msg)
 {
-    Eigen::VectorXd diff = to - from;
-    for (int i = 0; i < diff.size(); ++i)
-        if (is_continuous[i])
-            diff[i] = shortestAngularDistance(from[i], to[i]);
-    return diff;
+    Eigen::Quaterniond q(msg.w, msg.x, msg.y, msg.z);
+    if (q.norm() < 1e-9)
+        return Eigen::Quaterniond::Identity();
+    q.normalize();
+    return q;
+}
+} // namespace
+
+void MotoMiniPlanningNode::sanitizeTrackingParameters()
+{
+    m_pos_min_ = std::max(1e-6, m_pos_min_);
+    m_pos_max_ = std::max(1e-6, m_pos_max_);
+    if (m_pos_min_ > m_pos_max_)
+        std::swap(m_pos_min_, m_pos_max_);
+
+    k_pos_min_ = std::max(1e-6, k_pos_min_);
+    k_pos_max_ = std::max(1e-6, k_pos_max_);
+    if (k_pos_min_ > k_pos_max_)
+        std::swap(k_pos_min_, k_pos_max_);
+
+    m_ori_min_ = std::max(1e-6, m_ori_min_);
+    m_ori_max_ = std::max(1e-6, m_ori_max_);
+    if (m_ori_min_ > m_ori_max_)
+        std::swap(m_ori_min_, m_ori_max_);
+
+    k_ori_min_ = std::max(1e-6, k_ori_min_);
+    k_ori_max_ = std::max(1e-6, k_ori_max_);
+    if (k_ori_min_ > k_ori_max_)
+        std::swap(k_ori_min_, k_ori_max_);
+
+    zeta_pos_ = std::max(0.0, zeta_pos_);
+    zeta_ori_ = std::max(0.0, zeta_ori_);
+    adaptive_lambda_ = std::max(0.0, adaptive_lambda_);
+    adaptive_alpha_pos_ = std::max(0.0, adaptive_alpha_pos_);
+    adaptive_alpha_ori_ = std::max(0.0, adaptive_alpha_ori_);
+    max_cart_linear_vel_ = std::max(0.0, max_cart_linear_vel_);
+    max_cart_angular_vel_ = std::max(0.0, max_cart_angular_vel_);
+    w0_ = std::max(1e-9, w0_);
+    k0_ = std::max(0.0, k0_);
+
+    collision_stop_distance_ = std::max(0.0, collision_stop_distance_);
+    collision_task_distance_ =
+        std::max(collision_stop_distance_, collision_task_distance_);
+    collision_guard_distance_ =
+        std::max(collision_task_distance_, collision_guard_distance_);
+    collision_projection_max_gamma_ =
+        std::clamp(collision_projection_max_gamma_, 0.0, 1.0);
+    collision_force_scale_ = std::max(0.0, collision_force_scale_);
+    collision_force_max_ = std::max(0.0, collision_force_max_);
 }
 
-static std::vector<bool> detectContinuousJoints(const Eigen::MatrixXd &limits, int n)
+bool MotoMiniPlanningNode::currentJointVector(Eigen::VectorXd &q) const
 {
-    std::vector<bool> r(n, false);
-    for (int i = 0; i < n; ++i)
-        if ((limits(i, 1) - limits(i, 0)) >= 2.0 * M_PI - 0.2)
-            r[i] = true;
-    return r;
-}
-
-static double unwrapToReference(double angle, double reference,
-                                double lower, double upper)
-{
-    while (angle - reference > M_PI)
-    {
-        const double cand = angle - 2.0 * M_PI;
-        if (cand < lower)
-            break;
-        angle = cand;
-    }
-    while (reference - angle > M_PI)
-    {
-        const double cand = angle + 2.0 * M_PI;
-        if (cand > upper)
-            break;
-        angle = cand;
-    }
-    return angle;
-}
-
-static void unwrapHorizonContinuousJoints(std::vector<Eigen::VectorXd> &q_traj,
-                                          const std::vector<bool> &is_cont,
-                                          const Eigen::MatrixXd &limits)
-{
-    if (q_traj.size() < 2)
-        return;
-    const int n = static_cast<int>(q_traj[0].size());
-    for (int j = 0; j < n; ++j)
-    {
-        if (!is_cont[j])
-            continue;
-        for (size_t k = 1; k < q_traj.size(); ++k)
-            q_traj[k][j] = unwrapToReference(q_traj[k][j], q_traj[k - 1][j],
-                                             limits(j, 0), limits(j, 1));
-    }
-}
-
-static Eigen::VectorXd positiveUpperLimits(const Eigen::MatrixX2d &limits,
-                                           int n,
-                                           double fallback)
-{
-    Eigen::VectorXd out = Eigen::VectorXd::Constant(n, fallback);
-    if (limits.rows() < n || limits.cols() < 2)
-        return out;
-
-    for (int i = 0; i < n; ++i)
-    {
-        double lim = std::max(std::abs(limits(i, 0)), std::abs(limits(i, 1)));
-        if (!std::isfinite(lim) || lim <= 1e-9)
-            lim = fallback;
-        out[i] = lim;
-    }
-    return out;
-}
-
-static tesseract_common::JointTrajectory buildDenseSmoothTrajectory(
-    const std::vector<Eigen::VectorXd> &q_knots,
-    const std::vector<std::string> &joint_names,
-    double knot_dt,
-    double output_dt,
-    const Eigen::VectorXd &velocity_limit,
-    bool smooth_output)
-{
-    tesseract_common::JointTrajectory traj;
-    if (q_knots.empty())
-        return traj;
-
-    const int n_joints = static_cast<int>(q_knots.front().size());
-    if (q_knots.size() == 1 || !smooth_output)
-    {
-        traj.reserve(q_knots.size());
-        for (size_t k = 0; k < q_knots.size(); ++k)
-        {
-            tesseract_common::JointState s;
-            s.joint_names = joint_names;
-            s.position = q_knots[k];
-            s.time = static_cast<double>(k) * knot_dt;
-            if (q_knots.size() == 1)
-                s.velocity = Eigen::VectorXd::Zero(n_joints);
-            else if (k == 0)
-                s.velocity = (q_knots[1] - q_knots[0]) / knot_dt;
-            else if (k == q_knots.size() - 1)
-                s.velocity = (q_knots[k] - q_knots[k - 1]) / knot_dt;
-            else
-                s.velocity = (q_knots[k + 1] - q_knots[k - 1]) / (2.0 * knot_dt);
-            s.acceleration = Eigen::VectorXd::Zero(n_joints);
-            traj.push_back(s);
-        }
-        return traj;
-    }
-
-    const double T = std::max(1e-6, knot_dt);
-    const double dt = std::clamp(output_dt, 0.001, T);
-    const size_t n_knots = q_knots.size();
-    const size_t n_segments = n_knots - 1;
-
-    std::vector<Eigen::VectorXd> slope(n_segments, Eigen::VectorXd::Zero(n_joints));
-    for (size_t k = 0; k < n_segments; ++k)
-        slope[k] = (q_knots[k + 1] - q_knots[k]) / T;
-
-    std::vector<Eigen::VectorXd> tangent(n_knots, Eigen::VectorXd::Zero(n_joints));
-    tangent.front() = slope.front();
-    tangent.back() = slope.back();
-    for (size_t k = 1; k + 1 < n_knots; ++k)
-    {
-        for (int j = 0; j < n_joints; ++j)
-        {
-            const double m0 = slope[k - 1][j];
-            const double m1 = slope[k][j];
-            if (m0 * m1 <= 0.0)
-            {
-                tangent[k][j] = 0.0;
-            }
-            else
-            {
-                tangent[k][j] = 2.0 * m0 * m1 / (m0 + m1);
-            }
-        }
-    }
-
-    for (auto &v : tangent)
-    {
-        for (int j = 0; j < n_joints; ++j)
-        {
-            const double lim = (j < velocity_limit.size())
-                                   ? std::max(0.0, velocity_limit[j])
-                                   : std::numeric_limits<double>::infinity();
-            v[j] = std::clamp(v[j], -lim, lim);
-        }
-    }
-
-    const double total_time = static_cast<double>(n_segments) * T;
-    const size_t n_samples = static_cast<size_t>(std::ceil(total_time / dt)) + 1;
-    traj.reserve(n_samples);
-
-    for (size_t sample = 0; sample < n_samples; ++sample)
-    {
-        const double t = std::min(static_cast<double>(sample) * dt, total_time);
-        const size_t seg = std::min(static_cast<size_t>(t / T), n_segments - 1);
-        const double local_t = t - static_cast<double>(seg) * T;
-        const double u = std::clamp(local_t / T, 0.0, 1.0);
-        const double u2 = u * u;
-        const double u3 = u2 * u;
-
-        const double h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
-        const double h10 = u3 - 2.0 * u2 + u;
-        const double h01 = -2.0 * u3 + 3.0 * u2;
-        const double h11 = u3 - u2;
-
-        const double dh00 = (6.0 * u2 - 6.0 * u) / T;
-        const double dh10 = 3.0 * u2 - 4.0 * u + 1.0;
-        const double dh01 = (-6.0 * u2 + 6.0 * u) / T;
-        const double dh11 = 3.0 * u2 - 2.0 * u;
-
-        const double ddh00 = (12.0 * u - 6.0) / (T * T);
-        const double ddh10 = (6.0 * u - 4.0) / T;
-        const double ddh01 = (-12.0 * u + 6.0) / (T * T);
-        const double ddh11 = (6.0 * u - 2.0) / T;
-
-        tesseract_common::JointState s;
-        s.joint_names = joint_names;
-        s.time = t;
-        s.position = h00 * q_knots[seg] +
-                     h10 * T * tangent[seg] +
-                     h01 * q_knots[seg + 1] +
-                     h11 * T * tangent[seg + 1];
-        s.velocity = dh00 * q_knots[seg] +
-                     dh10 * tangent[seg] +
-                     dh01 * q_knots[seg + 1] +
-                     dh11 * tangent[seg + 1];
-        s.acceleration = ddh00 * q_knots[seg] +
-                         ddh10 * tangent[seg] +
-                         ddh01 * q_knots[seg + 1] +
-                         ddh11 * tangent[seg + 1];
-        traj.push_back(s);
-    }
-
-    if (!traj.empty())
-    {
-        traj.front().position = q_knots.front();
-        traj.back().position = q_knots.back();
-    }
-
-    return traj;
-}
-
-// ============================================================================
-// ASYNC CALLBACK — Cartesian PT1 smoother
-// ============================================================================
-
-void MotoMiniPlanningNode::targetPoseCallback(
-    const geometry_msgs::msg::PoseStamped::SharedPtr msg)
-{
-    std::lock_guard<std::mutex> lock(_mpc_target_mutex);
-
-    Eigen::Isometry3d raw_new_pose;
-    tf2::fromMsg(msg->pose, raw_new_pose);
-
-    if (target_initialized_)
-    {
-        const double alpha_pos =
-            std::clamp(tracking_target_pos_alpha_, 0.01, 1.0);
-        const double alpha_rot =
-            std::clamp(tracking_target_rot_alpha_, 0.01, 1.0);
-
-        Eigen::Vector3d smoothed_pos =
-            current_target_pose_.translation() +
-            alpha_pos * (raw_new_pose.translation() - current_target_pose_.translation());
-
-        Eigen::Quaterniond q_curr(current_target_pose_.linear());
-        Eigen::Quaterniond q_new(raw_new_pose.linear());
-        Eigen::Quaterniond q_smoothed = q_curr.slerp(alpha_rot, q_new);
-
-        Eigen::Isometry3d smoothed_pose = Eigen::Isometry3d::Identity();
-        smoothed_pose.translation() = smoothed_pos;
-        smoothed_pose.linear() = q_smoothed.toRotationMatrix();
-
-        rclcpp::Time current_time(msg->header.stamp);
-        double dt = (current_time - last_target_time_).seconds();
-        if (dt > 1e-4)
-        {
-            target_velocity_linear_ =
-                (smoothed_pose.translation() - current_target_pose_.translation()) / dt;
-            Eigen::AngleAxisd diff(
-                smoothed_pose.linear() * current_target_pose_.linear().inverse());
-            target_velocity_angular_ = diff.axis() * diff.angle() / dt;
-        }
-
-        current_target_pose_ = smoothed_pose;
-        last_target_time_ = msg->header.stamp;
-    }
-    else
-    {
-        current_target_pose_ = raw_new_pose;
-        target_velocity_linear_.setZero();
-        target_velocity_angular_.setZero();
-        target_initialized_ = true;
-        last_target_time_ = msg->header.stamp;
-    }
-}
-
-// ============================================================================
-// MATH HELPERS
-// ============================================================================
-
-Eigen::Isometry3d MotoMiniPlanningNode::predictTargetPose(int step_k)
-{
-    std::lock_guard<std::mutex> lock(_mpc_target_mutex);
-
-    double lead_time = step_k * mpc_dt_;
-    Eigen::Isometry3d predicted = current_target_pose_;
-    predicted.translation() += target_velocity_linear_ * lead_time;
-
-    double angle = target_velocity_angular_.norm() * lead_time;
-    if (angle > 1e-6)
-        predicted.linear() =
-            Eigen::AngleAxisd(angle, target_velocity_angular_.normalized()).toRotationMatrix() *
-            current_target_pose_.linear();
-    return predicted;
-}
-
-Eigen::VectorXd MotoMiniPlanningNode::computeDlsExtrapolation(
-    const Eigen::VectorXd &q_last,
-    const Eigen::Isometry3d &target_next,
-    const Eigen::VectorXd &velocity_limit,
-    const Eigen::Vector3d & /*target_linear_vel*/,
-    const Eigen::Vector3d & /*target_angular_vel*/)
-{
-    auto fk = manip_->calcFwdKin(q_last);
-    if (fk.find(ee_link_) == fk.end())
-        return q_last;
-
-    Eigen::Isometry3d ee_current = fk.at(ee_link_);
-    Eigen::Vector3d dx = target_next.translation() - ee_current.translation();
-    Eigen::AngleAxisd aa(target_next.linear() * ee_current.linear().inverse());
-    Eigen::Vector3d dw = aa.axis() * aa.angle();
-
-    Eigen::Matrix<double, 6, 1> twist;
-    twist.head<3>() = std::max(0.0, tracking_cart_pos_gain_) * dx;
-    const double max_pos_step =
-        std::max(0.0, tracking_max_cart_speed_) * mpc_dt_;
-    const double pos_step = twist.head<3>().norm();
-    if (max_pos_step > 1e-9 && pos_step > max_pos_step)
-        twist.head<3>() *= max_pos_step / pos_step;
-
-    const double orientation_weight =
-        std::clamp(tracking_orientation_weight_, 0.0, 1.0);
-    twist.tail<3>() =
-        orientation_weight * std::max(0.0, tracking_cart_rot_gain_) * dw;
-    const double max_rot_step =
-        std::max(0.0, tracking_max_rot_speed_) * mpc_dt_;
-    const double rot_step = twist.tail<3>().norm();
-    if (max_rot_step > 1e-9 && rot_step > max_rot_step)
-        twist.tail<3>() *= max_rot_step / rot_step;
-
-    Eigen::MatrixXd J = manip_->calcJacobian(q_last, base_link_, ee_link_);
-    const double lambda = 0.2;
-    Eigen::MatrixXd JJt = J * J.transpose();
-    JJt += (lambda * lambda) * Eigen::MatrixXd::Identity(6, 6);
-    Eigen::VectorXd dq = J.transpose() * JJt.ldlt().solve(twist);
-
-    const Eigen::VectorXd max_dq = velocity_limit * mpc_dt_;
-    for (int i = 0; i < dq.size(); ++i)
-    {
-        const double lim = (i < max_dq.size()) ? std::max(0.0, max_dq[i]) : 0.0;
-        dq[i] = std::max(-lim, std::min(lim, dq[i]));
-    }
-
-    Eigen::VectorXd q_next = q_last + dq;
-    for (int i = 0; i < q_next.size(); ++i)
-        q_next[i] = std::max(joint_limits_(i, 0),
-                             std::min(joint_limits_(i, 1), q_next[i]));
-    return q_next;
-}
-
-// ============================================================================
-// AVOIDANCE WORKER LIFECYCLE
-// ============================================================================
-
-void MotoMiniPlanningNode::startAvoidanceWorker()
-{
-    if (avoidance_running_.exchange(true))
-        return; // already running
-    avoidance_worker_ = std::thread(&MotoMiniPlanningNode::avoidanceWorkerLoop, this);
-    RCLCPP_INFO(this->get_logger(), "Avoidance worker thread started.");
-}
-
-void MotoMiniPlanningNode::stopAvoidanceWorker()
-{
-    if (!avoidance_running_.exchange(false))
-        return;
-    avoidance_request_cv_.notify_all();
-    if (avoidance_worker_.joinable())
-        avoidance_worker_.join();
-    RCLCPP_INFO(this->get_logger(), "Avoidance worker thread stopped.");
-}
-
-void MotoMiniPlanningNode::requestAvoidance(const Eigen::VectorXd &anchor)
-{
-    {
-        std::lock_guard<std::mutex> lk(avoidance_request_mutex_);
-        avoidance_request_anchor_ = anchor;
-        avoidance_request_pending_.store(true);
-    }
-    avoidance_request_cv_.notify_one();
-}
-
-// ============================================================================
-// COLLISION CHECK
-// ============================================================================
-
-bool MotoMiniPlanningNode::checkCollisionAtState(const Eigen::VectorXd &q)
-{
-    // env_mutex_ is assumed held (shared_lock) by the caller.
-    auto manager = env_->getDiscreteContactManager();
-    if (!manager)
+    if (!last_joint_state_ || joint_names_.empty())
         return false;
 
-    auto state_solver = env_->getStateSolver();
-    auto scene_state = state_solver->getState(manip_->getJointNames(), q);
-
-    manager->setCollisionObjectsTransform(scene_state.link_transforms);
-
-    tesseract_collision::ContactResultMap contacts;
-    tesseract_collision::ContactRequest req;
-    req.type = tesseract_collision::ContactTestType::FIRST;
-    manager->contactTest(contacts, req);
-
-    return !contacts.empty();
-}
-
-int MotoMiniPlanningNode::checkCollisionInHorizon(
-    const std::vector<Eigen::VectorXd> &q_traj)
-{
-    // Skip k=0 (anchor) — that's "now", any collision there is a sensor
-    // glitch we can't react to anyway. Check k=1..end.
-    for (size_t k = 1; k < q_traj.size(); ++k)
-        if (checkCollisionAtState(q_traj[k]))
-            return static_cast<int>(k);
-    return -1;
-}
-
-// ============================================================================
-// AVOIDANCE WORKER — runs TrajOpt with collision cost ENABLED
-// ============================================================================
-
-void MotoMiniPlanningNode::avoidanceWorkerLoop()
-{
-    while (avoidance_running_.load())
+    q.resize(static_cast<Eigen::Index>(joint_names_.size()));
+    for (size_t i = 0; i < joint_names_.size(); ++i)
     {
-        Eigen::VectorXd anchor;
-        {
-            std::unique_lock<std::mutex> lk(avoidance_request_mutex_);
-            avoidance_request_cv_.wait(lk, [this]()
-                                       { return !avoidance_running_.load() ||
-                                                avoidance_request_pending_.load(); });
-            if (!avoidance_running_.load())
-                return;
-            anchor = avoidance_request_anchor_;
-            avoidance_request_pending_.store(false);
-        }
-        if (anchor.size() == 0)
-            continue;
-
-        const auto t0 = this->now();
-
-        std::vector<Eigen::VectorXd> result;
-        bool ok = false;
-        try
-        {
-            ok = runAvoidancePlan(anchor, result);
-        }
-        catch (const std::exception &e)
-        {
-            RCLCPP_ERROR(this->get_logger(),
-                         "Avoidance worker exception: %s", e.what());
-            ok = false;
-        }
-
-        const double elapsed_ms = (this->now() - t0).seconds() * 1000.0;
-
-        if (ok && !result.empty())
-        {
-            std::unique_lock<std::shared_mutex> wl(avoidance_result_mutex_);
-            avoidance_traj_ = std::move(result);
-            avoidance_idx_ = 0;
-            avoidance_traj_stamp_ = this->now();
-            avoidance_traj_valid_.store(true);
-            RCLCPP_INFO(this->get_logger(),
-                        "Avoidance plan ready (%zu pts, %.0f ms).",
-                        avoidance_traj_.size(), elapsed_ms);
-        }
-        else
-        {
-            RCLCPP_WARN(this->get_logger(),
-                        "Avoidance planning failed after %.0f ms.", elapsed_ms);
-        }
-    }
-}
-
-bool MotoMiniPlanningNode::runAvoidancePlan(
-    const Eigen::VectorXd &q_start,
-    std::vector<Eigen::VectorXd> &out_traj)
-{
-    using namespace tesseract_planning;
-
-    std::shared_lock<std::shared_mutex> env_lock(env_mutex_);
-
-    const int H = avoidance_horizon_;
-    const auto &joint_names = manip_->getJointNames();
-    const int n_joints = static_cast<int>(joint_names.size());
-
-    // Build the planning problem: start from q_start, then H Cartesian
-    // waypoints predicted along the current target's trajectory.
-    CompositeInstruction ci(
-        "DEFAULT",
-        tesseract_common::ManipulatorInfo(manip_->getName(), base_link_, ee_link_));
-
-    ci.push_back(MoveInstruction(StateWaypoint(joint_names, q_start),
-                                 MoveInstructionType::FREESPACE, "FREESPACE"));
-    for (int k = 1; k <= H; ++k)
-        ci.push_back(MoveInstruction(CartesianWaypoint(predictTargetPose(k)),
-                                     MoveInstructionType::FREESPACE, "FREESPACE"));
-
-    auto profiles = std::make_shared<tesseract_common::ProfileDictionary>();
-
-    // (1) MOVE — looser Cartesian cost so detours are allowed
-    auto move = std::make_shared<TrajOptIfoptDefaultMoveProfile>();
-    move->cartesian_cost_config.enabled = true;
-    Eigen::VectorXd cw = Eigen::VectorXd::Zero(6);
-    cw.head<3>().setConstant(5.0); // position — softer than tracking (10)
-    cw.tail<3>().setConstant(0.5); // orientation — softer
-    move->cartesian_cost_config.coeff = cw;
-    move->cartesian_constraint_config.enabled = false;
-
-    move->joint_cost_config.enabled = true;
-    Eigen::VectorXd jc = Eigen::VectorXd::Ones(n_joints) * 0.5;
-    jc[n_joints - 1] = 2.0;
-    move->joint_cost_config.coeff = jc;
-
-    // (2) COMPOSITE — collision cost ENABLED, larger margin
-    auto comp = std::make_shared<TrajOptIfoptDefaultCompositeProfile>();
-    comp->collision_cost_config.enabled = true;
-
-    comp->smooth_velocities = true;
-    Eigen::VectorXd vw = Eigen::VectorXd::Ones(n_joints) * 5.0;
-    vw[n_joints - 1] = 50.0;
-    comp->velocity_coeff = vw;
-
-    comp->smooth_accelerations = true;
-    Eigen::VectorXd aw = Eigen::VectorXd::Ones(n_joints) * 1.0;
-    aw[n_joints - 1] = 20.0;
-    comp->acceleration_coeff = aw;
-
-    comp->smooth_jerks = false;
-    comp->jerk_coeff = Eigen::VectorXd::Ones(1) * 0.0;
-
-    // (3) SOLVER — give it room to find a detour
-    auto solver = std::make_shared<TrajOptIfoptOSQPSolverProfile>();
-    solver->opt_params.max_iterations = 20;
-    solver->opt_params.initial_trust_box_size = 0.1;
-    solver->opt_params.min_approx_improve = 1e-3;
-    solver->opt_params.cnt_tolerance = 1e-3;
-
-    const std::string NS = "TrajOptIfoptMotionPlannerTask";
-    profiles->addProfile(NS, "FREESPACE", move);
-    profiles->addProfile(NS, "DEFAULT", comp);
-    profiles->addProfile(NS, "DEFAULT", solver);
-
-    std::shared_ptr<const tesseract_environment::Environment> const_env = env_;
-    auto ds = std::make_unique<TaskComposerDataStorage>();
-    ds->setData("planning_input", ci);
-    ds->setData("environment", const_env);
-    ds->setData("profiles", profiles);
-
-    auto tc_ctx = std::make_shared<TaskComposerContext>(
-        mpc_task_->getName(), std::move(ds));
-
-    auto fut = task_executor_->run(*mpc_task_, std::move(tc_ctx));
-    if (!fut)
-        return false;
-    fut->wait();
-
-    const std::string out_key = mpc_task_->getOutputKeys().get("program");
-    const auto stored = fut->context->data_storage->getData();
-    if (stored.count(out_key) == 0)
-        return false;
-
-    auto ci_out = stored.at(out_key).template as<CompositeInstruction>();
-    tesseract_planning::formatProgram(ci_out, *env_);
-    auto tess_traj = toJointTrajectory(ci_out);
-    if (tess_traj.empty())
-        return false;
-
-    // Convert to vector<VectorXd> and unwrap continuous joints.
-    out_traj.clear();
-    out_traj.reserve(tess_traj.size());
-    for (const auto &s : tess_traj)
-        out_traj.push_back(s.position);
-
-    const auto is_cont = detectContinuousJoints(joint_limits_, n_joints);
-    unwrapHorizonContinuousJoints(out_traj, is_cont, joint_limits_);
-
-    // Final safety: re-validate the avoidance plan against the live env.
-    for (size_t i = 1; i < out_traj.size(); ++i)
-        if (checkCollisionAtState(out_traj[i]))
-        {
-            RCLCPP_WARN(this->get_logger(),
-                        "Avoidance plan REJECTED: still in collision at idx %zu", i);
+        auto it = std::find(last_joint_state_->name.begin(),
+                            last_joint_state_->name.end(),
+                            joint_names_[i]);
+        if (it == last_joint_state_->name.end())
             return false;
-        }
 
+        const size_t idx =
+            static_cast<size_t>(std::distance(last_joint_state_->name.begin(), it));
+        if (idx >= last_joint_state_->position.size())
+            return false;
+        q[static_cast<Eigen::Index>(i)] = last_joint_state_->position[idx];
+    }
     return true;
 }
 
-// ============================================================================
-// HOT PATH — Controller with TRACKING / AVOIDANCE state machine
-// ============================================================================
-
-void MotoMiniPlanningNode::mpcTimerCallback()
+bool MotoMiniPlanningNode::initTrackedPositions()
 {
-    if (!tracking_enabled_)
-        return;
-    if (!target_initialized_)
-    {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                             "Controller: waiting for target...");
-        return;
-    }
-    if (!last_joint_state_)
-    {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                             "Controller: waiting for joint state...");
-        return;
-    }
+    Eigen::VectorXd q;
+    if (!currentJointVector(q))
+        return false;
 
-    std::shared_lock<std::shared_mutex> env_lock(env_mutex_);
-    const rclcpp::Time tick_start = this->now();
+    tracked_positions_.assign(q.data(), q.data() + q.size());
+    tracked_velocities_.assign(static_cast<size_t>(q.size()), 0.0);
+    return true;
+}
 
-    const int n_joints = static_cast<int>(manip_->getJointNames().size());
-    const auto &joint_names = manip_->getJointNames();
-    const Eigen::VectorXd v_hw_limit =
-        positiveUpperLimits(velocity_limits_, n_joints, 1.0);
+bool MotoMiniPlanningNode::getEEPose(const Eigen::VectorXd &q,
+                                     Eigen::Vector3d &pos,
+                                     Eigen::Matrix3d &rot) const
+{
+    if (!manip_)
+        return false;
 
-    const double velocity_scale =
-        std::clamp(tracking_velocity_limit_scale_, 0.01, 1.0);
-    double startup_ramp = 1.0;
-    if (tracking_start_ramp_time_ > 1e-6 &&
-        tracking_start_time_.nanoseconds() > 0)
-    {
-        const double ramp_phase = std::clamp(
-            (tick_start - tracking_start_time_).seconds() /
-                tracking_start_ramp_time_,
-            0.0, 1.0);
-        const double smooth_phase =
-            ramp_phase * ramp_phase * (3.0 - 2.0 * ramp_phase);
-        const double start_scale =
-            std::clamp(tracking_start_velocity_scale_, 0.01, 1.0);
-        startup_ramp = start_scale + (1.0 - start_scale) * smooth_phase;
-    }
-    const Eigen::VectorXd v_limit = v_hw_limit * velocity_scale * startup_ramp;
-    const auto is_continuous = detectContinuousJoints(joint_limits_, n_joints);
+    const auto fk = manip_->calcFwdKin(q);
+    auto it = fk.find(ee_link_);
+    if (it == fk.end())
+        return false;
 
-    // ------------------------------------------------------------------
-    // Adaptive horizon (tracking only — avoidance has its own H)
-    // ------------------------------------------------------------------
-    const double linear_speed = target_velocity_linear_.norm();
-    const double angular_speed = target_velocity_angular_.norm();
-    const int base_horizon = std::clamp(mpc_horizon_n_, 5, 20);
-    int horizon = base_horizon;
-    if (linear_speed > 0.5 || angular_speed > 0.5)
-        horizon = std::min(std::max(base_horizon, 8), 20);
+    pos = it->second.translation();
+    rot = it->second.rotation();
+    return true;
+}
 
-    // ------------------------------------------------------------------
-    // Anchor
-    // ------------------------------------------------------------------
-    Eigen::VectorXd q_anchor;
-    Eigen::VectorXd q_feedback;
-    {
-        std::lock_guard<std::mutex> lock(_mpc_state_mutex);
-        q_feedback = current_joints_;
-        if (q_feedback.size() == 0)
-            return;
-
-        if (has_tracking_velocity_command_ &&
-            !horizon_joints_.empty() &&
-            horizon_joints_.front().size() == q_feedback.size())
-        {
-            q_anchor = horizon_joints_.front();
-        }
-        else
-        {
-            q_anchor = q_feedback;
-        }
-
-        const double eps = 1e-4;
-        const double lead_limit = std::max(0.0, tracking_command_lead_limit_);
-        for (int i = 0; i < q_anchor.size(); ++i)
-        {
-            if (lead_limit > 1e-9 && q_feedback.size() == q_anchor.size())
-                q_anchor[i] = std::clamp(q_anchor[i],
-                                         q_feedback[i] - lead_limit,
-                                         q_feedback[i] + lead_limit);
-            q_anchor[i] = std::max(joint_limits_(i, 0) + eps,
-                                   std::min(joint_limits_(i, 1) - eps, q_anchor[i]));
-        }
-    }
-    if (q_anchor.size() == 0)
+void MotoMiniPlanningNode::publishFeedback()
+{
+    Eigen::VectorXd q;
+    if (!currentJointVector(q))
         return;
 
-    // ------------------------------------------------------------------
-    // Always compute the DLS horizon. We need it as the tracking output,
-    // and we need it to detect "is the path still clear so we can hand
-    // back from AVOIDANCE_EXEC to TRACKING".
-    // ------------------------------------------------------------------
-    std::vector<Eigen::VectorXd> q_dls(horizon + 1);
-    q_dls[0] = q_anchor;
-    for (int k = 1; k <= horizon; ++k)
-        q_dls[k] =
-            computeDlsExtrapolation(q_dls[k - 1], predictTargetPose(k), v_limit, target_velocity_linear_, target_velocity_angular_);
-    unwrapHorizonContinuousJoints(q_dls, is_continuous, joint_limits_);
-
-    const int dls_first_collision = checkCollisionInHorizon(q_dls);
-    const bool dls_clear = (dls_first_collision < 0);
-
-    // ------------------------------------------------------------------
-    // STATE MACHINE — pick what to publish this tick.
-    // ------------------------------------------------------------------
-    std::vector<Eigen::VectorXd> q_publish;
-    q_publish.reserve(horizon + 1);
-
-    const char *mode_str = "TRACKING";
-    auto current_mode = mode_.load();
-
-    if (current_mode == ControllerMode::TRACKING)
-    {
-        if (!dls_clear)
-        {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                                 "TRACKING: collision predicted at horizon idx %d → requesting avoidance.",
-                                 dls_first_collision);
-            avoidance_traj_valid_.store(false); // discard any stale plan
-            requestAvoidance(q_anchor);
-            mode_.store(ControllerMode::AVOIDANCE_REQUESTED);
-            current_mode = ControllerMode::AVOIDANCE_REQUESTED;
-        }
-        else
-        {
-            q_publish = q_dls;
-            mode_str = "TRACKING";
-        }
-    }
-
-    if (current_mode == ControllerMode::AVOIDANCE_REQUESTED)
-    {
-        if (avoidance_traj_valid_.load())
-        {
-            std::unique_lock<std::shared_mutex> wl(avoidance_result_mutex_);
-            avoidance_idx_ = 0;
-            mode_.store(ControllerMode::AVOIDANCE_EXEC);
-            current_mode = ControllerMode::AVOIDANCE_EXEC;
-        }
-        else
-        {
-            // Hold pose until plan arrives.
-            q_publish.assign(horizon + 1, q_anchor);
-            mode_str = "AVOIDANCE_REQUESTED (hold)";
-        }
-    }
-
-    if (current_mode == ControllerMode::AVOIDANCE_EXEC)
-    {
-        std::shared_lock<std::shared_mutex> rl(avoidance_result_mutex_);
-
-        const double age = (this->now() - avoidance_traj_stamp_).seconds();
-        const bool exhausted = (avoidance_idx_ + 1 >= avoidance_traj_.size());
-        const bool stale = (age > avoidance_traj_max_age_);
-
-        if (!avoidance_traj_valid_.load() || exhausted)
-        {
-            // Plan finished. Hand back to tracking ONLY if the path is clear.
-            if (dls_clear)
-            {
-                rl.unlock();
-                mode_.store(ControllerMode::TRACKING);
-                avoidance_traj_valid_.store(false);
-                q_publish = q_dls;
-                mode_str = "TRACKING (resumed)";
-            }
-            else
-            {
-                // Still blocked — request a fresh plan.
-                rl.unlock();
-                avoidance_traj_valid_.store(false);
-                requestAvoidance(q_anchor);
-                mode_.store(ControllerMode::AVOIDANCE_REQUESTED);
-                q_publish.assign(horizon + 1, q_anchor);
-                mode_str = "AVOIDANCE_EXEC → re-plan (path still blocked)";
-            }
-        }
-        else if (stale)
-        {
-            // Old plan — ask for a fresh one.
-            rl.unlock();
-            avoidance_traj_valid_.store(false);
-            requestAvoidance(q_anchor);
-            mode_.store(ControllerMode::AVOIDANCE_REQUESTED);
-            q_publish.assign(horizon + 1, q_anchor);
-            mode_str = "AVOIDANCE_EXEC → stale, re-planning";
-        }
-        else
-        {
-            // Slice the avoidance trajectory into a horizon-sized window.
-            q_publish.resize(horizon + 1);
-            q_publish[0] = q_anchor;
-            for (int k = 1; k <= horizon; ++k)
-            {
-                const size_t src = std::min(avoidance_idx_ + k,
-                                            avoidance_traj_.size() - 1);
-                q_publish[k] = avoidance_traj_[src];
-            }
-            avoidance_idx_++;
-            rl.unlock();
-
-            // Re-validate against the LIVE environment
-            const int recheck = checkCollisionInHorizon(q_publish);
-            if (recheck >= 0)
-            {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-                                     "AVOIDANCE_EXEC: live recheck failed at idx %d → re-planning.",
-                                     recheck);
-                avoidance_traj_valid_.store(false);
-                requestAvoidance(q_anchor);
-                mode_.store(ControllerMode::AVOIDANCE_REQUESTED);
-                q_publish.assign(horizon + 1, q_anchor);
-                mode_str = "AVOIDANCE_EXEC → live collision, re-planning";
-            }
-            else
-            {
-                mode_str = "AVOIDANCE_EXEC";
-            }
-        }
-    }
-
-    // Re-unwrap (avoidance slices may have been seeded fresh).
-    unwrapHorizonContinuousJoints(q_publish, is_continuous, joint_limits_);
-    if (q_publish.empty())
+    Eigen::Vector3d pos;
+    Eigen::Matrix3d rot;
+    if (!getEEPose(q, pos, rot))
         return;
 
-    // ------------------------------------------------------------------
-    // COMMAND SHAPER — rate, acceleration and feedback lead limiting.
-    // ------------------------------------------------------------------
-    if (q_publish.size() >= 2)
+    const Eigen::Vector3d rpy = rot.eulerAngles(0, 1, 2);
+    if (pub_feedback_)
     {
-        Eigen::VectorXd prev_q = q_publish[0];
-        Eigen::VectorXd prev_v =
-            (last_tracking_velocity_command_.size() == n_joints)
-                ? last_tracking_velocity_command_
-                : Eigen::VectorXd::Zero(n_joints);
-        Eigen::VectorXd first_segment_v = Eigen::VectorXd::Zero(n_joints);
+        geometry_msgs::msg::Twist msg;
+        msg.linear.x = pos.x();
+        msg.linear.y = pos.y();
+        msg.linear.z = pos.z();
+        msg.angular.x = rpy.x();
+        msg.angular.y = rpy.y();
+        msg.angular.z = rpy.z();
+        pub_feedback_->publish(msg);
+    }
 
-        const double max_dv = std::max(0.0, tracking_accel_limit_) * mpc_dt_;
-        const double lead_limit = std::max(0.0, tracking_command_lead_limit_);
+    const rclcpp::Time now = this->now();
+    Eigen::VectorXd qdot = Eigen::VectorXd::Zero(q.size());
+    if (have_q_prev_ && q_prev_.size() == q.size())
+    {
+        const double dt = (now - t_prev_q_).seconds();
+        if (dt > 1e-6)
+            qdot = (q - q_prev_) / dt;
+    }
+    q_prev_ = q;
+    t_prev_q_ = now;
+    have_q_prev_ = true;
 
-        for (size_t k = 1; k < q_publish.size(); ++k)
+    if (pub_feedback_vel_)
+    {
+        const Eigen::MatrixXd jacobian = manip_->calcJacobian(q, base_link_, ee_link_);
+        const Eigen::VectorXd v_cart = jacobian * qdot;
+
+        geometry_msgs::msg::Twist msg;
+        msg.linear.x = v_cart(0);
+        msg.linear.y = v_cart(1);
+        msg.linear.z = v_cart(2);
+        msg.angular.x = v_cart(3);
+        msg.angular.y = v_cart(4);
+        msg.angular.z = v_cart(5);
+        pub_feedback_vel_->publish(msg);
+    }
+}
+
+bool MotoMiniPlanningNode::checkVelocityLimits(const Eigen::VectorXd &theta_d) const
+{
+    if (theta_d.size() == 0)
+        return false;
+
+    for (Eigen::Index i = 0; i < theta_d.size(); ++i)
+    {
+        double limit = std::numeric_limits<double>::infinity();
+        if (velocity_limits_.rows() == theta_d.size() && velocity_limits_.cols() >= 2)
         {
-            Eigen::VectorXd v_cmd = (q_publish[k] - prev_q) / mpc_dt_;
-
-            for (int j = 0; j < n_joints; ++j)
-            {
-                // 1. Limit strictly based on maximum linear acceleration bounds (slew rate)
-                if (max_dv > 0.0)
-                {
-                    v_cmd[j] = std::clamp(v_cmd[j], prev_v[j] - max_dv, prev_v[j] + max_dv);
-                }
-
-                // 2. Clamp mathematically to absolute velocity limits
-                v_cmd[j] = std::clamp(v_cmd[j], -v_limit[j], v_limit[j]);
-            }
-
-            Eigen::VectorXd q_next = prev_q + v_cmd * mpc_dt_;
-            for (int j = 0; j < n_joints; ++j)
-            {
-                q_next[j] = std::clamp(q_next[j],
-                                       joint_limits_(j, 0),
-                                       joint_limits_(j, 1));
-
-                if (lead_limit > 1e-9 && q_feedback.size() == n_joints)
-                {
-                    const double future_allow =
-                        lead_limit + static_cast<double>(k) * mpc_dt_ * v_limit[j];
-                    q_next[j] = std::clamp(q_next[j],
-                                           q_feedback[j] - future_allow,
-                                           q_feedback[j] + future_allow);
-                }
-            }
-
-            q_publish[k] = q_next;
-            if (k == 1)
-                first_segment_v = v_cmd;
-            prev_q = q_next;
-            prev_v = v_cmd;
+            limit = std::max(std::abs(velocity_limits_(i, 0)),
+                             std::abs(velocity_limits_(i, 1)));
+        }
+        else if (theta_d.size() == NUMBER_OF_JOINT)
+        {
+            limit = FALLBACK_VELOCITY[static_cast<size_t>(i)];
         }
 
-        last_tracking_velocity_command_ = first_segment_v;
-        has_tracking_velocity_command_ = true;
+        limit *= SAFETY_VELOCITY_ALPHA;
+        if (std::isfinite(limit) && std::abs(theta_d[i]) > limit)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Joint %ld velocity %.4f rad/s exceeds streaming limit %.4f rad/s",
+                        static_cast<long>(i), theta_d[i], limit);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MotoMiniPlanningNode::checkPositionLimits(
+    const std::vector<double> &pos,
+    const std::vector<double> &reference) const
+{
+    if (pos.empty())
+        return false;
+
+    for (size_t i = 0; i < pos.size(); ++i)
+    {
+        double lower = -std::numeric_limits<double>::infinity();
+        double upper = std::numeric_limits<double>::infinity();
+        if (joint_limits_.rows() == static_cast<Eigen::Index>(pos.size()) &&
+            joint_limits_.cols() >= 2)
+        {
+            lower = joint_limits_(static_cast<Eigen::Index>(i), 0) + SAFETY_JOINT_PADDING_RAD;
+            upper = joint_limits_(static_cast<Eigen::Index>(i), 1) - SAFETY_JOINT_PADDING_RAD;
+        }
+        else if (pos.size() == NUMBER_OF_JOINT)
+        {
+            lower = FALLBACK_LOWER[i] + SAFETY_JOINT_PADDING_RAD;
+            upper = FALLBACK_UPPER[i] - SAFETY_JOINT_PADDING_RAD;
+        }
+
+        const bool below = pos[i] <= lower;
+        const bool above = pos[i] >= upper;
+        if (below || above)
+        {
+            if (reference.size() == pos.size())
+            {
+                const double eps = 1e-9;
+                const bool recovering_from_lower =
+                    below && reference[i] <= lower && pos[i] >= reference[i] - eps;
+                const bool recovering_from_upper =
+                    above && reference[i] >= upper && pos[i] <= reference[i] + eps;
+                if (recovering_from_lower || recovering_from_upper)
+                    continue;
+            }
+
+            RCLCPP_WARN(this->get_logger(),
+                        "Joint %zu position %.4f rad outside streaming safe range [%.4f, %.4f]",
+                        i, pos[i], lower, upper);
+            return false;
+        }
+    }
+    return true;
+}
+
+void MotoMiniPlanningNode::publishStreamPoint(
+    rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr &pub,
+    const std::vector<double> &pos,
+    const std::vector<double> &vel,
+    double time_sec)
+{
+    if (!pub || pos.empty() || pos.size() != vel.size())
+        return;
+
+    trajectory_msgs::msg::JointTrajectory traj;
+    traj.header.stamp = this->now();
+    if (!joint_names_.empty())
+    {
+        traj.joint_names = joint_names_;
     }
     else
     {
-        last_tracking_velocity_command_ = Eigen::VectorXd::Zero(n_joints);
-        has_tracking_velocity_command_ = true;
+        traj.joint_names.assign(FALLBACK_JOINT_NAMES.begin(), FALLBACK_JOINT_NAMES.end());
     }
 
-    // ------------------------------------------------------------------
-    // VELOCITY GATE (always on, against the scaled tracking envelope)
-    // ------------------------------------------------------------------
-    bool safe = true;
-    double worst_ratio = 0.0;
-    int worst_joint = -1;
-    for (size_t k = 1; k < q_publish.size(); ++k)
-        for (int j = 0; j < n_joints; ++j)
-        {
-            const double v = std::abs(q_publish[k][j] - q_publish[k - 1][j]) / mpc_dt_;
-            const double r = v / std::max(v_limit[j], 1e-6);
-            if (r > worst_ratio)
-            {
-                worst_ratio = r;
-                worst_joint = j;
-            }
-            if (r > 1.1)
-                safe = false;
-        }
-    if (!safe)
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    point.positions = pos;
+    point.velocities = vel;
+    point.time_from_start = rclcpp::Duration::from_seconds(std::max(0.0, time_sec));
+    traj.points.push_back(point);
+    pub->publish(traj);
+}
+
+void MotoMiniPlanningNode::publishArmInit()
+{
+    if (tracked_positions_.empty())
+        return;
+
+    std::vector<double> zero_vel(tracked_positions_.size(), 0.0);
+    publishStreamPoint(pub_stream_path_cmd_, tracked_positions_, zero_vel, 0.5);
+    RCLCPP_INFO(this->get_logger(),
+                "Tracking arm init sent to /joint_path_command.");
+}
+
+void MotoMiniPlanningNode::seedStreamingCommand()
+{
+    if (tracked_positions_.empty())
+        return;
+
+    std::vector<double> zero_vel(tracked_positions_.size(), 0.0);
+    publishStreamPoint(pub_stream_joint_cmd_, tracked_positions_, zero_vel, 0.0);
+    RCLCPP_INFO(this->get_logger(), "Tracking seed sent to joint_command.");
+}
+
+void MotoMiniPlanningNode::publishStreamingTrajectory(const std::vector<double> &pos,
+                                                      const std::vector<double> &vel)
+{
+    const double t_rel = (this->now() - t_start_).seconds();
+    publishStreamPoint(pub_stream_joint_cmd_, pos, vel, t_rel);
+}
+
+void MotoMiniPlanningNode::sendTriggerIfReady(
+    const rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr &client,
+    const char *service_name)
+{
+    if (!client || !client->service_is_ready())
     {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                             "Controller: rejecting tick — joint %d at %.2fx tracking velocity limit (mode=%s).",
-                             worst_joint, worst_ratio, mode_str);
+        RCLCPP_DEBUG(this->get_logger(),
+                     "%s service is not available; no trajectory-streamer mode request sent.",
+                     service_name);
         return;
     }
 
-    // ------------------------------------------------------------------
-    // BUILD dense JointTrajectory
-    // ------------------------------------------------------------------
-    const double publish_dt =
-        tracking_use_smooth_output_
-            ? std::clamp(tracking_output_dt_, 0.001, mpc_dt_)
-            : mpc_dt_;
-    tesseract_common::JointTrajectory tess_traj =
-        buildDenseSmoothTrajectory(q_publish,
-                                   joint_names,
-                                   mpc_dt_,
-                                   publish_dt,
-                                   v_limit,
-                                   tracking_use_smooth_output_);
+    auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+    client->async_send_request(request);
+}
 
-    // ------------------------------------------------------------------
-    // PUBLISH
-    // ------------------------------------------------------------------
-    const double solve_elapsed = (this->now() - tick_start).seconds();
-    static double smooth_splice = 0.0;
-    smooth_splice = 0.2 * solve_elapsed + 0.8 * smooth_splice;
-    const double splice_to_send = std::min(smooth_splice, 0.100);
-    publishTrajectory(tess_traj, joint_names, splice_to_send, publish_dt);
+void MotoMiniPlanningNode::requestTrajectoryStreamerStart()
+{
+    sendTriggerIfReady(traj_stream_start_client_, "/pose_following/start");
+}
 
-    // ------------------------------------------------------------------
-    // UPDATE WARM-START
-    // ------------------------------------------------------------------
-    if (static_cast<int>(horizon_joints_.size()) < horizon)
-        horizon_joints_.resize(horizon);
-    for (int k = 0; k < horizon; ++k)
+void MotoMiniPlanningNode::requestTrajectoryStreamerStop()
+{
+    sendTriggerIfReady(traj_stream_stop_client_, "/pose_following/stop");
+}
+
+void MotoMiniPlanningNode::resetVirtualState()
+{
+    xdot_ref_.setZero();
+    have_q_prev_ctrl_ = false;
+    q_prev_ctrl_.resize(0);
+    latest_collision_wrench_.setZero();
+    t_last_collision_wrench_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    latest_collision_distance_ = std::numeric_limits<double>::infinity();
+    latest_collision_normal_.setZero();
+    t_last_collision_distance_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    t_last_collision_normal_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+}
+
+void MotoMiniPlanningNode::resetControlWindow()
+{
+    resetVirtualState();
+    e_p_.setZero();
+    e_o_.setZero();
+    t_start_ = this->now();
+    t_last_ = this->now();
+}
+
+void MotoMiniPlanningNode::ensureStreamingInitialized()
+{
+    if (!tracking_enabled_ || stream_arm_init_sent_)
+        return;
+
+    if (initTrackedPositions())
     {
-        const size_t src = std::min<size_t>(k + 1, q_publish.size() - 1);
-        horizon_joints_[k] = q_publish[src];
+        publishArmInit();
+        stream_arm_init_sent_ = true;
+    }
+}
+
+void MotoMiniPlanningNode::enterPoseFollowFromCurrentPose()
+{
+    Eigen::VectorXd q;
+    Eigen::Vector3d ee_pos;
+    Eigen::Matrix3d ee_rot;
+    if (!currentJointVector(q) || !getEEPose(q, ee_pos, ee_rot))
+        return;
+
+    const Eigen::Quaterniond qee(ee_rot);
+    desired_pose_.header.frame_id = base_link_;
+    desired_pose_.pose.position.x = ee_pos.x();
+    desired_pose_.pose.position.y = ee_pos.y();
+    desired_pose_.pose.position.z = ee_pos.z();
+    desired_pose_.pose.orientation.w = qee.w();
+    desired_pose_.pose.orientation.x = qee.x();
+    desired_pose_.pose.orientation.y = qee.y();
+    desired_pose_.pose.orientation.z = qee.z();
+    has_desired_pose_ = true;
+    t_last_pose_cb_ = this->now();
+
+    if (initTrackedPositions())
+    {
+        resetControlWindow();
+        if (enable_seed_)
+            seedStreamingCommand();
+        tracking_state_ = TrackingStreamState::POSE_FOLLOW;
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream: IDLE -> POSE_FOLLOW from target velocity.");
+    }
+}
+
+void MotoMiniPlanningNode::trackingControlCallback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+    if (!msg)
+        return;
+
+    if (msg->data)
+    {
+        if (tracking_enabled_)
+            return;
+
+        is_executing_ = false;
+        planner_->stopOnlinePlanner();
+        requestTrajectoryStreamerStop();
+
+        tracking_enabled_ = true;
+        tracking_state_ = TrackingStreamState::IDLE;
+        last_tracking_state_ = TrackingStreamState::STOP;
+        stream_arm_init_sent_ = false;
+        is_init_done_ = false;
+        has_desired_pose_ = false;
+        has_init_pose_ = false;
+        latest_target_vel_.setZero();
+        t_last_target_vel_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        resetControlWindow();
+        ensureStreamingInitialized();
+
+        publishStatus("Mode: Tracking");
+        RCLCPP_INFO(this->get_logger(),
+                    "Mode -> TRACKING feedback stream. Waiting for fresh tracking input.");
+    }
+    else
+    {
+        if (!tracking_enabled_)
+            return;
+
+        tracking_enabled_ = false;
+        tracking_state_ = TrackingStreamState::IDLE;
+        last_tracking_state_ = TrackingStreamState::IDLE;
+        tracked_positions_.clear();
+        tracked_velocities_.clear();
+        has_desired_pose_ = false;
+        has_init_pose_ = false;
+        latest_target_vel_.setZero();
+        t_last_target_vel_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+        resetControlWindow();
+        requestTrajectoryStreamerStart();
+
+        publishStatus("Mode: Planning");
+        RCLCPP_INFO(this->get_logger(),
+                    "Mode -> PLANNING. Feedback remains active; streaming commands stopped.");
+    }
+}
+
+void MotoMiniPlanningNode::desiredPoseCallback(
+    const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+{
+    if (!msg)
+        return;
+
+    if (!tracking_enabled_)
+        return;
+
+    desired_pose_ = *msg;
+    has_desired_pose_ = true;
+    t_last_pose_cb_ = this->now();
+
+    if (tracking_state_ == TrackingStreamState::IDLE ||
+        tracking_state_ == TrackingStreamState::STOP)
+    {
+        if (initTrackedPositions())
+        {
+            resetControlWindow();
+            if (enable_seed_)
+                seedStreamingCommand();
+            tracking_state_ = TrackingStreamState::POSE_FOLLOW;
+            RCLCPP_INFO(this->get_logger(),
+                        "Tracking stream: IDLE -> POSE_FOLLOW from /motomini/target_pose.");
+        }
+    }
+}
+
+void MotoMiniPlanningNode::initPoseCallback(
+    const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+{
+    if (!msg)
+        return;
+
+    if (!tracking_enabled_)
+        return;
+
+    init_pose_ = *msg;
+    has_init_pose_ = true;
+    RCLCPP_INFO(this->get_logger(),
+                "Tracking init pose received: (%.4f, %.4f, %.4f)",
+                init_pose_.pose.position.x,
+                init_pose_.pose.position.y,
+                init_pose_.pose.position.z);
+
+    if ((tracking_state_ == TrackingStreamState::IDLE ||
+         tracking_state_ == TrackingStreamState::STOP) &&
+        initTrackedPositions())
+    {
+        resetControlWindow();
+        if (enable_seed_)
+            seedStreamingCommand();
+        tracking_state_ = TrackingStreamState::INIT;
+    }
+}
+
+void MotoMiniPlanningNode::targetVelCallback(
+    const geometry_msgs::msg::Twist::SharedPtr msg)
+{
+    if (!msg)
+        return;
+
+    if (!tracking_enabled_)
+        return;
+
+    latest_target_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
+        msg->angular.x, msg->angular.y, msg->angular.z;
+    t_last_target_vel_cb_ = this->now();
+
+    if (tracking_state_ == TrackingStreamState::IDLE &&
+        latest_target_vel_.norm() > 0.0)
+    {
+        enterPoseFollowFromCurrentPose();
+    }
+}
+
+void MotoMiniPlanningNode::collisionWrenchCallback(
+    const geometry_msgs::msg::WrenchStamped::SharedPtr msg)
+{
+    if (!msg)
+        return;
+
+    latest_collision_wrench_ << -msg->wrench.force.x,
+        -msg->wrench.force.y,
+        -msg->wrench.force.z,
+        -msg->wrench.torque.x,
+        -msg->wrench.torque.y,
+        -msg->wrench.torque.z;
+    t_last_collision_wrench_cb_ = this->now();
+}
+
+void MotoMiniPlanningNode::collisionDistanceCallback(
+    const std_msgs::msg::Float64::SharedPtr msg)
+{
+    if (!msg)
+        return;
+
+    latest_collision_distance_ = msg->data;
+    t_last_collision_distance_cb_ = this->now();
+}
+
+void MotoMiniPlanningNode::collisionNormalCallback(
+    const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
+{
+    if (!msg)
+        return;
+
+    latest_collision_normal_ << msg->vector.x, msg->vector.y, msg->vector.z;
+    t_last_collision_normal_cb_ = this->now();
+}
+
+bool MotoMiniPlanningNode::computeControlStep(const Eigen::VectorXd &q,
+                                              const Eigen::Vector3d &des_pos,
+                                              const Eigen::Matrix3d &des_rot,
+                                              double dt,
+                                              Eigen::VectorXd &theta_d)
+{
+    Eigen::Vector3d ee_pos;
+    Eigen::Matrix3d ee_rot;
+    if (!getEEPose(q, ee_pos, ee_rot))
+        return false;
+
+    e_p_ = des_pos - ee_pos;
+    e_o_ = orientationError(des_rot, ee_rot);
+
+    const double active_time = (this->now() - t_start_).seconds();
+    const double s_t = 1.0 - std::exp(-adaptive_lambda_ * std::max(0.0, active_time));
+    const double s_e_pos = std::tanh(adaptive_alpha_pos_ * e_p_.norm());
+    const double s_e_ori = std::tanh(adaptive_alpha_ori_ * e_o_.norm());
+
+    const Eigen::MatrixXd jacobian = manip_->calcJacobian(q, base_link_, ee_link_);
+    const double determinant = (jacobian * jacobian.transpose()).determinant();
+    const double manipulability = std::sqrt(std::max(0.0, determinant));
+    const double s_w = std::clamp(manipulability / std::max(1e-9, w0_), 0.2, 1.0);
+    if (manipulability <= w0_)
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Near singularity (w=%.6f <= w0=%.6f). SR damping active.",
+                             manipulability, w0_);
     }
 
-    // ------------------------------------------------------------------
-    // VISUALISATION
-    // ------------------------------------------------------------------
-    if (pub_ee_path_)
-    {
-        // 1. Robot Horizon Path Marker
-        visualization_msgs::msg::Marker marker;
-        marker.header.frame_id = base_link_;
-        marker.header.stamp = this->now();
-        marker.ns = "controller_horizon_path";
-        marker.id = 1;
-        marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-        marker.action = visualization_msgs::msg::Marker::ADD;
-        marker.scale.x = 0.005;
-        // Colour-code: green=tracking, yellow=requesting, red=avoiding
-        const auto m = mode_.load();
-        marker.color.a = 1.0f;
-        if (m == ControllerMode::TRACKING)
-        {
-            marker.color.r = 0.0f;
-            marker.color.g = 1.0f;
-            marker.color.b = 0.5f;
-        }
-        else if (m == ControllerMode::AVOIDANCE_REQUESTED)
-        {
-            marker.color.r = 1.0f;
-            marker.color.g = 0.8f;
-            marker.color.b = 0.0f;
-        }
-        else
-        {
-            marker.color.r = 1.0f;
-            marker.color.g = 0.2f;
-            marker.color.b = 0.0f;
-        }
+    const double k_pos = s_w * (k_pos_min_ + s_t * s_e_pos * (k_pos_max_ - k_pos_min_));
+    const double m_pos = m_pos_max_ - s_t * s_e_pos * (m_pos_max_ - m_pos_min_);
+    const double d_pos = 2.0 * zeta_pos_ * std::sqrt(std::max(1e-12, m_pos * k_pos));
 
-        for (const auto &state : tess_traj)
+    const double k_ori = s_w * (k_ori_min_ + s_t * s_e_ori * (k_ori_max_ - k_ori_min_));
+    const double m_ori = m_ori_max_ - s_t * s_e_ori * (m_ori_max_ - m_ori_min_);
+    const double d_ori = 2.0 * zeta_ori_ * std::sqrt(std::max(1e-12, m_ori * k_ori));
+
+    Eigen::VectorXd qdot = Eigen::VectorXd::Zero(q.size());
+    bool used_driver_velocity = false;
+    if (last_joint_state_ &&
+        last_joint_state_->velocity.size() >= last_joint_state_->name.size())
+    {
+        Eigen::VectorXd qdot_driver(static_cast<Eigen::Index>(joint_names_.size()));
+        bool valid = true;
+        for (size_t i = 0; i < joint_names_.size(); ++i)
         {
-            auto fk = manip_->calcFwdKin(state.position);
-            if (fk.count(ee_link_) > 0)
+            auto it = std::find(last_joint_state_->name.begin(),
+                                last_joint_state_->name.end(),
+                                joint_names_[i]);
+            if (it == last_joint_state_->name.end())
             {
-                geometry_msgs::msg::Point p;
-                p.x = fk.at(ee_link_).translation().x();
-                p.y = fk.at(ee_link_).translation().y();
-                p.z = fk.at(ee_link_).translation().z();
-                marker.points.push_back(p);
+                valid = false;
+                break;
             }
+            const size_t idx =
+                static_cast<size_t>(std::distance(last_joint_state_->name.begin(), it));
+            if (idx >= last_joint_state_->velocity.size())
+            {
+                valid = false;
+                break;
+            }
+            qdot_driver[static_cast<Eigen::Index>(i)] = last_joint_state_->velocity[idx];
         }
-        pub_ee_path_->publish(marker);
-
-        // 2. Predicted Target Path Marker
-        visualization_msgs::msg::Marker target_marker;
-        target_marker.header.frame_id = base_link_;
-        target_marker.header.stamp = this->now();
-        target_marker.ns = "predicted_target_path";
-        target_marker.id = 2; // Unique ID to draw alongside the robot path
-        target_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
-        target_marker.action = visualization_msgs::msg::Marker::ADD;
-        target_marker.scale.x = 0.005;
-        target_marker.color.r = 0.0f;
-        target_marker.color.g = 1.0f;
-        target_marker.color.b = 1.0f; // Cyan color for target prediction
-        target_marker.color.a = 1.0f;
-
-        for (int k = 0; k <= horizon; ++k)
+        if (valid && qdot_driver.allFinite())
         {
-            Eigen::Isometry3d pred = predictTargetPose(k);
-            geometry_msgs::msg::Point p;
-            p.x = pred.translation().x();
-            p.y = pred.translation().y();
-            p.z = pred.translation().z();
-            target_marker.points.push_back(p);
+            qdot = qdot_driver;
+            used_driver_velocity = true;
         }
-        pub_ee_path_->publish(target_marker);
     }
 
-    // ------------------------------------------------------------------
-    // DIAGNOSTICS
-    // ------------------------------------------------------------------
-    const double duration_ms = (this->now() - tick_start).seconds() * 1000.0;
-    if (duration_ms > 20.0)
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                             "Tick %.2f ms (budget 20 ms) mode=%s",
-                             duration_ms, mode_str);
+    if (!used_driver_velocity && have_q_prev_ctrl_ && q_prev_ctrl_.size() == q.size())
+    {
+        const double dt_q = (this->now() - t_prev_q_ctrl_).seconds();
+        if (dt_q > 1e-6)
+            qdot = (q - q_prev_ctrl_) / dt_q;
+    }
+    q_prev_ctrl_ = q;
+    t_prev_q_ctrl_ = this->now();
+    have_q_prev_ctrl_ = true;
 
-    RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1500,
-                          "ctrl  mode=%s  H=%d  solve=%.2fms  splice=%.1fms  worst_v=%.2fx",
-                          mode_str, horizon, duration_ms, splice_to_send * 1000.0, worst_ratio);
+    const Eigen::Matrix<double, 6, 1> xdot_actual = jacobian * qdot;
+
+    Eigen::Matrix<double, 6, 1> xdot_des =
+        Eigen::Matrix<double, 6, 1>::Zero();
+    if ((this->now() - t_last_target_vel_cb_).seconds() < TARGET_VEL_TIMEOUT_SEC)
+    {
+        xdot_des.head<3>() = latest_target_vel_.head<3>();
+        xdot_des.tail<3>() = des_rot * latest_target_vel_.tail<3>();
+    }
+    const Eigen::Matrix<double, 6, 1> velocity_error = xdot_actual - xdot_des;
+
+    Eigen::Matrix<double, 6, 1> f_collision =
+        Eigen::Matrix<double, 6, 1>::Zero();
+    if ((this->now() - t_last_collision_wrench_cb_).seconds() <
+        collision_wrench_timeout_sec_)
+    {
+        f_collision = latest_collision_wrench_;
+    }
+    f_collision.head<3>() *= collision_force_scale_;
+    const double f_norm = f_collision.head<3>().norm();
+    if (collision_force_max_ > 0.0 && f_norm > collision_force_max_ && f_norm > 1e-9)
+        f_collision.head<3>() *= collision_force_max_ / f_norm;
+
+    const bool collision_constraint_active =
+        ((this->now() - t_last_collision_distance_cb_).seconds() <
+         collision_constraint_timeout_sec_) &&
+        ((this->now() - t_last_collision_normal_cb_).seconds() <
+         collision_constraint_timeout_sec_) &&
+        latest_collision_normal_.allFinite() &&
+        latest_collision_normal_.norm() > 1e-6 &&
+        std::isfinite(latest_collision_distance_);
+
+    double gamma = 0.0;
+    Eigen::Vector3d n_away = Eigen::Vector3d::Zero();
+    if (collision_constraint_active)
+    {
+        n_away = latest_collision_normal_.normalized();
+        const double span =
+            std::max(1e-6, collision_guard_distance_ - collision_task_distance_);
+        gamma = 1.0 - std::clamp(
+                          (latest_collision_distance_ - collision_task_distance_) / span,
+                          0.0, 1.0);
+        gamma = std::min(gamma, collision_projection_max_gamma_);
+    }
+
+    Eigen::Vector3d f_goal_pos = k_pos * e_p_ - d_pos * velocity_error.head<3>();
+    if (collision_goal_suppression_ && gamma > 0.0)
+    {
+        const double goal_into = f_goal_pos.dot(n_away);
+        if (goal_into < 0.0)
+            f_goal_pos -= gamma * goal_into * n_away;
+    }
+
+    Eigen::Matrix<double, 6, 1> xddot_ref;
+    xddot_ref.head<3>() =
+        (f_goal_pos - f_collision.head<3>() - d_pos * xdot_ref_.head<3>()) /
+        std::max(1e-9, m_pos);
+    xddot_ref.tail<3>() =
+        (k_ori * e_o_ - d_ori * velocity_error.tail<3>() -
+         f_collision.tail<3>() - d_ori * xdot_ref_.tail<3>()) /
+        std::max(1e-9, m_ori);
+
+    const double dt_safe =
+        (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
+    xdot_ref_ += xddot_ref * dt_safe;
+
+    if (enable_collision_projection_ && gamma > 0.0)
+    {
+        const double v_into = xdot_ref_.head<3>().dot(n_away);
+        if (v_into < 0.0)
+            xdot_ref_.head<3>() -= gamma * v_into * n_away;
+    }
+
+    const double linear_norm = xdot_ref_.head<3>().norm();
+    if (linear_norm > max_cart_linear_vel_ && linear_norm > 1e-9)
+        xdot_ref_.head<3>() *= max_cart_linear_vel_ / linear_norm;
+
+    const double angular_norm = xdot_ref_.tail<3>().norm();
+    if (angular_norm > max_cart_angular_vel_ && angular_norm > 1e-9)
+        xdot_ref_.tail<3>() *= max_cart_angular_vel_ / angular_norm;
+
+    theta_d = calcSrInverse(jacobian, manipulability, w0_, k0_) * xdot_ref_;
+    return theta_d.allFinite();
+}
+
+void MotoMiniPlanningNode::handleTrackingIdle()
+{
+    if (last_tracking_state_ != tracking_state_)
+    {
+        last_tracking_state_ = tracking_state_;
+        resetVirtualState();
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream IDLE: syncing joint state, no command output.");
+    }
+
+    if (last_joint_state_)
+        initTrackedPositions();
+}
+
+void MotoMiniPlanningNode::handleTrackingStop()
+{
+    if (last_tracking_state_ != tracking_state_)
+    {
+        last_tracking_state_ = tracking_state_;
+        resetVirtualState();
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream STOP: command output disabled.");
+    }
+
+    if (last_joint_state_)
+        initTrackedPositions();
+}
+
+void MotoMiniPlanningNode::handleTrackingInit()
+{
+    if (last_tracking_state_ != tracking_state_)
+    {
+        last_tracking_state_ = tracking_state_;
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream INIT: moving to /pose_following/init_pose.");
+    }
+
+    if (!has_init_pose_)
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Tracking INIT waiting for /pose_following/init_pose.");
+        return;
+    }
+
+    Eigen::VectorXd q;
+    if (!currentJointVector(q))
+        return;
+
+    Eigen::Vector3d ee_pos;
+    Eigen::Matrix3d ee_rot;
+    if (!getEEPose(q, ee_pos, ee_rot))
+        return;
+
+    const double dx = std::abs(init_pose_.pose.position.x - ee_pos.x());
+    const double dy = std::abs(init_pose_.pose.position.y - ee_pos.y());
+    const double dz = std::abs(init_pose_.pose.position.z - ee_pos.z());
+    if (dx < POSITION_ERROR_THRESHOLD &&
+        dy < POSITION_ERROR_THRESHOLD &&
+        dz < POSITION_ERROR_THRESHOLD)
+    {
+        is_init_done_ = true;
+        resetControlWindow();
+        tracking_state_ = TrackingStreamState::POSE_FOLLOW;
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking init complete. INIT -> POSE_FOLLOW.");
+        return;
+    }
+
+    const Eigen::Quaterniond q_des = normalizedQuaternion(init_pose_.pose.orientation);
+    const Eigen::Vector3d des_pos(init_pose_.pose.position.x,
+                                  init_pose_.pose.position.y,
+                                  init_pose_.pose.position.z);
+
+    const double dt = (this->now() - t_last_).seconds();
+    t_last_ = this->now();
+
+    Eigen::VectorXd theta_d;
+    if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt, theta_d))
+        return;
+
+    if (!checkVelocityLimits(theta_d))
+    {
+        resetControlWindow();
+        tracking_state_ = TrackingStreamState::STOP;
+        return;
+    }
+
+    if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
+        !initTrackedPositions())
+    {
+        return;
+    }
+
+    std::vector<double> prev_pos = tracked_positions_;
+    const double dt_safe =
+        (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
+    for (size_t i = 0; i < tracked_positions_.size(); ++i)
+    {
+        tracked_positions_[i] += theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
+        tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
+    }
+
+    if (!checkPositionLimits(tracked_positions_, prev_pos))
+    {
+        tracked_positions_ = prev_pos;
+        std::fill(tracked_velocities_.begin(), tracked_velocities_.end(), 0.0);
+    }
+
+    publishStreamingTrajectory(tracked_positions_, tracked_velocities_);
+}
+
+void MotoMiniPlanningNode::handleTrackingPoseFollow()
+{
+    if (last_tracking_state_ != tracking_state_)
+    {
+        last_tracking_state_ = tracking_state_;
+        resetVirtualState();
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream POSE_FOLLOW: tracking /motomini/target_pose.");
+    }
+
+    if (!has_desired_pose_)
+    {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                             "Tracking POSE_FOLLOW waiting for /motomini/target_pose.");
+        return;
+    }
+
+    const double pose_age = (this->now() - t_last_pose_cb_).seconds();
+    if (pose_age > POSE_TIMEOUT_SEC)
+    {
+        RCLCPP_WARN(this->get_logger(),
+                    "Tracking pose input timeout %.2f s. POSE_FOLLOW -> IDLE.",
+                    pose_age);
+        resetControlWindow();
+        tracking_state_ = TrackingStreamState::IDLE;
+        return;
+    }
+
+    Eigen::VectorXd q;
+    if (!currentJointVector(q))
+        return;
+
+    Eigen::Quaterniond q_des = normalizedQuaternion(desired_pose_.pose.orientation);
+    Eigen::Vector3d des_pos(desired_pose_.pose.position.x,
+                            desired_pose_.pose.position.y,
+                            desired_pose_.pose.position.z);
+
+    const double dt = (this->now() - t_last_).seconds();
+    t_last_ = this->now();
+    const double dt_safe =
+        (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
+
+    if ((this->now() - t_last_target_vel_cb_).seconds() < TARGET_VEL_TIMEOUT_SEC &&
+        latest_target_vel_.norm() > 0.0)
+    {
+        des_pos.x() += latest_target_vel_(0) * dt_safe;
+        des_pos.y() += latest_target_vel_(1) * dt_safe;
+        des_pos.z() += latest_target_vel_(2) * dt_safe;
+        const Eigen::Quaterniond delta =
+            Eigen::AngleAxisd(latest_target_vel_(3) * dt_safe, Eigen::Vector3d::UnitX()) *
+            Eigen::AngleAxisd(latest_target_vel_(4) * dt_safe, Eigen::Vector3d::UnitY()) *
+            Eigen::AngleAxisd(latest_target_vel_(5) * dt_safe, Eigen::Vector3d::UnitZ());
+        q_des = (q_des * delta).normalized();
+
+        desired_pose_.pose.position.x = des_pos.x();
+        desired_pose_.pose.position.y = des_pos.y();
+        desired_pose_.pose.position.z = des_pos.z();
+        desired_pose_.pose.orientation.w = q_des.w();
+        desired_pose_.pose.orientation.x = q_des.x();
+        desired_pose_.pose.orientation.y = q_des.y();
+        desired_pose_.pose.orientation.z = q_des.z();
+        t_last_pose_cb_ = this->now();
+    }
+
+    Eigen::VectorXd theta_d;
+    if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt_safe, theta_d))
+        return;
+
+    if (!checkVelocityLimits(theta_d))
+    {
+        resetControlWindow();
+        tracking_state_ = TrackingStreamState::STOP;
+        return;
+    }
+
+    if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
+        !initTrackedPositions())
+    {
+        return;
+    }
+
+    std::vector<double> prev_pos = tracked_positions_;
+    for (size_t i = 0; i < tracked_positions_.size(); ++i)
+    {
+        tracked_positions_[i] += theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
+        tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
+    }
+
+    if (!checkPositionLimits(tracked_positions_, prev_pos))
+    {
+        tracked_positions_ = prev_pos;
+        std::fill(tracked_velocities_.begin(), tracked_velocities_.end(), 0.0);
+    }
+
+    publishStreamingTrajectory(tracked_positions_, tracked_velocities_);
+}
+
+void MotoMiniPlanningNode::feedbackTimerCallback()
+{
+    publishFeedback();
+
+    if (!tracking_enabled_)
+        return;
+
+    ensureStreamingInitialized();
+    switch (tracking_state_)
+    {
+    case TrackingStreamState::IDLE:
+        handleTrackingIdle();
+        break;
+    case TrackingStreamState::INIT:
+        handleTrackingInit();
+        break;
+    case TrackingStreamState::POSE_FOLLOW:
+        handleTrackingPoseFollow();
+        break;
+    case TrackingStreamState::STOP:
+        handleTrackingStop();
+        break;
+    }
 }
