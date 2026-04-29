@@ -153,7 +153,7 @@
     #   Increase mass for slower, smoother motion.
     #   Decrease mass for faster response, but watch joint velocity trips.
     m_pos_min: 0.02
-    m_pos_max: 0.08 
+    m_pos_max: 0.15 
 
     # Translational virtual stiffness.
     # k_pos_min is the soft baseline; k_pos_max is the fastest tracking value.
@@ -162,8 +162,8 @@
     #   Raise k_pos_max for faster position convergence.
     #   Lower k_pos_min if the robot feels too aggressive near the target.
     #   Lower k_pos_max if startup or large-error moves hit velocity limits.
-    k_pos_min: 120.0
-    k_pos_max: 250.0
+    k_pos_min: 100.0
+    k_pos_max: 210.0
 
     # Translational damping ratio used by D = 2*zeta*sqrt(M*K).
     # Tuning:

@@ -104,6 +104,8 @@
 #define SAFETY_JOINT_PADDING_RAD (5.0 * M_PI / 180.0) // [rad] padding from hard limits
 #define POSE_TIMEOUT_SEC 3.0                          // POSE_FOLLOW → IDLE if no pose [s]
 #define TARGET_VEL_TIMEOUT_SEC 0.5                    // stop integrating target_vel if stale [s]
+#define ARM_PRE_DELAY_S 0.5                           // wait before sending path command
+#define ARM_POST_DELAY_S 1.0                          // wait after path command before seeding
 
 // ============================================================
 // SECTION 2 – INCLUDES
@@ -426,6 +428,7 @@ private:
         STATE_POSE_FOLLOW = 1,
         STATE_STOP = 2,
         STATE_INIT = 3,
+        STATE_ARMING = 4,
     };
 
     // ============================================================
@@ -901,6 +904,8 @@ private:
             return;
         std::vector<double> zero_vel(joint_names_.size(), 0.0);
         publishToTopic(pub_joint_cmd_, tracked_positions_, zero_vel, 0.0);
+        streaming_time_ = 0.0;
+        is_active_ = true;
         RCLCPP_INFO(this->get_logger(), "Seed sent to joint_command (t=0)");
     }
 
@@ -908,8 +913,8 @@ private:
     void publishTrajectory(const std::vector<double> &pos,
                            const std::vector<double> &vel)
     {
-        double t_rel = (this->now() - t_start_).seconds();
-        publishToTopic(pub_joint_cmd_, pos, vel, t_rel);
+        publishToTopic(pub_joint_cmd_, pos, vel, streaming_time_);
+        streaming_time_ += 1.0 / rate_hz_;
     }
 
     // ============================================================
@@ -1009,6 +1014,10 @@ private:
             // base frame before applying reference-state damping.
             xdot_des.tail<3>() = des_rot * latest_target_vel_.tail<3>();
         }
+        if (xdot_des.head<3>().norm() <= targetVelocityDeadband())
+            xdot_des.head<3>().setZero();
+        if (xdot_des.tail<3>().norm() <= targetVelocityDeadband())
+            xdot_des.tail<3>().setZero();
 
         const Eigen::Matrix<double, 6, 1> edot_ref = xdot_des - xdot_ref_;
 
@@ -1029,6 +1038,7 @@ private:
         const double f_norm = F_collision.head<3>().norm();
         if (collision_force_max_ > 0.0 && f_norm > collision_force_max_ && f_norm > 1e-9)
             F_collision.head<3>() *= collision_force_max_ / f_norm;
+        F_collision = filterCollisionWrench(F_collision, dt_safe);
 
         // --- Close-work safety projection: distance/normal from the collision
         //     node feed a blended velocity & goal-force suppression. ---
@@ -1131,6 +1141,50 @@ private:
         return true;
     }
 
+    double lowPassAlpha(double cutoff_hz, double dt) const
+    {
+        if (dt <= 0.0)
+            return 1.0;
+        return std::clamp(1.0 - std::exp(-2.0 * M_PI * cutoff_hz * dt), 0.0, 1.0);
+    }
+
+    double targetVelocityDeadband() const
+    {
+        return std::max(0.002, 0.01 * max_cart_linear_vel_);
+    }
+
+    double collisionForceAttackHz() const
+    {
+        const double tau = std::max(0.02, 0.2 * collision_wrench_timeout_sec_);
+        return 1.0 / tau;
+    }
+
+    double collisionForceReleaseHz() const
+    {
+        return std::max(1.0, 0.35 * collisionForceAttackHz());
+    }
+
+    Eigen::Matrix<double, 6, 1> filterCollisionWrench(
+        const Eigen::Matrix<double, 6, 1> &raw_wrench,
+        double dt)
+    {
+        if (dt <= 0.0 || dt > 1.0)
+        {
+            filtered_collision_wrench_ = raw_wrench;
+            return filtered_collision_wrench_;
+        }
+
+        const double cutoff_hz =
+            (raw_wrench.head<3>().norm() >= filtered_collision_wrench_.head<3>().norm())
+                ? collisionForceAttackHz()
+                : collisionForceReleaseHz();
+        const double alpha = lowPassAlpha(cutoff_hz, dt);
+        filtered_collision_wrench_ += alpha * (raw_wrench - filtered_collision_wrench_);
+        if (filtered_collision_wrench_.norm() < 1e-6 && raw_wrench.norm() < 1e-6)
+            filtered_collision_wrench_.setZero();
+        return filtered_collision_wrench_;
+    }
+
     // Reset the virtual integrator state when entering IDLE/STOP or starting
     // INIT/POSE_FOLLOW.
     void resetVirtualState()
@@ -1143,6 +1197,7 @@ private:
         have_velocity_filter_update_ = false;
         t_last_velocity_filter_update_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         latest_collision_wrench_.setZero();
+        filtered_collision_wrench_.setZero();
         t_last_collision_wrench_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         latest_collision_distance_ = std::numeric_limits<double>::infinity();
         latest_collision_normal_.setZero();
@@ -1179,7 +1234,7 @@ private:
         }
     }
 
-    // Streaming desired pose — triggers IDLE → POSE_FOLLOW automatically
+    // Streaming desired pose — triggers IDLE → ARMING → POSE_FOLLOW
     void desiredPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
     {
         desired_pose_ = *msg;
@@ -1190,19 +1245,14 @@ private:
         {
             if (initTrackedPositions())
             {
-                resetControlWindow();
-                initializeReferenceVelocityFromMeasuredState();
-                if (enable_seed_)
-                    seed();
-                state_ = STATE_POSE_FOLLOW;
-                RCLCPP_INFO(this->get_logger(), "STATE_IDLE → STATE_POSE_FOLLOW");
+                pending_state_ = STATE_POSE_FOLLOW;
+                state_ = STATE_ARMING;
+                RCLCPP_INFO(this->get_logger(), "Target received: STATE_IDLE → STATE_ARMING");
             }
         }
     }
 
-    // Streaming target velocity. Linear is base-frame, angular is body-frame
-    // (post-multiplied into the desired-pose quaternion). Integrated by the
-    // controller into desired_pose_ each tick while in STATE_POSE_FOLLOW.
+    // Streaming target velocity.
     void targetVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
     {
         latest_target_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
@@ -1210,7 +1260,8 @@ private:
         t_last_target_vel_cb_ = this->now();
 
         // Velocity-only entry: seed desired_pose_ from current EE and start tracking.
-        if (state_ == STATE_IDLE && latest_target_vel_.norm() > 0.0)
+        if (state_ == STATE_IDLE &&
+            latest_target_vel_.head<3>().norm() > targetVelocityDeadband())
         {
             Eigen::VectorXd q;
             Eigen::Vector3d ee_pos;
@@ -1231,13 +1282,9 @@ private:
 
             if (initTrackedPositions())
             {
-                resetControlWindow();
-                initializeReferenceVelocityFromMeasuredState();
-                if (enable_seed_)
-                    seed();
-                state_ = STATE_POSE_FOLLOW;
-                RCLCPP_INFO(this->get_logger(),
-                            "STATE_IDLE → STATE_POSE_FOLLOW (target_vel input)");
+                pending_state_ = STATE_POSE_FOLLOW;
+                state_ = STATE_ARMING;
+                RCLCPP_INFO(this->get_logger(), "Target velocity received: STATE_IDLE → STATE_ARMING");
             }
         }
     }
@@ -1289,28 +1336,29 @@ private:
                        std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
         state_ = STATE_IDLE;
+        is_active_ = false;
+        arm_trigger_sent_ = false;
         resetControlWindow();
         tracked_positions_.clear();
         tracked_velocities_.clear();
         is_init_done_ = false;
         res->success = true;
-        res->message = "Reset to STATE_IDLE";
-        RCLCPP_INFO(this->get_logger(), "/start → STATE_IDLE");
+        res->message = "Reset to STATE_IDLE and re-armed.";
+        RCLCPP_INFO(this->get_logger(), "/start → STATE_IDLE (ready to re-arm)");
     }
 
-    // /pose_following/stop → STATE_STOP (immediate, no more publishing)
+    // /pose_following/stop → STATE_STOP (immediate, zero velocity publishing)
     void stopCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
                       std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
         state_ = STATE_STOP;
         resetControlWindow();
         res->success = true;
-        res->message = "Stopped — STATE_STOP";
+        res->message = "Stopped — STATE_STOP (holding position)";
         RCLCPP_INFO(this->get_logger(), "/stop → STATE_STOP");
     }
 
-    // /pose_following/init_start → STATE_INIT
-    // Requires: init_pose set via /pose_following/init_pose, current state = IDLE
+    // /pose_following/init_start → STATE_IDLE → STATE_ARMING → STATE_INIT
     void initStartCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
                            std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
@@ -1333,34 +1381,38 @@ private:
             return;
         }
         is_init_done_ = false;
-        resetControlWindow();
-        initializeReferenceVelocityFromMeasuredState();
-        if (enable_seed_)
-            seed();
-        state_ = STATE_INIT;
+        pending_state_ = STATE_INIT;
+        state_ = STATE_ARMING;
         res->success = true;
-        res->message = "STATE_IDLE → STATE_INIT";
-        RCLCPP_INFO(this->get_logger(), "/init_start → STATE_INIT");
+        res->message = "STATE_IDLE → STATE_ARMING → STATE_INIT";
+        RCLCPP_INFO(this->get_logger(), "/init_start → STATE_ARMING");
     }
 
     // ============================================================
     // STATE HANDLERS
     // ============================================================
 
-    // IDLE — sync internal positions from real robot; no publishing
+    // IDLE — sync internal positions from real robot; publish if active
     void handleIdle()
     {
         if (last_state_ != state_)
         {
             last_state_ = state_;
             resetVirtualState();
-            RCLCPP_INFO(this->get_logger(), "STATE_IDLE: syncing joint state, no output.");
+            RCLCPP_INFO(this->get_logger(), "STATE_IDLE: syncing joint state.");
         }
         if (last_joint_state_)
+        {
             initTrackedPositions();
+            if (is_active_)
+            {
+                std::vector<double> zero_vel(joint_names_.size(), 0.0);
+                publishTrajectory(tracked_positions_, zero_vel);
+            }
+        }
     }
 
-    // STOP — zero velocity, sync from real robot; no publishing
+    // STOP — zero velocity, sync from real robot; publish if active
     void handleStop()
     {
         if (last_state_ != state_)
@@ -1368,10 +1420,57 @@ private:
             last_state_ = state_;
             resetVirtualState();
             RCLCPP_INFO(this->get_logger(),
-                        "STATE_STOP: velocity zeroed, no output. Call /start to resume.");
+                        "STATE_STOP: velocity zeroed. Still publishing current state.");
         }
         if (last_joint_state_)
+        {
             initTrackedPositions();
+            if (is_active_)
+            {
+                std::vector<double> zero_vel(joint_names_.size(), 0.0);
+                publishTrajectory(tracked_positions_, zero_vel);
+            }
+        }
+    }
+
+    // ARMING — robust sequence: Path Command (Arm Trigger) → Delay → Seed → Active
+    void handleArming()
+    {
+        if (last_state_ != state_)
+        {
+            last_state_ = state_;
+            t_arming_start_ = this->now();
+            arm_trigger_sent_ = false;
+            RCLCPP_INFO(this->get_logger(), "STATE_ARMING: sequence started (Pre-delay: %.1fs)", ARM_PRE_DELAY_S);
+        }
+
+        double elapsed = (this->now() - t_arming_start_).seconds();
+        
+        // Step 1: Send Path Command after pre-delay
+        if (!arm_trigger_sent_)
+        {
+            if (elapsed < ARM_PRE_DELAY_S) return;
+            if (initTrackedPositions())
+            {
+                publishArmInit();
+                arm_trigger_sent_ = true;
+                RCLCPP_INFO(this->get_logger(), "STATE_ARMING: Arm trigger sent (Post-delay: %.1fs)", ARM_POST_DELAY_S);
+            }
+            return;
+        }
+
+        // Step 2: Wait post-delay then send Seed and transition
+        if (elapsed < ARM_PRE_DELAY_S + ARM_POST_DELAY_S) return;
+
+        if (initTrackedPositions())
+        {
+            seed();
+            resetControlWindow();
+            initializeReferenceVelocityFromMeasuredState();
+            state_ = pending_state_;
+            RCLCPP_INFO(this->get_logger(), "STATE_ARMING → %s", 
+                        (state_ == STATE_INIT ? "STATE_INIT" : "STATE_POSE_FOLLOW"));
+        }
     }
 
     // INIT — move to init_pose_ using adaptive admittance + SR-inverse
@@ -1380,7 +1479,7 @@ private:
         if (last_state_ != state_)
         {
             last_state_ = state_;
-            initializeReferenceVelocityFromMeasuredState();
+            // initializeReferenceVelocityFromMeasuredState already called in handleArming
             RCLCPP_INFO(this->get_logger(), "STATE_INIT: moving to init pose...");
         }
 
@@ -1443,7 +1542,6 @@ private:
         {
             RCLCPP_WARN(this->get_logger(),
                         "[INIT] Joint velocity exceeded limit → STATE_STOP");
-            resetControlWindow();
             state_ = STATE_STOP;
             return;
         }
@@ -1454,8 +1552,8 @@ private:
             return;
         }
 
-        // Stateless overwrite: anchor every command to the measured joint state.
-        std::vector<double> prev_pos = tracked_positions_;
+        // Integrate: derive velocity consistently
+        const std::vector<double> prev_pos = tracked_positions_;
         const double dt_safe =
             (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
         for (size_t i = 0; i < tracked_positions_.size(); ++i)
@@ -1463,7 +1561,7 @@ private:
             tracked_positions_[i] =
                 q[static_cast<Eigen::Index>(i)] +
                 theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-            tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
+            tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
         }
 
         // Position safety — revert and hold on limit violation
@@ -1475,10 +1573,6 @@ private:
         }
 
         publishTrajectory(tracked_positions_, tracked_velocities_);
-
-        RCLCPP_DEBUG(this->get_logger(),
-                     "[INIT] err(%.4f,%.4f,%.4f)",
-                     dx, dy, dz);
     }
 
     // POSE_FOLLOW — track streaming desired_pose_ via adaptive admittance + SR-inverse
@@ -1487,7 +1581,7 @@ private:
         if (last_state_ != state_)
         {
             last_state_ = state_;
-            initializeReferenceVelocityFromMeasuredState();
+            // initializeReferenceVelocityFromMeasuredState already called in handleArming
             RCLCPP_INFO(this->get_logger(),
                         "STATE_POSE_FOLLOW: tracking /motomini/target_pose");
         }
@@ -1500,14 +1594,19 @@ private:
             return;
         }
 
-        // Pose timeout — go idle if input stalls
+        // Pose timeout — keep active but hold current position
         double dt_cb = (this->now() - t_last_pose_cb_).seconds();
         if (dt_cb > POSE_TIMEOUT_SEC)
         {
-            RCLCPP_WARN(this->get_logger(),
-                        "Pose input timeout (%.2f s > %.2f s) → STATE_IDLE", dt_cb, POSE_TIMEOUT_SEC);
-            resetControlWindow();
-            state_ = STATE_IDLE;
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "Pose input timeout (%.2f s > %.2f s) — holding position.", dt_cb, POSE_TIMEOUT_SEC);
+            
+            if (last_joint_state_)
+            {
+                initTrackedPositions();
+                std::vector<double> zero_vel(joint_names_.size(), 0.0);
+                publishTrajectory(tracked_positions_, zero_vel);
+            }
             return;
         }
 
@@ -1532,7 +1631,6 @@ private:
             (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
 
         // Integrate streaming target_vel into the desired pose.
-        // linear = base frame (added directly), angular = body frame (post-mul).
         const double dt_vel = (this->now() - t_last_target_vel_cb_).seconds();
         if (dt_vel < TARGET_VEL_TIMEOUT_SEC && latest_target_vel_.norm() > 0.0)
         {
@@ -1545,8 +1643,6 @@ private:
                 Eigen::AngleAxisd(latest_target_vel_(5) * dt_safe, Eigen::Vector3d::UnitZ());
             q_des = (q_des * delta).normalized();
 
-            // Persist the integrated target so the next pose-only callback
-            // doesn't snap the robot back to a stale absolute target.
             desired_pose_.pose.position.x = des_pos.x();
             desired_pose_.pose.position.y = des_pos.y();
             desired_pose_.pose.position.z = des_pos.z();
@@ -1554,23 +1650,18 @@ private:
             desired_pose_.pose.orientation.x = q_des.x();
             desired_pose_.pose.orientation.y = q_des.y();
             desired_pose_.pose.orientation.z = q_des.z();
-            t_last_pose_cb_ = this->now(); // velocity stream keeps follow alive
+            t_last_pose_cb_ = this->now(); 
         }
 
         Eigen::VectorXd theta_d;
         if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt_safe, theta_d))
             return;
 
-        RCLCPP_DEBUG(this->get_logger(),
-                     "[FOLLOW] e_p=(%.4f,%.4f,%.4f) e_o=(%.4f,%.4f,%.4f)",
-                     e_p_(0), e_p_(1), e_p_(2), e_o_(0), e_o_(1), e_o_(2));
-
         // Velocity safety
         if (!checkVelocityLimits(theta_d))
         {
             RCLCPP_WARN(this->get_logger(),
                         "[FOLLOW] Joint velocity exceeded limit → STATE_STOP");
-            resetControlWindow();
             state_ = STATE_STOP;
             return;
         }
@@ -1581,14 +1672,14 @@ private:
             return;
         }
 
-        // Integrate: stateless overwrite — always base on actual joint state
-        std::vector<double> prev_pos = tracked_positions_;
+        // Integrate: derive velocity consistently
+        const std::vector<double> prev_pos = tracked_positions_;
         for (size_t i = 0; i < tracked_positions_.size(); ++i)
         {
             tracked_positions_[i] =
                 q[static_cast<Eigen::Index>(i)] +
                 theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-            tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
+            tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
         }
 
         // Position safety — revert and hold on limit violation
@@ -1613,6 +1704,9 @@ private:
         {
         case STATE_IDLE:
             handleIdle();
+            break;
+        case STATE_ARMING:
+            handleArming();
             break;
         case STATE_INIT:
             handleInit();
@@ -1700,6 +1794,7 @@ private:
     Eigen::Vector3d latest_collision_normal_{Eigen::Vector3d::Zero()};
     rclcpp::Time t_last_collision_distance_cb_{0, 0, RCL_ROS_TIME};
     rclcpp::Time t_last_collision_normal_cb_{0, 0, RCL_ROS_TIME};
+    Eigen::Matrix<double, 6, 1> filtered_collision_wrench_{Eigen::Matrix<double, 6, 1>::Zero()};
 
     // --- Numerical θ̇ history for feedback_vel (J·θ̇) ---
     Eigen::VectorXd q_prev_;
@@ -1735,6 +1830,13 @@ private:
     sensor_msgs::msg::JointState::SharedPtr last_joint_state_;
     geometry_msgs::msg::PoseStamped desired_pose_;
     geometry_msgs::msg::PoseStamped init_pose_;
+
+    // --- Arming & Streaming ---
+    double streaming_time_{0.0};
+    rclcpp::Time t_arming_start_{0, 0, RCL_ROS_TIME};
+    bool arm_trigger_sent_{false};
+    State pending_state_{STATE_IDLE};
+    bool is_active_{false}; // True if we have ever started streaming since last /start
 };
 
 // ============================================================

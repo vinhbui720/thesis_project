@@ -36,6 +36,8 @@ constexpr double SAFETY_JOINT_PADDING_RAD = 5.0 * M_PI / 180.0;
 constexpr double POSITION_ERROR_THRESHOLD = 0.0005;
 constexpr double POSE_TIMEOUT_SEC = 3.0;
 constexpr double TARGET_VEL_TIMEOUT_SEC = 0.5;
+constexpr double ARM_PRE_DELAY_S = 0.5;
+constexpr double ARM_POST_DELAY_S = 1.0;
 
 const std::array<std::string, NUMBER_OF_JOINT> FALLBACK_JOINT_NAMES = {
     "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
@@ -558,14 +560,16 @@ void MotoMiniPlanningNode::seedStreamingCommand()
 
     std::vector<double> zero_vel(tracked_positions_.size(), 0.0);
     publishStreamPoint(pub_stream_joint_cmd_, tracked_positions_, zero_vel, 0.0);
+    streaming_time_ = 0.0;
+    is_active_ = true;
     RCLCPP_INFO(this->get_logger(), "Tracking seed sent to joint_command.");
 }
 
 void MotoMiniPlanningNode::publishStreamingTrajectory(const std::vector<double> &pos,
                                                       const std::vector<double> &vel)
 {
-    const double t_rel = (this->now() - t_start_).seconds();
-    publishStreamPoint(pub_stream_joint_cmd_, pos, vel, t_rel);
+    publishStreamPoint(pub_stream_joint_cmd_, pos, vel, streaming_time_);
+    streaming_time_ += 1.0 / std::max(1.0, rate_hz_);
 }
 
 void MotoMiniPlanningNode::sendTriggerIfReady(
@@ -628,6 +632,50 @@ bool MotoMiniPlanningNode::initializeReferenceVelocityFromMeasuredState()
     return true;
 }
 
+double MotoMiniPlanningNode::lowPassAlpha(double cutoff_hz, double dt) const
+{
+    if (dt <= 0.0)
+        return 1.0;
+    return std::clamp(1.0 - std::exp(-2.0 * M_PI * cutoff_hz * dt), 0.0, 1.0);
+}
+
+double MotoMiniPlanningNode::targetVelocityDeadband() const
+{
+    return std::max(0.002, 0.01 * max_cart_linear_vel_);
+}
+
+double MotoMiniPlanningNode::collisionForceAttackHz() const
+{
+    const double tau = std::max(0.02, 0.2 * collision_wrench_timeout_sec_);
+    return 1.0 / tau;
+}
+
+double MotoMiniPlanningNode::collisionForceReleaseHz() const
+{
+    return std::max(1.0, 0.35 * collisionForceAttackHz());
+}
+
+Eigen::Matrix<double, 6, 1> MotoMiniPlanningNode::filterCollisionWrench(
+    const Eigen::Matrix<double, 6, 1> &raw_wrench,
+    double dt)
+{
+    if (dt <= 0.0 || dt > 1.0)
+    {
+        filtered_collision_wrench_ = raw_wrench;
+        return filtered_collision_wrench_;
+    }
+
+    const double cutoff_hz =
+        (raw_wrench.head<3>().norm() >= filtered_collision_wrench_.head<3>().norm())
+            ? collisionForceAttackHz()
+            : collisionForceReleaseHz();
+    const double alpha = lowPassAlpha(cutoff_hz, dt);
+    filtered_collision_wrench_ += alpha * (raw_wrench - filtered_collision_wrench_);
+    if (filtered_collision_wrench_.norm() < 1e-6 && raw_wrench.norm() < 1e-6)
+        filtered_collision_wrench_.setZero();
+    return filtered_collision_wrench_;
+}
+
 void MotoMiniPlanningNode::resetVirtualState()
 {
     xdot_ref_.setZero();
@@ -638,6 +686,7 @@ void MotoMiniPlanningNode::resetVirtualState()
     have_velocity_filter_update_ = false;
     t_last_velocity_filter_update_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     latest_collision_wrench_.setZero();
+    filtered_collision_wrench_.setZero();
     t_last_collision_wrench_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
     latest_collision_distance_ = std::numeric_limits<double>::infinity();
     latest_collision_normal_.setZero();
@@ -652,18 +701,6 @@ void MotoMiniPlanningNode::resetControlWindow()
     e_o_.setZero();
     t_start_ = this->now();
     t_last_ = this->now();
-}
-
-void MotoMiniPlanningNode::ensureStreamingInitialized()
-{
-    if (!tracking_enabled_ || stream_arm_init_sent_)
-        return;
-
-    if (initTrackedPositions())
-    {
-        publishArmInit();
-        stream_arm_init_sent_ = true;
-    }
 }
 
 void MotoMiniPlanningNode::enterPoseFollowFromCurrentPose()
@@ -688,13 +725,10 @@ void MotoMiniPlanningNode::enterPoseFollowFromCurrentPose()
 
     if (initTrackedPositions())
     {
-        resetControlWindow();
-        initializeReferenceVelocityFromMeasuredState();
-        if (enable_seed_)
-            seedStreamingCommand();
-        tracking_state_ = TrackingStreamState::POSE_FOLLOW;
+        pending_tracking_state_ = TrackingStreamState::POSE_FOLLOW;
+        tracking_state_ = TrackingStreamState::ARMING;
         RCLCPP_INFO(this->get_logger(),
-                    "Tracking stream: IDLE -> POSE_FOLLOW from target velocity.");
+                    "Tracking stream: IDLE -> ARMING from target velocity.");
     }
 }
 
@@ -714,15 +748,16 @@ void MotoMiniPlanningNode::trackingControlCallback(const std_msgs::msg::Bool::Sh
 
         tracking_enabled_ = true;
         tracking_state_ = TrackingStreamState::IDLE;
-        last_tracking_state_ = TrackingStreamState::STOP;
-        stream_arm_init_sent_ = false;
+        last_tracking_state_ = TrackingStreamState::IDLE;
+        arm_trigger_sent_ = false;
+        pending_tracking_state_ = TrackingStreamState::IDLE;
+        is_active_ = false;
         is_init_done_ = false;
         has_desired_pose_ = false;
         has_init_pose_ = false;
         latest_target_vel_.setZero();
         t_last_target_vel_cb_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         resetControlWindow();
-        ensureStreamingInitialized();
 
         publishStatus("Mode: Tracking");
         RCLCPP_INFO(this->get_logger(),
@@ -736,6 +771,9 @@ void MotoMiniPlanningNode::trackingControlCallback(const std_msgs::msg::Bool::Sh
         tracking_enabled_ = false;
         tracking_state_ = TrackingStreamState::IDLE;
         last_tracking_state_ = TrackingStreamState::IDLE;
+        arm_trigger_sent_ = false;
+        pending_tracking_state_ = TrackingStreamState::IDLE;
+        is_active_ = false;
         tracked_positions_.clear();
         tracked_velocities_.clear();
         has_desired_pose_ = false;
@@ -769,13 +807,10 @@ void MotoMiniPlanningNode::desiredPoseCallback(
     {
         if (initTrackedPositions())
         {
-            resetControlWindow();
-            initializeReferenceVelocityFromMeasuredState();
-            if (enable_seed_)
-                seedStreamingCommand();
-            tracking_state_ = TrackingStreamState::POSE_FOLLOW;
+            pending_tracking_state_ = TrackingStreamState::POSE_FOLLOW;
+            tracking_state_ = TrackingStreamState::ARMING;
             RCLCPP_INFO(this->get_logger(),
-                        "Tracking stream: IDLE -> POSE_FOLLOW from /motomini/target_pose.");
+                        "Tracking stream: IDLE -> ARMING from /motomini/target_pose.");
         }
     }
 }
@@ -801,11 +836,10 @@ void MotoMiniPlanningNode::initPoseCallback(
          tracking_state_ == TrackingStreamState::STOP) &&
         initTrackedPositions())
     {
-        resetControlWindow();
-        initializeReferenceVelocityFromMeasuredState();
-        if (enable_seed_)
-            seedStreamingCommand();
-        tracking_state_ = TrackingStreamState::INIT;
+        pending_tracking_state_ = TrackingStreamState::INIT;
+        tracking_state_ = TrackingStreamState::ARMING;
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream: IDLE -> ARMING -> INIT.");
     }
 }
 
@@ -823,7 +857,7 @@ void MotoMiniPlanningNode::targetVelCallback(
     t_last_target_vel_cb_ = this->now();
 
     if (tracking_state_ == TrackingStreamState::IDLE &&
-        latest_target_vel_.norm() > 0.0)
+        latest_target_vel_.head<3>().norm() > targetVelocityDeadband())
     {
         enterPoseFollowFromCurrentPose();
     }
@@ -926,6 +960,10 @@ bool MotoMiniPlanningNode::computeControlStep(const Eigen::VectorXd &q,
         // reference velocity.
         xdot_des.tail<3>() = des_rot * latest_target_vel_.tail<3>();
     }
+    if (xdot_des.head<3>().norm() <= targetVelocityDeadband())
+        xdot_des.head<3>().setZero();
+    if (xdot_des.tail<3>().norm() <= targetVelocityDeadband())
+        xdot_des.tail<3>().setZero();
     const Eigen::Matrix<double, 6, 1> edot_ref = xdot_des - xdot_ref_;
 
     Eigen::Matrix<double, 6, 1> f_collision =
@@ -939,6 +977,7 @@ bool MotoMiniPlanningNode::computeControlStep(const Eigen::VectorXd &q,
     const double f_norm = f_collision.head<3>().norm();
     if (collision_force_max_ > 0.0 && f_norm > collision_force_max_ && f_norm > 1e-9)
         f_collision.head<3>() *= collision_force_max_ / f_norm;
+    f_collision = filterCollisionWrench(f_collision, dt_safe);
 
     const bool collision_constraint_active =
         ((this->now() - t_last_collision_distance_cb_).seconds() <
@@ -1004,11 +1043,18 @@ void MotoMiniPlanningNode::handleTrackingIdle()
         last_tracking_state_ = tracking_state_;
         resetVirtualState();
         RCLCPP_INFO(this->get_logger(),
-                    "Tracking stream IDLE: syncing joint state, no command output.");
+                    "Tracking stream IDLE: syncing joint state.");
     }
 
     if (last_joint_state_)
+    {
         initTrackedPositions();
+        if (is_active_)
+        {
+            std::vector<double> zero_vel(joint_names_.size(), 0.0);
+            publishStreamingTrajectory(tracked_positions_, zero_vel);
+        }
+    }
 }
 
 void MotoMiniPlanningNode::handleTrackingStop()
@@ -1018,11 +1064,62 @@ void MotoMiniPlanningNode::handleTrackingStop()
         last_tracking_state_ = tracking_state_;
         resetVirtualState();
         RCLCPP_INFO(this->get_logger(),
-                    "Tracking stream STOP: command output disabled.");
+                    "Tracking stream STOP: velocity zeroed. Still publishing current state.");
     }
 
     if (last_joint_state_)
+    {
         initTrackedPositions();
+        if (is_active_)
+        {
+            std::vector<double> zero_vel(joint_names_.size(), 0.0);
+            publishStreamingTrajectory(tracked_positions_, zero_vel);
+        }
+    }
+}
+
+void MotoMiniPlanningNode::handleTrackingArming()
+{
+    if (last_tracking_state_ != tracking_state_)
+    {
+        last_tracking_state_ = tracking_state_;
+        t_arming_start_ = this->now();
+        arm_trigger_sent_ = false;
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream ARMING: sequence started (Pre-delay: %.1fs)",
+                    ARM_PRE_DELAY_S);
+    }
+
+    const double elapsed = (this->now() - t_arming_start_).seconds();
+
+    if (!arm_trigger_sent_)
+    {
+        if (elapsed < ARM_PRE_DELAY_S)
+            return;
+        if (initTrackedPositions())
+        {
+            publishArmInit();
+            arm_trigger_sent_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                        "Tracking stream ARMING: arm trigger sent (Post-delay: %.1fs)",
+                        ARM_POST_DELAY_S);
+        }
+        return;
+    }
+
+    if (elapsed < ARM_PRE_DELAY_S + ARM_POST_DELAY_S)
+        return;
+
+    if (initTrackedPositions())
+    {
+        seedStreamingCommand();
+        resetControlWindow();
+        initializeReferenceVelocityFromMeasuredState();
+        tracking_state_ = pending_tracking_state_;
+        RCLCPP_INFO(this->get_logger(),
+                    "Tracking stream ARMING -> %s",
+                    tracking_state_ == TrackingStreamState::INIT ? "INIT" : "POSE_FOLLOW");
+    }
 }
 
 void MotoMiniPlanningNode::handleTrackingInit()
@@ -1030,7 +1127,6 @@ void MotoMiniPlanningNode::handleTrackingInit()
     if (last_tracking_state_ != tracking_state_)
     {
         last_tracking_state_ = tracking_state_;
-        initializeReferenceVelocityFromMeasuredState();
         RCLCPP_INFO(this->get_logger(),
                     "Tracking stream INIT: moving to /pose_following/init_pose.");
     }
@@ -1081,7 +1177,8 @@ void MotoMiniPlanningNode::handleTrackingInit()
 
     if (!checkVelocityLimits(theta_d))
     {
-        resetControlWindow();
+        RCLCPP_WARN(this->get_logger(),
+                    "[TRACKING INIT] Joint velocity exceeded limit -> STOP");
         tracking_state_ = TrackingStreamState::STOP;
         return;
     }
@@ -1092,7 +1189,7 @@ void MotoMiniPlanningNode::handleTrackingInit()
         return;
     }
 
-    std::vector<double> prev_pos(q.data(), q.data() + q.size());
+    const std::vector<double> prev_pos = tracked_positions_;
     const double dt_safe =
         (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
     for (size_t i = 0; i < tracked_positions_.size(); ++i)
@@ -1100,10 +1197,10 @@ void MotoMiniPlanningNode::handleTrackingInit()
         tracked_positions_[i] =
             q[static_cast<Eigen::Index>(i)] +
             theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-        tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
+        tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
     }
 
-    if (!checkPositionLimits(tracked_positions_, prev_pos))
+    if (!checkPositionLimits(tracked_positions_))
     {
         tracked_positions_ = prev_pos;
         std::fill(tracked_velocities_.begin(), tracked_velocities_.end(), 0.0);
@@ -1117,7 +1214,6 @@ void MotoMiniPlanningNode::handleTrackingPoseFollow()
     if (last_tracking_state_ != tracking_state_)
     {
         last_tracking_state_ = tracking_state_;
-        initializeReferenceVelocityFromMeasuredState();
         RCLCPP_INFO(this->get_logger(),
                     "Tracking stream POSE_FOLLOW: tracking /motomini/target_pose.");
     }
@@ -1132,11 +1228,15 @@ void MotoMiniPlanningNode::handleTrackingPoseFollow()
     const double pose_age = (this->now() - t_last_pose_cb_).seconds();
     if (pose_age > POSE_TIMEOUT_SEC)
     {
-        RCLCPP_WARN(this->get_logger(),
-                    "Tracking pose input timeout %.2f s. POSE_FOLLOW -> IDLE.",
-                    pose_age);
-        resetControlWindow();
-        tracking_state_ = TrackingStreamState::IDLE;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "Tracking pose input timeout %.2f s -- holding position.",
+                             pose_age);
+        if (last_joint_state_)
+        {
+            initTrackedPositions();
+            std::vector<double> zero_vel(joint_names_.size(), 0.0);
+            publishStreamingTrajectory(tracked_positions_, zero_vel);
+        }
         return;
     }
 
@@ -1182,7 +1282,8 @@ void MotoMiniPlanningNode::handleTrackingPoseFollow()
 
     if (!checkVelocityLimits(theta_d))
     {
-        resetControlWindow();
+        RCLCPP_WARN(this->get_logger(),
+                    "[TRACKING FOLLOW] Joint velocity exceeded limit -> STOP");
         tracking_state_ = TrackingStreamState::STOP;
         return;
     }
@@ -1193,16 +1294,16 @@ void MotoMiniPlanningNode::handleTrackingPoseFollow()
         return;
     }
 
-    std::vector<double> prev_pos(q.data(), q.data() + q.size());
+    const std::vector<double> prev_pos = tracked_positions_;
     for (size_t i = 0; i < tracked_positions_.size(); ++i)
     {
         tracked_positions_[i] =
             q[static_cast<Eigen::Index>(i)] +
             theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-        tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
+        tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
     }
 
-    if (!checkPositionLimits(tracked_positions_, prev_pos))
+    if (!checkPositionLimits(tracked_positions_))
     {
         tracked_positions_ = prev_pos;
         std::fill(tracked_velocities_.begin(), tracked_velocities_.end(), 0.0);
@@ -1218,11 +1319,13 @@ void MotoMiniPlanningNode::feedbackTimerCallback()
     if (!tracking_enabled_)
         return;
 
-    ensureStreamingInitialized();
     switch (tracking_state_)
     {
     case TrackingStreamState::IDLE:
         handleTrackingIdle();
+        break;
+    case TrackingStreamState::ARMING:
+        handleTrackingArming();
         break;
     case TrackingStreamState::INIT:
         handleTrackingInit();

@@ -19,8 +19,9 @@ Features:
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch_ros.actions import Node
-from launch.substitutions import LaunchConfiguration, FindPackageShare
+from launch.substitutions import LaunchConfiguration, FindExecutable, FindPackageShare, Command
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.parameter_descriptions import ParameterValue
 import os
 
 
@@ -64,6 +65,30 @@ def generate_launch_description():
         }.items()
     )
 
+    robot_description_content = Command(
+        [
+            FindExecutable(name='xacro'),
+            ' ',
+            os.path.join(pkg_share, 'urdf', 'motomini.xacro'),
+        ]
+    )
+    robot_description = {
+        'robot_description': ParameterValue(robot_description_content, value_type=str)
+    }
+
+    robot_description_semantic_content = Command(
+        [
+            FindExecutable(name='cat'),
+            ' ',
+            os.path.join(pkg_share, 'config', 'motomini.srdf'),
+        ]
+    )
+    robot_description_semantic = {
+        'robot_description_semantic': ParameterValue(
+            robot_description_semantic_content, value_type=str)
+    }
+    collision_wrench_config = os.path.join(pkg_share, 'config', 'collision_wrench.yaml')
+
     # Enhanced Debug Node
     enhanced_debug = Node(
         package='robot_planning',
@@ -93,6 +118,9 @@ def generate_launch_description():
         name='online_collision_debugger',
         output='screen',
         parameters=[
+            robot_description,
+            robot_description_semantic,
+            collision_wrench_config,
             {
                 'collision_threshold': LaunchConfiguration('collision_threshold'),
             }

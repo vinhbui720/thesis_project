@@ -172,13 +172,13 @@ private:
         POSE_FOLLOW = 1,
         STOP = 2,
         INIT = 3,
+        ARMING = 4,
     };
 
     // ---- Feedback-stream mode ----
     bool tracking_enabled_{false};
     TrackingStreamState tracking_state_{TrackingStreamState::IDLE};
     TrackingStreamState last_tracking_state_{TrackingStreamState::IDLE};
-    bool stream_arm_init_sent_{false};
     bool has_desired_pose_{false};
     bool has_init_pose_{false};
     bool is_init_done_{false};
@@ -248,6 +248,12 @@ private:
     Eigen::Vector3d latest_collision_normal_{Eigen::Vector3d::Zero()};
     rclcpp::Time t_last_collision_distance_cb_{0, 0, RCL_ROS_TIME};
     rclcpp::Time t_last_collision_normal_cb_{0, 0, RCL_ROS_TIME};
+    Eigen::Matrix<double, 6, 1> filtered_collision_wrench_{Eigen::Matrix<double, 6, 1>::Zero()};
+    double streaming_time_{0.0};
+    rclcpp::Time t_arming_start_{0, 0, RCL_ROS_TIME};
+    bool arm_trigger_sent_{false};
+    TrackingStreamState pending_tracking_state_{TrackingStreamState::IDLE};
+    bool is_active_{false};
 
     // Private helpers
     bool initializeEnvironment();
@@ -271,6 +277,13 @@ private:
                                   Eigen::VectorXd &q_prev,
                                   rclcpp::Time &t_prev_q,
                                   bool &have_q_prev);
+    double lowPassAlpha(double cutoff_hz, double dt) const;
+    double targetVelocityDeadband() const;
+    double collisionForceAttackHz() const;
+    double collisionForceReleaseHz() const;
+    Eigen::Matrix<double, 6, 1> filterCollisionWrench(
+        const Eigen::Matrix<double, 6, 1> &raw_wrench,
+        double dt);
     bool initializeReferenceVelocityFromMeasuredState();
     bool initTrackedPositions();
     bool getEEPose(const Eigen::VectorXd &q, Eigen::Vector3d &pos, Eigen::Matrix3d &rot) const;
@@ -297,7 +310,6 @@ private:
                                     const std::vector<double> &vel);
     void resetVirtualState();
     void resetControlWindow();
-    void ensureStreamingInitialized();
     void enterPoseFollowFromCurrentPose();
     void requestTrajectoryStreamerStart();
     void requestTrajectoryStreamerStop();
@@ -305,6 +317,7 @@ private:
                             const char *service_name);
     void handleTrackingIdle();
     void handleTrackingStop();
+    void handleTrackingArming();
     void handleTrackingInit();
     void handleTrackingPoseFollow();
 

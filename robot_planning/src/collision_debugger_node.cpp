@@ -8,6 +8,7 @@
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <string>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -145,6 +146,9 @@ public:
         joint_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10,
             std::bind(&OnlineCollisionDebugger::jointStateCallback, this, std::placeholders::_1));
+        target_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "/motomini/target_vel", 10,
+            std::bind(&OnlineCollisionDebugger::targetVelCallback, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(),
                     "Online Collision Debugger started. threshold=%.3f m, influence=%.3f m, safe=%.3f m, "
@@ -185,6 +189,13 @@ private:
         return v * (max_norm / n);
     }
 
+    static double lowPassAlpha(double cutoff_hz, double dt)
+    {
+        if (dt <= 0.0)
+            return 1.0;
+        return std::clamp(1.0 - std::exp(-2.0 * M_PI * cutoff_hz * dt), 0.0, 1.0);
+    }
+
     std::string classifyZone(double d) const
     {
         if (d <= collision_stop_distance_)
@@ -203,6 +214,136 @@ private:
         const double span =
             std::max(1e-6, collision_guard_distance_ - collision_task_distance_);
         return 1.0 - std::clamp((d - collision_task_distance_) / span, 0.0, 1.0);
+    }
+
+    double targetVelocityTimeout() const
+    {
+        return std::max(0.05, 0.75 * collision_influence_distance_);
+    }
+
+    double tangentialVelocityDeadband() const
+    {
+        const double span = std::max(1e-4, collision_guard_distance_ - collision_task_distance_);
+        return std::max(0.002, 0.2 * span);
+    }
+
+    double tangentialProjectionEpsilon() const
+    {
+        const double span = std::max(1e-6, collision_guard_distance_ - collision_task_distance_);
+        return std::max(1e-6, 0.05 * span);
+    }
+
+    double tangentialSpeedScale() const
+    {
+        const double span = std::max(1e-4, collision_guard_distance_ - collision_task_distance_);
+        return std::max(0.01, span);
+    }
+
+    double tangentialForceLimit() const
+    {
+        return std::max(0.0, 0.35 * collision_force_max_total_);
+    }
+
+    double tangentialForceGain() const
+    {
+        return tangentialForceLimit();
+    }
+
+    double collisionForceAttackHz() const
+    {
+        const double tau = std::max(0.02, 0.25 * std::max(1e-3, collision_influence_distance_));
+        return 1.0 / tau;
+    }
+
+    double collisionForceReleaseHz() const
+    {
+        return std::max(1.0, 0.35 * collisionForceAttackHz());
+    }
+
+    Eigen::Vector3d fallbackTangent(const Eigen::Vector3d &n_away) const
+    {
+        Eigen::Vector3d tangent = n_away.cross(Eigen::Vector3d::UnitZ());
+        if (!tangent.allFinite() || tangent.norm() < tangentialProjectionEpsilon())
+            tangent = n_away.cross(Eigen::Vector3d::UnitX());
+        if (!tangent.allFinite() || tangent.norm() < tangentialProjectionEpsilon())
+            tangent = Eigen::Vector3d::UnitY();
+        return tangent.normalized();
+    }
+
+    Eigen::Vector3d computeTangentialForce(double distance,
+                                           const Eigen::Vector3d &n_away) 
+    {
+        const double target_age = (this->now() - t_last_target_vel_cb_).seconds();
+        const double v_deadband = tangentialVelocityDeadband();
+        if (target_age > targetVelocityTimeout())
+            return Eigen::Vector3d::Zero();
+
+        Eigen::Vector3d v_goal = latest_target_vel_linear_;
+        if (!v_goal.allFinite() || v_goal.norm() <= v_deadband)
+            return Eigen::Vector3d::Zero();
+
+        Eigen::Vector3d n = n_away;
+        if (!n.allFinite() || n.norm() < 1e-9)
+            return Eigen::Vector3d::Zero();
+        n.normalize();
+
+        const double v_into = v_goal.dot(n);
+        if (v_into >= -v_deadband)
+            return Eigen::Vector3d::Zero();
+
+        const Eigen::Vector3d v_proj = v_goal - v_into * n;
+        Eigen::Vector3d tangent = Eigen::Vector3d::Zero();
+        if (v_proj.norm() >= tangentialProjectionEpsilon())
+            tangent = v_proj.normalized();
+        else if (last_tangent_dir_.allFinite() && last_tangent_dir_.norm() >= 1e-9)
+            tangent = last_tangent_dir_.normalized();
+        else
+            tangent = fallbackTangent(n);
+
+        if (last_tangent_dir_.allFinite() &&
+            last_tangent_dir_.norm() >= 1e-9 &&
+            tangent.dot(last_tangent_dir_) < 0.0)
+            tangent = -tangent;
+        last_tangent_dir_ = tangent;
+
+        const double gamma = computeProjectionGamma(distance);
+        if (gamma <= 0.0)
+            return Eigen::Vector3d::Zero();
+
+        const double approach_ratio =
+            std::clamp((-v_into - v_deadband) / tangentialSpeedScale(),
+                       0.0, 1.0);
+        const double tangential_mag =
+            tangentialForceGain() * gamma * gamma * approach_ratio;
+        return clampNorm(tangential_mag * tangent, tangentialForceLimit());
+    }
+
+    Eigen::Vector3d smoothPublishedForce(const Eigen::Vector3d &raw_force)
+    {
+        const rclcpp::Time now = this->now();
+        double dt = 0.0;
+        if (have_force_filter_state_)
+            dt = (now - t_last_force_filter_update_).seconds();
+        t_last_force_filter_update_ = now;
+
+        if (!have_force_filter_state_ || dt <= 0.0 || dt > 1.0)
+        {
+            filtered_total_force_ = raw_force;
+            have_force_filter_state_ = true;
+            return filtered_total_force_;
+        }
+
+        const double cutoff_hz =
+            (raw_force.norm() >= filtered_total_force_.norm())
+                ? collisionForceAttackHz()
+                : collisionForceReleaseHz();
+        const double alpha = lowPassAlpha(cutoff_hz, dt);
+        filtered_total_force_ += alpha * (raw_force - filtered_total_force_);
+
+        if (filtered_total_force_.norm() < 1e-6 && raw_force.norm() < 1e-6)
+            filtered_total_force_.setZero();
+
+        return filtered_total_force_;
     }
 
     Eigen::Vector3d computeCollisionForce(double distance,
@@ -459,6 +600,13 @@ private:
         collision_wrench_pub_->publish(msg);
     }
 
+    void targetVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    {
+        latest_target_vel_linear_ <<
+            msg->linear.x, msg->linear.y, msg->linear.z;
+        t_last_target_vel_cb_ = this->now();
+    }
+
     // Publish closest-contact constraint data so the controller can run
     // velocity projection and goal-force suppression. When no contact is
     // active, advertise a large distance and zero normal so the controller
@@ -676,7 +824,13 @@ private:
             }
         }
 
+        Eigen::Vector3d tangential_force = Eigen::Vector3d::Zero();
+        if (has_closest)
+            tangential_force = computeTangentialForce(closest_distance, closest_n_away);
+
+        total_force += tangential_force;
         total_force = clampNorm(total_force, collision_force_max_total_);
+        total_force = smoothPublishedForce(total_force);
 
         const std::string zone =
             has_closest ? classifyZone(closest_distance) : std::string("FREE");
@@ -689,7 +843,8 @@ private:
                      << " closest_d=" << closest_distance
                      << " zone=" << zone
                      << " gamma=" << gamma_dbg
-                     << " n_away=" << vecToString(closest_n_away);
+                     << " n_away=" << vecToString(closest_n_away)
+                     << " f_tan=" << vecToString(tangential_force);
 
         publishCollisionWrench(total_force, total_torque);
         publishCollisionConstraint(has_closest, closest_distance, closest_n_away);
@@ -715,6 +870,7 @@ private:
     }
 
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr target_vel_sub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr contact_debug_pub_;
     rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr collision_wrench_pub_;
@@ -751,6 +907,12 @@ private:
     double force_arrow_min_length_;
     double force_arrow_max_length_;
     double force_arrow_length_gain_;
+    Eigen::Vector3d latest_target_vel_linear_{Eigen::Vector3d::Zero()};
+    rclcpp::Time t_last_target_vel_cb_{0, 0, RCL_ROS_TIME};
+    Eigen::Vector3d last_tangent_dir_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d filtered_total_force_{Eigen::Vector3d::Zero()};
+    rclcpp::Time t_last_force_filter_update_{0, 0, RCL_ROS_TIME};
+    bool have_force_filter_state_{false};
 };
 
 int main(int argc, char **argv)
