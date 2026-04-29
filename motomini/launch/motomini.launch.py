@@ -67,7 +67,7 @@ def generate_launch_description():
         Node(
             package="robot_planning",
             executable="motomini_planning_node",
-            parameters=[*common_params, planning_params_yaml, {
+            parameters=[*common_params, planning_params_yaml, feedback_controller_yaml, {
                 "manipulator_group": "manipulator",
                 "base_link": "world",
                 "ee_link": concrete_ee_link,

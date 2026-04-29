@@ -83,6 +83,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("collision_constraint_timeout_sec", 0.2);
     this->declare_parameter<double>("collision_force_scale", 1.0);
     this->declare_parameter<double>("collision_force_max", 5.0);
+    this->declare_parameter<bool>("real_robot", true);
 
     rate_hz_ = std::max(1.0, this->get_parameter("rate_hz").as_double());
     w0_ = this->get_parameter("w0").as_double();
@@ -123,6 +124,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         this->get_parameter("collision_force_scale").as_double();
     collision_force_max_ =
         this->get_parameter("collision_force_max").as_double();
+    real_robot_ = this->get_parameter("real_robot").as_bool();
 
     const auto &overrides =
         this->get_node_parameters_interface()->get_parameter_overrides();
@@ -507,6 +509,7 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
             else if (n == "ompl_rrt_range_2") cfg.ompl_rrt_range_2 = p.as_double();
             else if (n == "planning_chunk_size") { new_chunk_size = static_cast<int>(p.as_int()); chunk_changed = true; }
             else if (n == "planning_parallel_chunks") { new_parallel = static_cast<int>(p.as_int()); chunk_changed = true; }
+            else if (n == "real_robot") { real_robot_ = p.as_bool(); }
             else if (n == "ee_link" || n == "tool_param")
             {
                 ee_link_ = p.as_string();

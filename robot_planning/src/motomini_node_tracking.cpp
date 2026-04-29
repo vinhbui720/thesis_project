@@ -226,7 +226,43 @@ void MotoMiniPlanningNode::publishFeedback()
 
     const rclcpp::Time now = this->now();
     Eigen::VectorXd qdot = Eigen::VectorXd::Zero(q.size());
-    if (have_q_prev_ && q_prev_.size() == q.size())
+    bool velocity_obtained = false;
+
+    if (real_robot_)
+    {
+        if (last_joint_state_ &&
+            last_joint_state_->velocity.size() >= last_joint_state_->name.size())
+        {
+            Eigen::VectorXd qdot_driver(static_cast<Eigen::Index>(joint_names_.size()));
+            bool valid = true;
+            for (size_t i = 0; i < joint_names_.size(); ++i)
+            {
+                auto it = std::find(last_joint_state_->name.begin(),
+                                    last_joint_state_->name.end(),
+                                    joint_names_[i]);
+                if (it == last_joint_state_->name.end())
+                {
+                    valid = false;
+                    break;
+                }
+                const size_t idx =
+                    static_cast<size_t>(std::distance(last_joint_state_->name.begin(), it));
+                if (idx >= last_joint_state_->velocity.size())
+                {
+                    valid = false;
+                    break;
+                }
+                qdot_driver[static_cast<Eigen::Index>(i)] = last_joint_state_->velocity[idx];
+            }
+            if (valid && qdot_driver.allFinite())
+            {
+                qdot = qdot_driver;
+                velocity_obtained = true;
+            }
+        }
+    }
+
+    if (!velocity_obtained && have_q_prev_ && q_prev_.size() == q.size())
     {
         const double dt = (now - t_prev_q_).seconds();
         if (dt > 1e-6)
@@ -679,39 +715,43 @@ bool MotoMiniPlanningNode::computeControlStep(const Eigen::VectorXd &q,
     const double d_ori = 2.0 * zeta_ori_ * std::sqrt(std::max(1e-12, m_ori * k_ori));
 
     Eigen::VectorXd qdot = Eigen::VectorXd::Zero(q.size());
-    bool used_driver_velocity = false;
-    if (last_joint_state_ &&
-        last_joint_state_->velocity.size() >= last_joint_state_->name.size())
+    bool velocity_obtained = false;
+
+    if (real_robot_)
     {
-        Eigen::VectorXd qdot_driver(static_cast<Eigen::Index>(joint_names_.size()));
-        bool valid = true;
-        for (size_t i = 0; i < joint_names_.size(); ++i)
+        if (last_joint_state_ &&
+            last_joint_state_->velocity.size() >= last_joint_state_->name.size())
         {
-            auto it = std::find(last_joint_state_->name.begin(),
-                                last_joint_state_->name.end(),
-                                joint_names_[i]);
-            if (it == last_joint_state_->name.end())
+            Eigen::VectorXd qdot_driver(static_cast<Eigen::Index>(joint_names_.size()));
+            bool valid = true;
+            for (size_t i = 0; i < joint_names_.size(); ++i)
             {
-                valid = false;
-                break;
+                auto it = std::find(last_joint_state_->name.begin(),
+                                    last_joint_state_->name.end(),
+                                    joint_names_[i]);
+                if (it == last_joint_state_->name.end())
+                {
+                    valid = false;
+                    break;
+                }
+                const size_t idx =
+                    static_cast<size_t>(std::distance(last_joint_state_->name.begin(), it));
+                if (idx >= last_joint_state_->velocity.size())
+                {
+                    valid = false;
+                    break;
+                }
+                qdot_driver[static_cast<Eigen::Index>(i)] = last_joint_state_->velocity[idx];
             }
-            const size_t idx =
-                static_cast<size_t>(std::distance(last_joint_state_->name.begin(), it));
-            if (idx >= last_joint_state_->velocity.size())
+            if (valid && qdot_driver.allFinite())
             {
-                valid = false;
-                break;
+                qdot = qdot_driver;
+                velocity_obtained = true;
             }
-            qdot_driver[static_cast<Eigen::Index>(i)] = last_joint_state_->velocity[idx];
-        }
-        if (valid && qdot_driver.allFinite())
-        {
-            qdot = qdot_driver;
-            used_driver_velocity = true;
         }
     }
 
-    if (!used_driver_velocity && have_q_prev_ctrl_ && q_prev_ctrl_.size() == q.size())
+    if (!velocity_obtained && have_q_prev_ctrl_ && q_prev_ctrl_.size() == q.size())
     {
         const double dt_q = (this->now() - t_prev_q_ctrl_).seconds();
         if (dt_q > 1e-6)
