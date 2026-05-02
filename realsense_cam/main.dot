@@ -1,0 +1,57 @@
+digraph main_flowchart {
+    rankdir=TB;
+    node [shape=rectangle, style=filled, fontname="Helvetica", fontsize=12];
+
+    // Start/End
+    start  [label="START", shape=oval, fillcolor="#4CAF50", fontcolor=white];
+    end    [label="END", shape=oval, fillcolor="#F44336", fontcolor=white];
+
+    // Init
+    init_rclpy  [label="rclpy.init()", fillcolor="#BBDEFB"];
+    parse_args  [label="Parse Arguments\n(--realcam, --bag, --tuning)", fillcolor="#BBDEFB"];
+
+    // Source selection
+    check_realcam [label="--realcam?", shape=diamond, fillcolor="#FFF9C4"];
+    init_realcam  [label="Init SourceRealCam\nCapture initial background frame", fillcolor="#C8E6C9"];
+    check_bg_ok   [label="bg_data OK\n& 'color' in bg_data?", shape=diamond, fillcolor="#FFF9C4"];
+    set_initial_bg [label="initial_bg = bg_data['color']", fillcolor="#C8E6C9"];
+    warn_bg        [label="WARN: Failed to capture\ninitial background frame", fillcolor="#FFCCBC"];
+    init_bag       [label="Init SourceBag\n(from args.bag or CONFIG)", fillcolor="#C8E6C9"];
+
+    // Shared setup
+    get_intr    [label="Extract Camera Intrinsics\n(fx, fy, cx, cy, w, h)", fillcolor="#BBDEFB"];
+    init_icp    [label="Init PoseInitICPAsync\n+ ROS2Publisher", fillcolor="#BBDEFB"];
+
+    // Tuning branch
+    check_tuning [label="--tuning?", shape=diamond, fillcolor="#FFF9C4"];
+    launch_tuner [label="Launch TuningGUI\n(blocks until done)", fillcolor="#E1BEE7"];
+    shutdown_tuning [label="rclpy.shutdown()\nexit(0)", fillcolor="#FFCCBC"];
+
+    // Normal pipeline
+    start_executor  [label="Start MultiThreadedExecutor\n(spin ROS2Publisher in thread)", fillcolor="#BBDEFB"];
+    build_pipeline  [label="Build Pipeline:\nSourceXxx → Preprocess → Background\n→ Depth → Fusion → Detect\n→ TrackerKalman → PoseInitICPAsync\n→ PoseFusion → ROS2Publisher → Visualize", fillcolor="#B3E5FC"];
+    run_pipeline    [label="pipeline.run()\n(blocking loop)", fillcolor="#B3E5FC"];
+    shutdown_normal [label="executor.shutdown()\nrclpy.shutdown()", fillcolor="#FFCCBC"];
+
+    // Edges
+    start -> init_rclpy -> parse_args -> check_realcam;
+
+    check_realcam -> init_realcam  [label="Yes"];
+    init_realcam  -> check_bg_ok;
+    check_bg_ok   -> set_initial_bg [label="Yes"];
+    check_bg_ok   -> warn_bg        [label="No"];
+
+    check_realcam -> init_bag [label="No"];
+
+    set_initial_bg -> get_intr;
+    warn_bg        -> get_intr;
+    init_bag       -> get_intr;
+
+    get_intr -> init_icp -> check_tuning;
+
+    check_tuning -> launch_tuner    [label="Yes"];
+    launch_tuner -> shutdown_tuning -> end;
+
+    check_tuning -> start_executor  [label="No"];
+    start_executor -> build_pipeline -> run_pipeline -> shutdown_normal -> end;
+}

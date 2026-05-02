@@ -70,7 +70,7 @@
 #define JOINT_4_R_VEL_LIMIT_RADSEC (M_PI * 10.0 / 3.0)
 #define JOINT_5_B_VEL_LIMIT_RADSEC (M_PI * 10.0 / 3.0)
 #define JOINT_6_T_VEL_LIMIT_RADSEC (M_PI * 10.0 / 3.0)
-#define SAFETY_VELOCITY_ALPHA 0.65 // fraction of hardware limit to use
+#define SAFETY_VELOCITY_ALPHA 0.8 // fraction of hardware limit to use
 
 // --- Legacy PD Parameters (accepted for backward-compatible YAML files) ---
 #define DEFAULT_LEGACY_KP_MAX 3.5
@@ -614,7 +614,10 @@ private:
         qdot_out = Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_names_.size()));
 
         bool velocity_valid = false;
-        if (last_joint_state_ &&
+        // real_robot=true  → try joint_state hardware velocity first (falls back if invalid)
+        // real_robot=false → always use pose-differentiation; hardware vel is ignored
+        if (real_robot_ &&
+            last_joint_state_ &&
             last_joint_state_->velocity.size() >= joint_names_.size())
         {
             Eigen::VectorXd qdot_driver(static_cast<Eigen::Index>(joint_names_.size()));
@@ -651,8 +654,8 @@ private:
             if (velocity_valid && qdot_driver.allFinite())
             {
                 qdot_out = qdot_driver;
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                     "SUCCESS: Using TRUE hardware velocity from MotoMini!");
+                // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                //                      "[VEL] real_robot=true → using hardware joint_state velocity.");
             }
         }
 
@@ -660,8 +663,12 @@ private:
         const double dt_prev = have_q_prev ? (now - t_prev_q).seconds() : dt_hint;
         if (!velocity_valid)
         {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "WARNING: Hardware velocity missing! Falling back to calculated lag-velocity.");
+            if (real_robot_)
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "[VEL] real_robot=true but hardware velocity invalid — falling back to pose diff.");
+            else
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "[VEL] real_robot=false → using pose-differentiation velocity.");
             if (have_q_prev && q_prev.size() == q.size() && dt_prev > 1e-6)
                 qdot_out = (q - q_prev) / dt_prev;
             else
@@ -674,8 +681,9 @@ private:
 
         const double filter_dt =
             (dt_prev > 1e-6 && dt_prev < 1.0) ? dt_prev : dt_hint;
-        if (real_robot_)
-            qdot_out = filterJointVelocity(qdot_out, filter_dt);
+        // Always filter: pose-diff velocity (real_robot=false) is the noisiest signal
+        // and needs the low-pass filter even more than hardware velocity does.
+        qdot_out = filterJointVelocity(qdot_out, filter_dt);
 
         return qdot_out.allFinite();
     }
@@ -753,7 +761,7 @@ private:
     // SAFETY CHECKS
     // ============================================================
 
-    bool checkVelocityLimits(const Eigen::VectorXd &theta_d) const
+    double clampJointVelocityLimits(Eigen::VectorXd &theta_d)
     {
         static const double lim[NUMBER_OF_JOINT] = {
             JOINT_1_S_VEL_LIMIT_RADSEC * SAFETY_VELOCITY_ALPHA,
@@ -763,17 +771,31 @@ private:
             JOINT_5_B_VEL_LIMIT_RADSEC * SAFETY_VELOCITY_ALPHA,
             JOINT_6_T_VEL_LIMIT_RADSEC * SAFETY_VELOCITY_ALPHA,
         };
-        for (int i = 0; i < NUMBER_OF_JOINT; ++i)
+
+        double scale = 1.0;
+        const int n = std::min<int>(NUMBER_OF_JOINT, theta_d.size());
+
+        for (int i = 0; i < n; ++i)
         {
-            if (std::abs(theta_d[i]) > lim[i])
+            const double a = std::abs(theta_d[i]);
+            if (a > lim[i] && a > 1e-12)
             {
-                RCLCPP_WARN(this->get_logger(),
-                            "Joint %d velocity %.4f rad/s exceeds limit %.4f rad/s",
-                            i, theta_d[i], lim[i]);
-                return false;
+                scale = std::min(scale, lim[i] / a);
             }
         }
-        return true;
+
+        if (scale < 1.0)
+        {
+            theta_d *= scale;
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(),
+                *this->get_clock(),
+                1000,
+                "Joint velocity clamped with scale %.3f. Continuing tracking.",
+                scale);
+        }
+
+        return scale;
     }
 
     bool checkCartesianVelocitySafety(const Eigen::Matrix<double, 6, 1> &xdot_actual)
@@ -1117,6 +1139,22 @@ private:
 
         // --- SR-inverse Jacobian → joint velocity command ---
         theta_d = calcSrInverse(J, w, w0_, k0_) * xdot_ref_;
+
+        // Clamp joint velocity instead of stopping the controller.
+        const double joint_scale = clampJointVelocityLimits(theta_d);
+
+        // Anti-windup for the Cartesian velocity integrator.
+        // After clamping theta_d, update xdot_ref_ to the Cartesian velocity
+        // that the clamped joint command can actually produce.
+        if (joint_scale < 1.0)
+        {
+            const Eigen::VectorXd xdot_limited = J * theta_d;
+            if (xdot_limited.size() == 6 && xdot_limited.allFinite())
+            {
+                xdot_ref_ = xdot_limited;
+                clampCartesianVelocity(xdot_ref_);
+            }
+        }
 
         return true;
     }
@@ -1554,14 +1592,8 @@ private:
         if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt, theta_d))
             return;
 
-        // Velocity safety
-        if (!checkVelocityLimits(theta_d))
-        {
-            RCLCPP_WARN(this->get_logger(),
-                        "[INIT] Joint velocity exceeded limit → STATE_STOP");
-            state_ = STATE_STOP;
-            return;
-        }
+        // Joint velocity is clamped inside computeControlStep().
+        // Do not enter STATE_STOP for normal command saturation.
 
         if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
             !initTrackedPositions())
@@ -1578,7 +1610,7 @@ private:
             tracked_positions_[i] =
                 q[static_cast<Eigen::Index>(i)] +
                 theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-            tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
+            tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
         }
 
         // Position safety — revert and hold on limit violation
@@ -1684,14 +1716,8 @@ private:
         if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt_safe, theta_d))
             return;
 
-        // Velocity safety
-        if (!checkVelocityLimits(theta_d))
-        {
-            RCLCPP_WARN(this->get_logger(),
-                        "[FOLLOW] Joint velocity exceeded limit → STATE_STOP");
-            state_ = STATE_STOP;
-            return;
-        }
+        // Joint velocity is clamped inside computeControlStep().
+        // Do not enter STATE_STOP for normal command saturation.
 
         if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
             !initTrackedPositions())
@@ -1706,7 +1732,7 @@ private:
             tracked_positions_[i] =
                 q[static_cast<Eigen::Index>(i)] +
                 theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-            tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
+            tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
         }
 
         // Position safety — revert and hold on limit violation

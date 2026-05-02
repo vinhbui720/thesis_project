@@ -1,0 +1,76 @@
+digraph MotoMiniTrajStreamerFlow {
+    rankdir=TB;
+    node [shape=box, style=filled, fillcolor=lightblue, fontname="Arial"];
+    edge [fontname="Arial"];
+
+    subgraph cluster_ros_interface {
+        label = "ROS 2 Interface";
+        style = dashed;
+        color = blue;
+
+        sub_joint [label="Sub: /joint_states\n(Velocity Estimation)", shape=ellipse, fillcolor=lightyellow];
+        sub_traj [label="Sub: /path_command\n(Incoming Trajectories)", shape=ellipse, fillcolor=lightyellow];
+        srv_start_stop [label="Srv: /pose_following/start/stop", shape=ellipse, fillcolor=lightyellow];
+        
+        pub_arm [label="Pub: /joint_path_command\n(Arming Trigger)", shape=ellipse, fillcolor=lightpink];
+        pub_stream [label="Pub: /joint_command\n(High-freq Stream)", shape=ellipse, fillcolor=lightpink];
+    }
+
+    subgraph cluster_worker_thread {
+        label = "Worker Thread (Asynchronous Processing)";
+        style = dashed;
+        color = darkgreen;
+
+        proc_traj [label="processTrajectory()", fillcolor=lightgreen];
+        mode_detect [label="Mode Detection\n(FAITHFUL vs SPLICE)", shape=diamond, fillcolor=lightyellow];
+        
+        dense_resample [label="Dense Hermite Resampling\n(Input Waypoints -> 50Hz/125Hz Cache)"];
+        
+        subgraph cluster_mode_b {
+            label = "Mode B: SPLICE (MPC Re-plans)";
+            color = orange;
+            fir_filter [label="FIR Gaussian Filter\n(Remove Numeric Chatter)"];
+            find_match [label="Find i_match\n(Closest cache pt to current state)"];
+            hermite_bridge [label="Hermite Bridge\n(Snap pos/vel to smooth path\nover 4 ticks)"];
+        }
+
+        update_cache [label="Atomically Update active_cache_", fillcolor=orange];
+    }
+
+    subgraph cluster_rt_thread {
+        label = "Real-Time Thread (tick timer)";
+        style = dashed;
+        color = red;
+
+        state_machine [label="Main State Machine\n(WAIT, ARMING, STREAMING, STOPPED)", fillcolor=lightgrey];
+        
+        arming_logic [label="Arming Sequence\n(Pre-delay -> Arm Pub -> Post-delay)"];
+        
+        do_stream [label="doStream()", fillcolor=lightpink];
+        cache_swap [label="New Cache Check?\nAlign traj_start_time with t_splice"];
+        sample_cache [label="sampleCache()\nO(1) Hermite Interpolation"];
+        limit_check [label="Joint Limit Check"];
+    }
+
+    // ROS -> Threads
+    sub_traj -> proc_traj [label="if !worker_busy"];
+    sub_joint -> arming_logic [label="Sync Initial Pos"];
+    srv_start_stop -> state_machine;
+
+    // Worker logic
+    proc_traj -> mode_detect;
+    mode_detect -> dense_resample [label="FAITHFUL"];
+    mode_detect -> fir_filter [label="SPLICE"];
+    fir_filter -> find_match -> hermite_bridge -> dense_resample;
+    dense_resample -> update_cache;
+
+    // RT logic
+    state_machine -> arming_logic [label="STATE_ARMING"];
+    state_machine -> do_stream [label="STATE_STREAMING"];
+    
+    arming_logic -> pub_arm;
+    
+    update_cache -> cache_swap [label="Atomic Swap"];
+    do_stream -> cache_swap -> sample_cache -> limit_check -> pub_stream;
+
+}

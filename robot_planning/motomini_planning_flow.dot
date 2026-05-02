@@ -1,0 +1,74 @@
+digraph MotoMiniPlanningFlow {
+    rankdir=TB;
+    node [shape=box, style=filled, fillcolor=lightblue, fontname="Arial"];
+    edge [fontname="Arial"];
+
+    subgraph cluster_ros_node {
+        label = "MotoMiniPlanningNode (ROS 2)";
+        style = dashed;
+        color = blue;
+
+        main [label="main()\nInitialize Node", fillcolor=lightgrey];
+        postInit [label="postInit()\nSetup Tesseract & Planner"];
+        
+        sub_states [label="Sub: /joint_states\nUpdate Env Monitor", shape=ellipse, fillcolor=lightyellow];
+        sub_targets [label="Sub: /motomini/targets\nAccumulate Waypoints", shape=ellipse, fillcolor=lightyellow];
+        sub_start [label="Sub: /motomini/start\nTrigger Planning", shape=ellipse, fillcolor=lightyellow];
+        sub_tracking [label="Sub: /tracking_control\nToggle Tracking Mode", shape=ellipse, fillcolor=lightyellow];
+
+        state_machine [label="Tracking State Machine\n(IDLE, ARMING, INIT, POSE_FOLLOW, STOP)", fillcolor=lightgreen];
+        
+        admittance_ctrl [label="Admittance Controller (50Hz)\n1. Calc Cartesian Error\n2. Admittance Dynamics (MKD)\n3. Collision Projection\n4. DLS Inverse Kinematics"];
+        
+        pub_traj [label="Pub: /joint_path_command\n(Offline Trajectory)", shape=ellipse, fillcolor=lightpink];
+        pub_stream [label="Pub: /joint_command\n(Real-time Commands)", shape=ellipse, fillcolor=lightpink];
+    }
+
+    subgraph cluster_planner_lib {
+        label = "MotoMiniPlanning (Core)";
+        style = dashed;
+        color = darkgreen;
+
+        run_method [label="run() - Offline Pipeline", fillcolor=lightgreen];
+        
+        chunk_split [label="Split Targets into Chunks"];
+        ik_seeds [label="Pre-compute IK Seeds\n(Parallel Start States)"];
+        
+        taskflow [label="Taskflow Parallel Execution", fillcolor=orange];
+        
+        subgraph cluster_chunk_logic {
+            label = "Per Chunk Logic";
+            trajopt [label="TrajOpt / Ifopt\nOptimization"];
+            isp [label="ISP\nTime Param"];
+        }
+        
+        stitch [label="Stitch Chunks\n(Full Trajectory)"];
+        
+        online_sqp [label="Background SQP Optimizer\n(Real-time Re-optimization)", fillcolor=orange];
+    }
+
+    // Connections
+    main -> postInit;
+    postInit -> sub_states;
+    postInit -> sub_targets;
+    postInit -> sub_start;
+    postInit -> sub_tracking;
+
+    sub_start -> run_method [label="Triggered"];
+    run_method -> chunk_split;
+    chunk_split -> ik_seeds;
+    ik_seeds -> taskflow;
+    taskflow -> trajopt;
+    trajopt -> isp;
+    isp -> stitch;
+    stitch -> pub_traj;
+
+    run_method -> online_sqp [label="If Online Mode"];
+    online_sqp -> pub_stream;
+
+    sub_tracking -> state_machine;
+    state_machine -> admittance_ctrl [label="If POSE_FOLLOW"];
+    admittance_ctrl -> pub_stream;
+
+    sub_states -> postInit [label="Update Env"];
+}
