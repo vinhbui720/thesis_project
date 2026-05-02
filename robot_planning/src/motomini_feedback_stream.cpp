@@ -206,6 +206,10 @@ public:
         this->declare_parameter<double>("max_cart_angular_acc", 2.5);
         this->declare_parameter<double>("measured_cart_linear_vel_limit", 1.0);
         this->declare_parameter<double>("measured_cart_angular_vel_limit", 3.0);
+        // Mode selector: set true for velocity-only joystick (integrates target_vel into
+        // desired_pose_); set false when an external node streams /motomini/target_pose
+        // so that target_vel is used as feedforward only and not double-applied.
+        this->declare_parameter<bool>("integrate_target_vel_to_pose", true);
 
         // ----- Read parameters -----
         this->get_parameter("robot_description", urdf_xml_);
@@ -255,6 +259,8 @@ public:
             this->get_parameter("measured_cart_linear_vel_limit").as_double();
         measured_cart_angular_vel_limit_ =
             this->get_parameter("measured_cart_angular_vel_limit").as_double();
+        integrate_target_vel_to_pose_ =
+            this->get_parameter("integrate_target_vel_to_pose").as_bool();
 
         collision_stop_distance_ = std::max(0.0, collision_stop_distance_);
         collision_task_distance_ =
@@ -1066,10 +1072,19 @@ private:
             gamma = std::min(gamma, collision_projection_max_gamma_);
         }
 
-        // Goal force = K·e + D·(ẋ_des−ẋ_ref). Strip the "into obstacle" component so the
-        // tracker stops actively pulling the EE deeper while still allowing
-        // tangent and away motion.
-        Eigen::Vector3d F_goal_pos = k_pos_var * e_p_ + d_pos_var * edot_ref.head<3>();
+        // --- Virtual acceleration per motomini_optimal_controller_fix.md ---
+        // Correct form: ẍ_ref = M⁻¹·( K·e + D·(ẋ_des − ẋ_ref) − F_coll )
+        // The damping term D acts ONLY on the velocity error (ẋ_des − ẋ_ref).
+        // Do NOT subtract an extra D·ẋ_ref: that would create double damping
+        // (K·e + D·ẋ_des − 2D·ẋ_ref) which can satisfy ẍ_ref=0 while e≠0.
+        //
+        // With this form, at steady state ẍ_ref=0 requires K·e=0 → e=0. ✓
+        const Eigen::Matrix<double, 6, 1> v_err = xdot_des - xdot_ref_;
+
+        Eigen::Vector3d F_goal_pos = k_pos_var * e_p_ + d_pos_var * v_err.head<3>();
+        Eigen::Vector3d F_goal_ori = k_ori_var * e_o_ + d_ori_var * v_err.tail<3>();
+
+        // Strip goal-force component driving EE into the obstacle.
         if (collision_goal_suppression_ && gamma > 0.0)
         {
             const double goal_into = F_goal_pos.dot(n_away);
@@ -1077,10 +1092,9 @@ private:
                 F_goal_pos -= gamma * goal_into * n_away;
         }
 
-        // --- Virtual acceleration ẍ_ref = M⁻¹·(F_goal_safe − F_coll − D·ẋ_ref) ---
         Eigen::Matrix<double, 6, 1> xddot_ref;
         xddot_ref.head<3>() = (F_goal_pos - F_collision.head<3>()) / std::max(1e-9, m_pos_var);
-        xddot_ref.tail<3>() = (k_ori_var * e_o_ + d_ori_var * edot_ref.tail<3>() - F_collision.tail<3>() - d_ori_var * xdot_ref_.tail<3>()) / std::max(1e-9, m_ori_var);
+        xddot_ref.tail<3>() = (F_goal_ori - F_collision.tail<3>()) / std::max(1e-9, m_ori_var);
 
         // --- Integrate ẋ_ref ---
         const Eigen::Matrix<double, 6, 1> xdot_prev = xdot_ref_;
@@ -1253,6 +1267,9 @@ private:
     }
 
     // Streaming target velocity.
+    // The velocity is integrated into desired_pose_ each tick (in handlePoseFollow).
+    // This callback just caches what arrives. The integration guard in handlePoseFollow
+    // uses the deadband to skip near-zero velocities, so no explicit zeroing is needed here.
     void targetVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
     {
         latest_target_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
@@ -1631,8 +1648,18 @@ private:
             (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
 
         // Integrate streaming target_vel into the desired pose.
+        // Only integrate when the velocity is fresh AND above the deadband.
+        // When the user releases (vel=0 callback), targetVelCallback has already
+        // frozen desired_pose_ at the current EE — so we just skip integration here.
         const double dt_vel = (this->now() - t_last_target_vel_cb_).seconds();
-        if (dt_vel < TARGET_VEL_TIMEOUT_SEC && latest_target_vel_.norm() > 0.0)
+        const bool vel_fresh = dt_vel < TARGET_VEL_TIMEOUT_SEC;
+        const bool vel_active = vel_fresh &&
+                                (latest_target_vel_.head<3>().norm() > targetVelocityDeadband() ||
+                                 latest_target_vel_.tail<3>().norm() > targetVelocityDeadband());
+        // Integrate target_vel into desired_pose_ only when in Mode B (joystick/vel-only).
+        // Mode A (external pose streamer): integrate_target_vel_to_pose=false → target_vel
+        // is feedforward only in computeControlStep; do NOT double-apply it here.
+        if (integrate_target_vel_to_pose_ && vel_active)
         {
             des_pos.x() += latest_target_vel_(0) * dt_safe;
             des_pos.y() += latest_target_vel_(1) * dt_safe;
@@ -1739,6 +1766,7 @@ private:
     // --- Adaptive Cartesian admittance gains ---
     double m_pos_min_, m_pos_max_, k_pos_min_, k_pos_max_, zeta_pos_;
     double m_ori_min_, m_ori_max_, k_ori_min_, k_ori_max_, zeta_ori_;
+    bool integrate_target_vel_to_pose_{true}; // Mode B (joystick). Set false for Mode A (ext pose).
     double adaptive_lambda_, adaptive_alpha_pos_, adaptive_alpha_ori_;
     double max_cart_linear_vel_, max_cart_angular_vel_;
 

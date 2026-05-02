@@ -12,7 +12,7 @@ Panels:
         - /MarkerArray1
         - /MarkerArray2
       Splitter Ratio: 0.5
-    Tree Height: 601
+    Tree Height: 441
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -212,8 +212,6 @@ Visualization Manager:
             {}
           workcell:
             base_link:
-              base:
-                {}
               link_1_s:
                 link_2_l:
                   link_3_u:
@@ -221,8 +219,7 @@ Visualization Manager:
                       link_5_b:
                         link_6_t:
                           tool0:
-                            magnetic_link:
-                              {}
+                            {}
             world_depth_camera_link:
               {}
       Update Interval: 0
@@ -416,12 +413,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        collision_distances: true
-        collision_point_link0: true
-        collision_point_link1: true
-        collision_push_force_link0: true
-        collision_push_force_link1: true
-        collision_vector_to_obstacle: true
+        collision_info: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
