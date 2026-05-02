@@ -70,7 +70,7 @@
 #define JOINT_4_R_VEL_LIMIT_RADSEC (M_PI * 10.0 / 3.0)
 #define JOINT_5_B_VEL_LIMIT_RADSEC (M_PI * 10.0 / 3.0)
 #define JOINT_6_T_VEL_LIMIT_RADSEC (M_PI * 10.0 / 3.0)
-#define SAFETY_VELOCITY_ALPHA 0.8 // fraction of hardware limit to use
+#define SAFETY_VELOCITY_ALPHA 0.9 // fraction of hardware limit to use
 
 // --- Legacy PD Parameters (accepted for backward-compatible YAML files) ---
 #define DEFAULT_LEGACY_KP_MAX 3.5
@@ -1047,8 +1047,6 @@ private:
         if (xdot_des.tail<3>().norm() <= targetVelocityDeadband())
             xdot_des.tail<3>().setZero();
 
-        const Eigen::Matrix<double, 6, 1> edot_ref = xdot_des - xdot_ref_;
-
         // --- Collision wrench from /motomini/collision_wrench ---
         // The debug node publishes a repulsive push-away wrench. The callback
         // stores the controller-side sign so this term can be used directly.
@@ -1094,6 +1092,54 @@ private:
             gamma = std::min(gamma, collision_projection_max_gamma_);
         }
 
+        // ------------------------------------------------------------
+        // Collision wall behavior:
+        // Keep tangential collision force, fade/remove normal spring force.
+        // n_away points away from the obstacle.
+        // F_pub is the actual published push/tangent force from collision node.
+        // F_collision is stored with opposite sign in this controller.
+        // ------------------------------------------------------------
+        if (collision_constraint_active && gamma > 0.0)
+        {
+            Eigen::Vector3d F_pub = -F_collision.head<3>();
+
+            if (F_pub.allFinite() && n_away.allFinite() && n_away.norm() > 1e-9)
+            {
+                const double f_n = F_pub.dot(n_away);
+
+                if (f_n > 0.0)
+                {
+                    // Positive normal component = push-away spring.
+                    // Fade it out as the hard velocity wall becomes active.
+                    const Eigen::Vector3d F_normal = f_n * n_away;
+                    const Eigen::Vector3d F_tangent = F_pub - F_normal;
+
+                    F_pub = F_tangent + (1.0 - gamma) * F_normal;
+                }
+                else if (f_n < 0.0)
+                {
+                    // Never allow collision wrench to push into the obstacle.
+                    F_pub -= f_n * n_away;
+                }
+
+                // Store back using controller's sign convention.
+                F_collision.head<3>() = -F_pub;
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Project desired/feedforward velocity too.
+        // This prevents target_vel from creating a damping force into the obstacle.
+        // Tangent and away velocity are preserved.
+        // ------------------------------------------------------------
+        if (collision_constraint_active && gamma > 0.0)
+        {
+            const double vd_into = xdot_des.head<3>().dot(n_away);
+
+            if (vd_into < 0.0)
+                xdot_des.head<3>() -= gamma * vd_into * n_away;
+        }
+
         // --- Virtual acceleration per motomini_optimal_controller_fix.md ---
         // Correct form: ẍ_ref = M⁻¹·( K·e + D·(ẋ_des − ẋ_ref) − F_coll )
         // The damping term D acts ONLY on the velocity error (ẋ_des − ẋ_ref).
@@ -1106,12 +1152,22 @@ private:
         Eigen::Vector3d F_goal_pos = k_pos_var * e_p_ + d_pos_var * v_err.head<3>();
         Eigen::Vector3d F_goal_ori = k_ori_var * e_o_ + d_ori_var * v_err.tail<3>();
 
-        // Strip goal-force component driving EE into the obstacle.
+        // ------------------------------------------------------------
+        // Wall reaction force.
+        // If goal force tries to go into obstacle, create equal opposite
+        // reaction scaled by gamma. This cancels inward force, not push away.
+        // ------------------------------------------------------------
         if (collision_goal_suppression_ && gamma > 0.0)
         {
-            const double goal_into = F_goal_pos.dot(n_away);
-            if (goal_into < 0.0)
-                F_goal_pos -= gamma * goal_into * n_away;
+            const double F_into = F_goal_pos.dot(n_away);
+
+            if (F_into < 0.0)
+            {
+                const Eigen::Vector3d F_wall_reaction =
+                    -gamma * F_into * n_away;
+
+                F_goal_pos += F_wall_reaction;
+            }
         }
 
         Eigen::Matrix<double, 6, 1> xddot_ref;
@@ -1154,6 +1210,19 @@ private:
                 xdot_ref_ = xdot_limited;
                 clampCartesianVelocity(xdot_ref_);
             }
+        }
+
+        // After joint velocity clamp anti-windup, project again.
+        // Joint saturation can slightly reintroduce an into-surface component.
+        if (joint_scale < 1.0 &&
+            enable_collision_projection_ &&
+            collision_constraint_active &&
+            gamma > 0.0)
+        {
+            const double v_into = xdot_ref_.head<3>().dot(n_away);
+
+            if (v_into < 0.0)
+                xdot_ref_.head<3>() -= gamma * v_into * n_away;
         }
 
         return true;

@@ -350,7 +350,6 @@ private:
                                           const Eigen::Vector3d &push_dir) const
     {
         const double d0 = std::max(1e-6, collision_influence_distance_);
-        const double d_safe = std::max(0.0, collision_safe_distance_);
 
         if (distance >= d0)
             return Eigen::Vector3d::Zero();
@@ -360,18 +359,33 @@ private:
             return Eigen::Vector3d::Zero();
         n.normalize();
 
-        // Floor distance to avoid singularities when the robot has already
-        // penetrated. The hold term picks up the slack in that regime.
         const double d = std::max(distance, 1e-4);
 
-        const double rep_mag =
-            collision_k_rep_ * (1.0 / d - 1.0 / d0) / (d * d);
+        // gamma = 0 far from wall, gamma = 1 at/inside task wall.
+        const double wall_gamma = computeProjectionGamma(distance);
 
+        // Normal spring fades out as the controller wall activates.
+        // This prevents spring/string oscillation at the edge.
+        const double spring_scale = 1.0 - wall_gamma;
+
+        const double rep_mag =
+            spring_scale *
+            collision_k_rep_ *
+            (1.0 / d - 1.0 / d0) /
+            (d * d);
+
+        // Emergency-only hold.
+        // Do not use hold at the normal safe wall, because that causes bounce.
         double hold_mag = 0.0;
-        if (distance < d_safe)
-            hold_mag = collision_k_hold_ * (d_safe - distance);
+        if (distance < collision_stop_distance_)
+        {
+            hold_mag =
+                collision_k_hold_ *
+                (collision_stop_distance_ - distance);
+        }
 
         const Eigen::Vector3d f = (rep_mag + hold_mag) * n;
+
         return clampNorm(f, collision_force_max_per_contact_);
     }
 

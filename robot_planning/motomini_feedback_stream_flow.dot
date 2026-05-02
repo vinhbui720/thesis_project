@@ -1,0 +1,78 @@
+digraph MotoMiniFeedbackStreamFlow {
+    rankdir=TB;
+    node [shape=box, style=filled, fillcolor=lightblue, fontname="Arial"];
+    edge [fontname="Arial"];
+
+    subgraph cluster_inputs {
+        label = "ROS Inputs (Callbacks)";
+        style = dashed;
+        color = blue;
+
+        sub_joint [label="Sub: /joint_states\n(Update Kinematics)", shape=ellipse, fillcolor=lightyellow];
+        sub_pose [label="Sub: /motomini/target_pose\n(Desired Goal)", shape=ellipse, fillcolor=lightyellow];
+        sub_vel [label="Sub: /motomini/target_vel\n(Feedforward / Joystick)", shape=ellipse, fillcolor=lightyellow];
+        sub_coll_wrench [label="Sub: /motomini/collision_wrench\n(Repulsive Forces)", shape=ellipse, fillcolor=lightyellow];
+        sub_coll_dist [label="Sub: /motomini/collision_distance\n(Safety Buffer)", shape=ellipse, fillcolor=lightyellow];
+        sub_coll_norm [label="Sub: /motomini/collision_normal\n(Projection Axis)", shape=ellipse, fillcolor=lightyellow];
+    }
+
+    subgraph cluster_control_loop {
+        label = "Control Loop (tick() - 50Hz)";
+        style = dashed;
+        color = red;
+
+        publish_feedback [label="Publish /motomini/feedback\n(Current EE Pose & Vel)"];
+        
+        state_machine [label="State Machine Switch", fillcolor=lightgrey];
+        
+        handle_idle [label="STATE_IDLE\n(Sync state, wait for target)"];
+        handle_arming [label="STATE_ARMING\n(Path Cmd -> Delay -> Seed)"];
+        handle_init [label="STATE_INIT\n(Move to init_pose)"];
+        handle_follow [label="STATE_POSE_FOLLOW\n(Track target_pose)"];
+        handle_stop [label="STATE_STOP\n(Velocity Zeroed)"];
+
+        subgraph cluster_control_law {
+            label = "computeControlStep() Logic";
+            fillcolor=lightcyan;
+            style=filled;
+
+            fk_calc [label="Forward Kinematics\n(Current EE Pose)"];
+            error_calc [label="Pose Error Calculation\n(Position & Orientation)"];
+            adaptive_gains [label="Adaptive Admittance Scaling\n(s_t, s_e, s_w -> M, K, D)"];
+            
+            accel_calc [label="Admittance Dynamics\nẍ_ref = M⁻¹(K·e + D·v_err - F_coll)"];
+            integrate [label="Integrate -> ẋ_ref\n(Ref Cartesian Velocity)"];
+            
+            coll_safety [label="Collision Projection (Gamma)\nProject ẋ_ref away from surface"];
+            
+            sr_ik [label="SR-Inverse Jacobian\nθ̇_cmd = J⁺_SR · ẋ_ref"];
+            
+            clamping [label="Joint Velocity Clamping\n& Anti-windup (Update ẋ_ref)"];
+        }
+
+        pub_joint [label="Pub: /joint_command\n(Streaming)", fillcolor=lightpink];
+    }
+
+    // Input to loop connections
+    sub_pose -> handle_arming [label="Triggers transition"];
+    sub_vel -> handle_arming [label="Triggers transition"];
+    
+    state_machine -> handle_idle [label="IDLE"];
+    state_machine -> handle_arming [label="ARMING"];
+    state_machine -> handle_init [label="INIT"];
+    state_machine -> handle_follow [label="POSE_FOLLOW"];
+    state_machine -> handle_stop [label="STOP"];
+
+    // Shared control step usage
+    handle_init -> fk_calc;
+    handle_follow -> fk_calc;
+    
+    fk_calc -> error_calc -> adaptive_gains -> accel_calc -> integrate -> coll_safety -> sr_ik -> clamping;
+    
+    clamping -> pub_joint;
+    handle_idle -> pub_joint [label="if active"];
+    handle_stop -> pub_joint [label="if active"];
+
+    // Global feedback
+    publish_feedback;
+}

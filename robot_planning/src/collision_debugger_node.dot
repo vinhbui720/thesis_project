@@ -1,0 +1,219 @@
+digraph collision_debugger_node {
+    rankdir=TB;
+    compound=true;
+    node [shape=rectangle, style=filled, fontname="Helvetica", fontsize=11];
+    edge [fontname="Helvetica", fontsize=10];
+
+    // ─────────────────────────────────────────────────────────
+    // STYLES
+    // ─────────────────────────────────────────────────────────
+    node [fillcolor="#BBDEFB"];  // default: blue-ish
+
+    // ══════════════════════════════════════════════════════════
+    // SUBGRAPH: main()
+    // ══════════════════════════════════════════════════════════
+    subgraph cluster_main {
+        label="main()";
+        style=filled; fillcolor="#E3F2FD"; color="#1565C0"; fontsize=13;
+
+        main_start  [label="START", shape=oval, fillcolor="#4CAF50", fontcolor=white];
+        main_init   [label="rclcpp::init(argc, argv)"];
+        main_spin   [label="rclcpp::spin(\n  OnlineCollisionDebugger)"];
+        main_shut   [label="rclcpp::shutdown()", fillcolor="#FFCCBC"];
+        main_end    [label="return 0", shape=oval, fillcolor="#F44336", fontcolor=white];
+
+        main_start -> main_init -> main_spin -> main_shut -> main_end;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // SUBGRAPH: Constructor
+    // ══════════════════════════════════════════════════════════
+    subgraph cluster_ctor {
+        label="OnlineCollisionDebugger()  [Constructor]";
+        style=filled; fillcolor="#E8F5E9"; color="#2E7D32"; fontsize=13;
+
+        ctor_params   [label="Declare & get all ROS 2 parameters\n(threshold, influence/safe/guard/task/stop\ndistances, k_rep, k_hold, force limits,\nmarker settings, wrench frame, etc.)"];
+        ctor_clamp    [label="Clamp / validate all parameter values\n(max(), ensure ordering of safety zones)"];
+        ctor_margin   [label="contact_margin_ = max(threshold_, influence_dist_)"];
+        ctor_urdf_chk [label="urdf_xml or srdf_xml empty?", shape=diamond, fillcolor="#FFF9C4"];
+        ctor_err_urdf [label="RCLCPP_ERROR: cannot start", fillcolor="#FFCCBC"];
+        ctor_ret1     [label="return (abort)", shape=oval, fillcolor="#EF9A9A"];
+        ctor_env_init [label="env_->init(urdf_xml, srdf_xml, locator)"];
+        ctor_init_ok  [label="init success?", shape=diamond, fillcolor="#FFF9C4"];
+        ctor_err_env  [label="RCLCPP_ERROR: Tesseract init failed", fillcolor="#FFCCBC"];
+        ctor_ret2     [label="return (abort)", shape=oval, fillcolor="#EF9A9A"];
+        ctor_mgr      [label="getDiscreteContactManager()\nsetActiveCollisionObjects()\nsetDefaultCollisionMargin(contact_margin_)"];
+        ctor_req      [label="Set ContactRequest:\n  type=ALL\n  calculate_distance=true\n  calculate_penetration=true"];
+        ctor_pubs     [label="Create Publishers:\n  collision_markers\n  collision_debug_contacts\n  /motomini/collision_wrench\n  /motomini/collision_distance\n  /motomini/collision_normal"];
+        ctor_subs     [label="Create Subscriptions:\n  /joint_states → jointStateCallback\n  /motomini/target_vel → targetVelCallback"];
+        ctor_done     [label="Node ready (RCLCPP_INFO)", fillcolor="#C8E6C9"];
+
+        ctor_params -> ctor_clamp -> ctor_margin -> ctor_urdf_chk;
+        ctor_urdf_chk -> ctor_err_urdf [label="Yes (empty)"];
+        ctor_err_urdf -> ctor_ret1;
+        ctor_urdf_chk -> ctor_env_init [label="No"];
+        ctor_env_init -> ctor_init_ok;
+        ctor_init_ok -> ctor_err_env [label="No"];
+        ctor_err_env -> ctor_ret2;
+        ctor_init_ok -> ctor_mgr [label="Yes"];
+        ctor_mgr -> ctor_req -> ctor_pubs -> ctor_subs -> ctor_done;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // SUBGRAPH: targetVelCallback
+    // ══════════════════════════════════════════════════════════
+    subgraph cluster_vel_cb {
+        label="targetVelCallback()";
+        style=filled; fillcolor="#FFF3E0"; color="#E65100"; fontsize=13;
+
+        vel_store [label="Store latest_target_vel_linear_\n= [linear.x, linear.y, linear.z]"];
+        vel_time  [label="t_last_target_vel_cb_ = now()"];
+        vel_store -> vel_time;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // SUBGRAPH: jointStateCallback  (main processing)
+    // ══════════════════════════════════════════════════════════
+    subgraph cluster_js_cb {
+        label="jointStateCallback()  [main processing loop]";
+        style=filled; fillcolor="#F3E5F5"; color="#6A1B9A"; fontsize=13;
+
+        js_guard   [label="env_ && contact_manager_ valid?", shape=diamond, fillcolor="#FFF9C4"];
+        js_ret     [label="return early", shape=oval, fillcolor="#EF9A9A"];
+        js_state   [label="1. env_->setState(joint names, positions)"];
+        js_xform   [label="2. contact_manager_->\n   setCollisionObjectsTransform(link_transforms)"];
+        js_ref     [label="3. Get wrench_ref (tool0 translation)\nfrom current_state.link_transforms"];
+        js_contact [label="4. contact_manager_->contactTest()\n   → ContactResultMap"];
+        js_prep    [label="5. Prepare outputs:\n   MarkerArray, debug_stream,\n   total_force=0, total_torque=0\n   closest_distance=∞, has_closest=false"];
+        js_delete  [label="Add DELETEALL marker\n(if debug_markers_enabled_)", fillcolor="#E1BEE7"];
+        js_loop    [label="For each contact pair\nFor each ContactResult", shape=hexagon, fillcolor="#CE93D8"];
+
+        js_acm     [label="ACM allows collision\n(link0, link1)?", shape=diamond, fillcolor="#FFF9C4"];
+        js_tool    [label="isToolCollisionPairIgnored\n(link0, link1)?", shape=diamond, fillcolor="#FFF9C4"];
+        js_margin  [label="distance >= contact_margin_?", shape=diamond, fillcolor="#FFF9C4"];
+        js_skip    [label="skip (continue)", shape=oval, fillcolor="#CFD8DC"];
+
+        js_normal  [label="Compute contactNormal0To1()"];
+        js_force   [label="computeCollisionForce():\n  force_on_link0 (−normal)\n  force_on_link1 (+normal)"];
+        js_pick    [label="force_for_controller =\n  max(|force_on_link0|, |force_on_link1|)"];
+        js_acc     [label="Accumulate:\n  total_force += force_for_controller\n  total_torque += (contact_pt − wrench_ref) × force"];
+        js_closest [label="result.distance < closest_distance?\n→ update closest_distance,\n   closest_n_away, closest_contact_pt,\n   has_closest=true", shape=diamond, fillcolor="#FFF9C4"];
+        js_markers [label="Add debug markers\n(if debug_markers_enabled_):\n  addDistanceLine\n  addContactPoint ×2\n  addVectorToObstacleArrow\n  addForceArrow ×3", fillcolor="#E1BEE7"];
+        js_debug_s [label="Append contact info\nto debug_stream"];
+
+        js_tan     [label="has_closest?\n→ computeTangentialForce(closest_dist, closest_n_away)", shape=diamond, fillcolor="#FFF9C4"];
+        js_clamp   [label="total_force += tangential_force\ntotal_force = clampNorm(total_force, max_total)\ntotal_force = smoothPublishedForce(total_force)"];
+        js_zone    [label="zone = classifyZone(closest_distance)\ngamma = computeProjectionGamma(closest_distance)"];
+        js_pub_w   [label="publishCollisionWrench(total_force, total_torque)"];
+        js_pub_c   [label="publishCollisionConstraint(\n  has_closest, closest_distance, closest_n_away)"];
+        js_mrk_out [label="(if debug_markers_enabled_):\n  addTotalForceArrow\n  addInfoTextMarker\n  marker_pub_->publish(marker_array)", fillcolor="#E1BEE7"];
+        js_dbg_out [label="(if publish_contact_debug_text_):\n  contact_debug_pub_->publish(debug_msg)", fillcolor="#E1BEE7"];
+
+        js_guard -> js_ret    [label="No"];
+        js_guard -> js_state  [label="Yes"];
+        js_state -> js_xform -> js_ref -> js_contact -> js_prep -> js_delete -> js_loop;
+        js_loop -> js_acm;
+        js_acm  -> js_skip    [label="Yes"];
+        js_acm  -> js_tool    [label="No"];
+        js_tool -> js_skip    [label="Yes"];
+        js_tool -> js_margin  [label="No"];
+        js_margin -> js_skip  [label="Yes"];
+        js_margin -> js_normal [label="No"];
+        js_normal -> js_force -> js_pick -> js_acc -> js_closest;
+        js_closest -> js_markers [label="(always)"];
+        js_markers -> js_debug_s;
+        js_debug_s -> js_loop [label="next contact\n(back to loop)", style=dashed];
+
+        js_loop -> js_tan     [label="all pairs done"];
+        js_tan  -> js_clamp   [label="(add or zero)"];
+        js_clamp -> js_zone -> js_pub_w -> js_pub_c -> js_mrk_out -> js_dbg_out;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // SUBGRAPH: computeCollisionForce
+    // ══════════════════════════════════════════════════════════
+    subgraph cluster_cf {
+        label="computeCollisionForce(distance, push_dir)";
+        style=filled; fillcolor="#FFEBEE"; color="#B71C1C"; fontsize=13;
+
+        cf_chk0  [label="distance >= influence_dist_?", shape=diamond, fillcolor="#FFF9C4"];
+        cf_zero0 [label="return Zero", shape=oval, fillcolor="#EF9A9A"];
+        cf_nrm   [label="Normalize push_dir → n\n(guard: not finite or near-zero → return Zero)"];
+        cf_gamma [label="wall_gamma = computeProjectionGamma(distance)\nspring_scale = 1 − wall_gamma"];
+        cf_rep   [label="rep_mag = spring_scale × k_rep\n    × (1/d − 1/d0) / d²"];
+        cf_hold  [label="distance < stop_distance_?\n→ hold_mag = k_hold × (stop_dist − d)", shape=diamond, fillcolor="#FFF9C4"];
+        cf_out   [label="f = (rep_mag + hold_mag) × n\nreturn clampNorm(f, max_per_contact)"];
+
+        cf_chk0 -> cf_zero0  [label="Yes"];
+        cf_chk0 -> cf_nrm    [label="No"];
+        cf_nrm -> cf_gamma -> cf_rep -> cf_hold;
+        cf_hold -> cf_out    [label="(hold_mag += if STOP zone)"];
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // SUBGRAPH: computeTangentialForce
+    // ══════════════════════════════════════════════════════════
+    subgraph cluster_tf {
+        label="computeTangentialForce(distance, n_away)";
+        style=filled; fillcolor="#FFF8E1"; color="#F57F17"; fontsize=13;
+
+        tf_age   [label="target_age > targetVelocityTimeout()?", shape=diamond, fillcolor="#FFF9C4"];
+        tf_zero0 [label="return Zero", shape=oval, fillcolor="#EF9A9A"];
+        tf_vchk  [label="v_goal not finite\nor |v_goal| ≤ v_deadband?", shape=diamond, fillcolor="#FFF9C4"];
+        tf_zero1 [label="return Zero", shape=oval, fillcolor="#EF9A9A"];
+        tf_nchk  [label="n_away not finite or near-zero?", shape=diamond, fillcolor="#FFF9C4"];
+        tf_zero2 [label="return Zero", shape=oval, fillcolor="#EF9A9A"];
+        tf_into  [label="v_into = v_goal · n\nv_into ≥ −v_deadband\n(not moving into obstacle)?", shape=diamond, fillcolor="#FFF9C4"];
+        tf_zero3 [label="return Zero", shape=oval, fillcolor="#EF9A9A"];
+        tf_tan   [label="Compute tangent:\n  1) v_proj = v_goal − v_into×n → normalize\n  2) else use last_tangent_dir_\n  3) else fallbackTangent(n)"];
+        tf_flip  [label="Flip tangent if dot(last_tangent_dir_) < 0"];
+        tf_gamma [label="gamma = computeProjectionGamma(distance)\ngamma ≤ 0 → return Zero"];
+        tf_mag   [label="approach_ratio = clamp((-v_into−deadband)/speed_scale)\ntangential_mag = gain × γ² × approach_ratio"];
+        tf_out   [label="return clampNorm(mag × tangent, tangentialForceLimit())"];
+
+        tf_age  -> tf_zero0  [label="Yes (stale)"];
+        tf_age  -> tf_vchk   [label="No"];
+        tf_vchk -> tf_zero1  [label="Yes"];
+        tf_vchk -> tf_nchk   [label="No"];
+        tf_nchk -> tf_zero2  [label="Yes"];
+        tf_nchk -> tf_into   [label="No"];
+        tf_into -> tf_zero3  [label="Yes (moving away)"];
+        tf_into -> tf_tan    [label="No (approaching)"];
+        tf_tan -> tf_flip -> tf_gamma -> tf_mag -> tf_out;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // SUBGRAPH: smoothPublishedForce
+    // ══════════════════════════════════════════════════════════
+    subgraph cluster_spf {
+        label="smoothPublishedForce(raw_force)";
+        style=filled; fillcolor="#E8EAF6"; color="#283593"; fontsize=13;
+
+        spf_first [label="First call or dt ≤ 0 or dt > 1 s?", shape=diamond, fillcolor="#FFF9C4"];
+        spf_reset [label="filtered_total_force_ = raw_force\nhave_force_filter_state_ = true\nreturn raw_force"];
+        spf_hz    [label="cutoff_hz = attackHz if |raw| ≥ |filtered|\n          else releaseHz"];
+        spf_alpha [label="alpha = 1 − exp(−2π × cutoff_hz × dt)"];
+        spf_filt  [label="filtered += alpha × (raw − filtered)"];
+        spf_zero  [label="Both near-zero?\n→ filtered.setZero()", shape=diamond, fillcolor="#FFF9C4"];
+        spf_ret   [label="return filtered_total_force_"];
+
+        spf_first -> spf_reset [label="Yes"];
+        spf_first -> spf_hz    [label="No"];
+        spf_hz -> spf_alpha -> spf_filt -> spf_zero;
+        spf_zero -> spf_ret    [label="(either way)"];
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // CROSS-GRAPH EDGES (node lifecycle + call edges)
+    // ══════════════════════════════════════════════════════════
+    main_spin -> ctor_params     [label="creates node →\ncalls constructor", lhead=cluster_ctor, ltail=cluster_main, style=dashed, color="#1565C0"];
+
+    // callbacks triggered by ROS 2 spin
+    ctor_subs -> vel_store       [label="spin → /target_vel msg", lhead=cluster_vel_cb, ltail=cluster_ctor, style=dashed, color="#E65100"];
+    ctor_subs -> js_guard        [label="spin → /joint_states msg", lhead=cluster_js_cb, ltail=cluster_ctor, style=dashed, color="#6A1B9A"];
+
+    // jointStateCallback calls helper functions
+    js_force -> cf_chk0          [label="calls", lhead=cluster_cf, ltail=cluster_js_cb, style=dashed, color="#B71C1C"];
+    js_tan   -> tf_age           [label="calls", lhead=cluster_tf, ltail=cluster_js_cb, style=dashed, color="#F57F17"];
+    js_clamp -> spf_first        [label="calls smoothPublishedForce", lhead=cluster_spf, ltail=cluster_js_cb, style=dashed, color="#283593"];
+}

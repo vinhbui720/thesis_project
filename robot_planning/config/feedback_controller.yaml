@@ -152,8 +152,8 @@
     # Tuning:
     #   Increase mass for slower, smoother motion.
     #   Decrease mass for faster response, but watch joint velocity trips.
-    m_pos_min: 0.01
-    m_pos_max: 0.20
+    m_pos_min: 0.001
+    m_pos_max: 0.17
 
     # Translational virtual stiffness.
     # k_pos_min is the soft baseline; k_pos_max is the fastest tracking value.
@@ -162,15 +162,15 @@
     #   Raise k_pos_max for faster position convergence.
     #   Lower k_pos_min if the robot feels too aggressive near the target.
     #   Lower k_pos_max if startup or large-error moves hit velocity limits.
-    k_pos_min: 70.0
-    k_pos_max: 500.0
+    k_pos_min: 200.0
+    k_pos_max: 1900.0
 
     # Translational damping ratio used by D = 2*zeta*sqrt(M*K).
     # Tuning:
     #   1.0 is near critical damping.
     #   < 1.0 is faster but can overshoot.
     #   > 1.0 is more damped but slower.
-    zeta_pos: 0.8
+    zeta_pos: 0.6
 
     # ===========================================================================
     # ADAPTIVE ORIENTATION VIRTUAL DYNAMICS
@@ -201,7 +201,7 @@
     # Tuning:
     #   Higher value reaches full adaptive strength sooner.
     #   Lower value makes mode starts softer.
-    adaptive_lambda: 10.0
+    adaptive_lambda: 50.0
 
     # Error scaling: s_e = tanh(alpha * |error|).
     # Tuning:
@@ -210,7 +210,7 @@
     # Examples:
     #   alpha_pos=30 reaches strong adaptation around 3-5 cm.
     #   alpha_ori=6 reaches strong adaptation around 0.2-0.4 rad.
-    adaptive_alpha_pos: 20.0
+    adaptive_alpha_pos: 40.0
     adaptive_alpha_ori: 5.0
 
     # ===========================================================================
@@ -222,7 +222,7 @@
     #   Raise only after confirming joint velocity safety does not trip.
     max_cart_linear_vel: 1.0    # [m/s]
     max_cart_angular_vel: 4.0   # [rad/s]
-    max_cart_linear_acc: 0.5
+    max_cart_linear_acc: 2.0
     max_cart_angular_acc: 1.0
     # ===========================================================================
     # SINGULARITY HANDLING (SR-INVERSE JACOBIAN)
@@ -253,7 +253,7 @@
     #           each tick AND used as xdot_des feedforward. Use when no external pose source.
     #   false = Mode A: external pose generator streams /motomini/target_pose.
     #           target_vel is feedforward only. Do NOT integrate to avoid double-application.
-    integrate_target_vel_to_pose: true
+    integrate_target_vel_to_pose: false
 
     # Legacy Cartesian PD parameters.
     # Compatibility behavior:
