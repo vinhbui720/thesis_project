@@ -27,6 +27,8 @@ def generate_launch_description():
     planning_chunk_size = LaunchConfiguration("planning_chunk_size")
     planning_parallel_chunks = LaunchConfiguration("planning_parallel_chunks")
     jogging = LaunchConfiguration("jogging")
+    bayesian = LaunchConfiguration("bayesian")
+    feedback_yaml_file = LaunchConfiguration("feedback_yaml_file")
     gantry_mode_tesser = IfCondition(PythonExpression(["'", gantry_mode, "' == 'tesser'"]))
     gantry_mode_loop = IfCondition(PythonExpression(["'", gantry_mode, "' == 'loop'"]))
     gantry_mode_gui = IfCondition(PythonExpression(["'", gantry_mode, "' == 'gui'"]))
@@ -127,6 +129,20 @@ def generate_launch_description():
         # ),
 
         # --- NEW pose-based jogging chain (PD feedback controller + pose GUI) ---
+        # Bayesian optimization node block
+        Node(
+            package="robot_planning",
+            executable="motomini_feedback_stream",
+            parameters=[*common_params, feedback_yaml_file, {
+                "manipulator_group": "manipulator",
+                "base_link": "world",
+                "ee_link": concrete_ee_link,
+                "real_robot": real_robot,
+            }],
+            condition=IfCondition(bayesian),
+            output="screen"
+        ),
+        # Normal operation node block
         Node(
             package="robot_planning",
             executable="motomini_feedback_stream",
@@ -137,7 +153,7 @@ def generate_launch_description():
                 "real_robot": real_robot,
             }],
             condition=IfCondition(PythonExpression([
-                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true' and '", bayesian, "' == 'false'"
             ])),
             output="screen"
         ),
@@ -149,7 +165,7 @@ def generate_launch_description():
                 "ee_frame": concrete_ee_link,
             }],
             condition=IfCondition(PythonExpression([
-                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true'"
+                "'", vel_streaming, "' == 'true' and '", jogging, "' == 'true' and '", bayesian, "' == 'false'"
             ])),
             output="screen"
         ),
@@ -432,6 +448,8 @@ def generate_launch_description():
         DeclareLaunchArgument("use_ompl", default_value="true"),
         DeclareLaunchArgument("vel_streaming", default_value="false"),
         DeclareLaunchArgument("jogging", default_value="false"),
+        DeclareLaunchArgument("bayesian", default_value="false"),
+        DeclareLaunchArgument("feedback_yaml_file", default_value=""),
         DeclareLaunchArgument("tracking_rate_hz", default_value="3.0"),
         DeclareLaunchArgument("planning_chunk_size", default_value="5"),
         DeclareLaunchArgument("planning_parallel_chunks", default_value="2"),

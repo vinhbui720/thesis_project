@@ -152,8 +152,8 @@
     # Tuning:
     #   Increase mass for slower, smoother motion.
     #   Decrease mass for faster response, but watch joint velocity trips.
-    m_pos_min: 0.04127845562028961
-    m_pos_max: 0.1680504461026802
+    m_pos_min: 0.001
+    m_pos_max: 0.45
 
     # Translational virtual stiffness.
     # k_pos_min is the soft baseline; k_pos_max is the fastest tracking value.
@@ -162,15 +162,15 @@
     #   Raise k_pos_max for faster position convergence.
     #   Lower k_pos_min if the robot feels too aggressive near the target.
     #   Lower k_pos_max if startup or large-error moves hit velocity limits.
-    k_pos_min: 213.94721674003614
-    k_pos_max: 2521.4333497543075
+    k_pos_min: 300.0
+    k_pos_max: 2500.0
 
     # Translational damping ratio used by D = 2*zeta*sqrt(M*K).
     # Tuning:
     #   1.0 is near critical damping.
     #   < 1.0 is faster but can overshoot.
     #   > 1.0 is more damped but slower.
-    zeta_pos: 0.8839200439485122
+    zeta_pos: 0.8
 
     # ===========================================================================
     # ADAPTIVE ORIENTATION VIRTUAL DYNAMICS
@@ -201,7 +201,7 @@
     # Tuning:
     #   Higher value reaches full adaptive strength sooner.
     #   Lower value makes mode starts softer.
-    adaptive_lambda: 10.516532838405427
+    adaptive_lambda: 70.0
 
     # Error scaling: s_e = tanh(alpha * |error|).
     # Tuning:
@@ -210,7 +210,7 @@
     # Examples:
     #   alpha_pos=30 reaches strong adaptation around 3-5 cm.
     #   alpha_ori=6 reaches strong adaptation around 0.2-0.4 rad.
-    adaptive_alpha_pos: 48.418095282947036
+    adaptive_alpha_pos: 10.0
     adaptive_alpha_ori: 5.0
 
     # ===========================================================================
