@@ -49,6 +49,25 @@ public:
         this->declare_parameter<double>("collision_k_hold", 50.0);
         this->declare_parameter<double>("collision_force_max_per_contact", 10.0);
         this->declare_parameter<double>("collision_force_max_total", 25.0);
+        
+        // New Normal Force model
+        this->declare_parameter<double>("collision_normal_force_max", 6.0);
+        this->declare_parameter<double>("collision_normal_fade_power", 1.0);
+        this->declare_parameter<double>("collision_normal_damping", 8.0);
+        
+        // Tangential sliding force
+        this->declare_parameter<bool>("collision_tangent_enabled", true);
+        this->declare_parameter<double>("collision_tangent_gain", 4.0);
+        this->declare_parameter<double>("collision_tangent_force_max", 4.0);
+        this->declare_parameter<double>("collision_tangent_force_ratio", 0.35);
+        this->declare_parameter<double>("collision_tangent_gamma_power", 2.0);
+        this->declare_parameter<double>("collision_tangent_speed_scale", 0.05);
+        this->declare_parameter<double>("collision_tangent_velocity_deadband", 0.01);
+        
+        // Force filtering
+        this->declare_parameter<double>("collision_force_attack_hz", 20.0);
+        this->declare_parameter<double>("collision_force_release_hz", 8.0);
+        this->declare_parameter<double>("collision_force_slew_rate", 80.0);
 
         // Safety zones consumed by the controller (close-work design)
         this->declare_parameter<double>("collision_guard_distance", 0.03);
@@ -81,6 +100,22 @@ public:
         collision_k_hold_ = this->get_parameter("collision_k_hold").as_double();
         collision_force_max_per_contact_ = this->get_parameter("collision_force_max_per_contact").as_double();
         collision_force_max_total_ = this->get_parameter("collision_force_max_total").as_double();
+
+        collision_normal_force_max_ = this->get_parameter("collision_normal_force_max").as_double();
+        collision_normal_fade_power_ = this->get_parameter("collision_normal_fade_power").as_double();
+        collision_normal_damping_ = this->get_parameter("collision_normal_damping").as_double();
+
+        collision_tangent_enabled_ = this->get_parameter("collision_tangent_enabled").as_bool();
+        collision_tangent_gain_ = this->get_parameter("collision_tangent_gain").as_double();
+        collision_tangent_force_max_ = this->get_parameter("collision_tangent_force_max").as_double();
+        collision_tangent_force_ratio_ = this->get_parameter("collision_tangent_force_ratio").as_double();
+        collision_tangent_gamma_power_ = this->get_parameter("collision_tangent_gamma_power").as_double();
+        collision_tangent_speed_scale_ = this->get_parameter("collision_tangent_speed_scale").as_double();
+        collision_tangent_velocity_deadband_ = this->get_parameter("collision_tangent_velocity_deadband").as_double();
+        
+        collision_force_attack_hz_ = this->get_parameter("collision_force_attack_hz").as_double();
+        collision_force_release_hz_ = this->get_parameter("collision_force_release_hz").as_double();
+        collision_force_slew_rate_ = this->get_parameter("collision_force_slew_rate").as_double();
 
         collision_guard_distance_ = this->get_parameter("collision_guard_distance").as_double();
         collision_task_distance_ = this->get_parameter("collision_task_distance").as_double();
@@ -149,6 +184,9 @@ public:
         target_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
             "/motomini/target_vel", 10,
             std::bind(&OnlineCollisionDebugger::targetVelCallback, this, std::placeholders::_1));
+        feedback_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            "/motomini/feedback_vel", 10,
+            std::bind(&OnlineCollisionDebugger::feedbackVelCallback, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(),
                     "Online Collision Debugger started. threshold=%.3f m, influence=%.3f m, safe=%.3f m, "
@@ -216,48 +254,39 @@ private:
         return 1.0 - std::clamp((d - collision_task_distance_) / span, 0.0, 1.0);
     }
 
-    double targetVelocityTimeout() const
+    double targetVelocityTimeout() const { return 0.2; }
+    double tangentialVelocityDeadband() const { return collision_tangent_velocity_deadband_; }
+    double tangentialSpeedScale() const { return collision_tangent_speed_scale_; }
+    double tangentialForceLimit() const { 
+        return std::min(collision_tangent_force_max_, collision_tangent_force_ratio_ * collision_force_max_total_); 
+    }
+    double tangentialForceGain() const { return collision_tangent_gain_; }
+    double collisionForceAttackHz() const { return collision_force_attack_hz_; }
+    double collisionForceReleaseHz() const { return collision_force_release_hz_; }
+
+    double normalDampingMag(const Eigen::Vector3d& n_away) const
     {
-        return std::max(0.05, 0.75 * collision_influence_distance_);
+        const double age = (this->now() - t_last_feedback_vel_cb_).seconds();
+        if (age > 0.2)
+            return 0.0;
+
+        const double v_n = latest_feedback_vel_linear_.dot(n_away);
+        if (v_n >= 0.0)
+            return 0.0;
+
+        return collision_normal_damping_ * (-v_n);
     }
 
-    double tangentialVelocityDeadband() const
+    static double smoothstep(double x)
     {
-        const double span = std::max(1e-4, collision_guard_distance_ - collision_task_distance_);
-        return std::max(0.002, 0.2 * span);
+        x = std::clamp(x, 0.0, 1.0);
+        return x * x * (3.0 - 2.0 * x);
     }
 
     double tangentialProjectionEpsilon() const
     {
         const double span = std::max(1e-6, collision_guard_distance_ - collision_task_distance_);
         return std::max(1e-6, 0.05 * span);
-    }
-
-    double tangentialSpeedScale() const
-    {
-        const double span = std::max(1e-4, collision_guard_distance_ - collision_task_distance_);
-        return std::max(0.01, span);
-    }
-
-    double tangentialForceLimit() const
-    {
-        return std::max(0.0, 0.35 * collision_force_max_total_);
-    }
-
-    double tangentialForceGain() const
-    {
-        return tangentialForceLimit();
-    }
-
-    double collisionForceAttackHz() const
-    {
-        const double tau = std::max(0.02, 0.25 * std::max(1e-3, collision_influence_distance_));
-        return 1.0 / tau;
-    }
-
-    double collisionForceReleaseHz() const
-    {
-        return std::max(1.0, 0.35 * collisionForceAttackHz());
     }
 
     Eigen::Vector3d fallbackTangent(const Eigen::Vector3d &n_away) const
@@ -270,9 +299,10 @@ private:
         return tangent.normalized();
     }
 
-    Eigen::Vector3d computeTangentialForce(double distance,
-                                           const Eigen::Vector3d &n_away) 
+    Eigen::Vector3d computeTangentialForce(double distance, const Eigen::Vector3d &n_away) 
     {
+        if (!collision_tangent_enabled_) return Eigen::Vector3d::Zero();
+
         const double target_age = (this->now() - t_last_target_vel_cb_).seconds();
         const double v_deadband = tangentialVelocityDeadband();
         if (target_age > targetVelocityTimeout())
@@ -310,11 +340,11 @@ private:
         if (gamma <= 0.0)
             return Eigen::Vector3d::Zero();
 
-        const double approach_ratio =
-            std::clamp((-v_into - v_deadband) / tangentialSpeedScale(),
-                       0.0, 1.0);
-        const double tangential_mag =
-            tangentialForceGain() * gamma * gamma * approach_ratio;
+        const double approach_ratio = std::clamp((-v_into - v_deadband) / tangentialSpeedScale(), 0.0, 1.0);
+        
+        const double gamma_shape = std::pow(std::clamp(gamma, 0.0, 1.0), collision_tangent_gamma_power_);
+        const double tangential_mag = tangentialForceGain() * gamma_shape * approach_ratio;
+        
         return clampNorm(tangential_mag * tangent, tangentialForceLimit());
     }
 
@@ -338,7 +368,14 @@ private:
                 ? collisionForceAttackHz()
                 : collisionForceReleaseHz();
         const double alpha = lowPassAlpha(cutoff_hz, dt);
-        filtered_total_force_ += alpha * (raw_force - filtered_total_force_);
+        
+        Eigen::Vector3d df = alpha * (raw_force - filtered_total_force_);
+        const double max_df = collision_force_slew_rate_ * dt;
+
+        if (df.norm() > max_df && df.norm() > 1e-9)
+            df = df.normalized() * max_df;
+
+        filtered_total_force_ += df;
 
         if (filtered_total_force_.norm() < 1e-6 && raw_force.norm() < 1e-6)
             filtered_total_force_.setZero();
@@ -346,10 +383,10 @@ private:
         return filtered_total_force_;
     }
 
-    Eigen::Vector3d computeCollisionForce(double distance,
-                                          const Eigen::Vector3d &push_dir) const
+    Eigen::Vector3d computeCollisionForce(double distance, const Eigen::Vector3d &push_dir) const
     {
         const double d0 = std::max(1e-6, collision_influence_distance_);
+        const double d_safe = std::clamp(collision_safe_distance_, 0.0, d0 - 1e-6);
 
         if (distance >= d0)
             return Eigen::Vector3d::Zero();
@@ -359,32 +396,22 @@ private:
             return Eigen::Vector3d::Zero();
         n.normalize();
 
-        const double d = std::max(distance, 1e-4);
-
-        // gamma = 0 far from wall, gamma = 1 at/inside task wall.
+        const double s = std::clamp((d0 - distance) / std::max(1e-6, d0 - d_safe), 0.0, 1.0);
         const double wall_gamma = computeProjectionGamma(distance);
 
-        // Normal spring fades out as the controller wall activates.
-        // This prevents spring/string oscillation at the edge.
-        const double spring_scale = 1.0 - wall_gamma;
+        const double fade = std::pow(std::clamp(1.0 - wall_gamma, 0.0, 1.0), collision_normal_fade_power_);
 
-        const double rep_mag =
-            spring_scale *
-            collision_k_rep_ *
-            (1.0 / d - 1.0 / d0) /
-            (d * d);
+        const double rep_mag = collision_normal_force_max_ * smoothstep(s) * fade;
 
-        // Emergency-only hold.
-        // Do not use hold at the normal safe wall, because that causes bounce.
         double hold_mag = 0.0;
         if (distance < collision_stop_distance_)
         {
-            hold_mag =
-                collision_k_hold_ *
-                (collision_stop_distance_ - distance);
+            hold_mag = collision_k_hold_ * (collision_stop_distance_ - distance);
         }
 
-        const Eigen::Vector3d f = (rep_mag + hold_mag) * n;
+        const double damping_mag = normalDampingMag(n);
+
+        Eigen::Vector3d f = (rep_mag + hold_mag + damping_mag) * n;
 
         return clampNorm(f, collision_force_max_per_contact_);
     }
@@ -619,6 +646,13 @@ private:
         latest_target_vel_linear_ <<
             msg->linear.x, msg->linear.y, msg->linear.z;
         t_last_target_vel_cb_ = this->now();
+    }
+
+    void feedbackVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    {
+        latest_feedback_vel_linear_ <<
+            msg->linear.x, msg->linear.y, msg->linear.z;
+        t_last_feedback_vel_cb_ = this->now();
     }
 
     // Publish closest-contact constraint data so the controller can run
@@ -885,6 +919,7 @@ private:
 
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr target_vel_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr feedback_vel_sub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr contact_debug_pub_;
     rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr collision_wrench_pub_;
@@ -921,8 +956,26 @@ private:
     double force_arrow_min_length_;
     double force_arrow_max_length_;
     double force_arrow_length_gain_;
+    double collision_normal_force_max_;
+    double collision_normal_fade_power_;
+    double collision_normal_damping_;
+
+    bool collision_tangent_enabled_;
+    double collision_tangent_gain_;
+    double collision_tangent_force_max_;
+    double collision_tangent_force_ratio_;
+    double collision_tangent_gamma_power_;
+    double collision_tangent_speed_scale_;
+    double collision_tangent_velocity_deadband_;
+    
+    double collision_force_attack_hz_;
+    double collision_force_release_hz_;
+    double collision_force_slew_rate_;
+
     Eigen::Vector3d latest_target_vel_linear_{Eigen::Vector3d::Zero()};
     rclcpp::Time t_last_target_vel_cb_{0, 0, RCL_ROS_TIME};
+    Eigen::Vector3d latest_feedback_vel_linear_{Eigen::Vector3d::Zero()};
+    rclcpp::Time t_last_feedback_vel_cb_{0, 0, RCL_ROS_TIME};
     Eigen::Vector3d last_tangent_dir_{Eigen::Vector3d::Zero()};
     Eigen::Vector3d filtered_total_force_{Eigen::Vector3d::Zero()};
     rclcpp::Time t_last_force_filter_update_{0, 0, RCL_ROS_TIME};

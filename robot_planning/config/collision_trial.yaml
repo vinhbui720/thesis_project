@@ -1,0 +1,23 @@
+online_collision_debugger:
+  ros__parameters:
+    collision_normal_force_max: 7.986209820381639
+    collision_normal_damping: 13.319596404909285
+    collision_force_max_per_contact: 7.873043802925985
+    collision_force_attack_hz: 14.61119761810825
+    collision_force_release_hz: 13.390543433936594
+    collision_force_slew_rate: 128.50001819251426
+    collision_tangent_gain: 4.869117747158546
+    collision_tangent_force_max: 6.680895664015688
+    collision_tangent_force_ratio: 0.2377727163643221
+    collision_tangent_gamma_power: 1.9735477006281605
+    collision_tangent_speed_scale: 0.06483902944440173
+    collision_tangent_velocity_deadband: 0.017642611675155677
+    collision_normal_fade_power: 1.0607318716184384
+    collision_force_scale: 0.8934514186402804
+    collision_force_max: 4.968081635827378
+    collision_constraint_timeout_sec: 0.25966028155014526
+    collision_influence_distance: 0.027198653878172385
+    collision_safe_distance: 0.024575207291595996
+    collision_guard_distance: 0.024372770796027593
+    collision_task_distance: 0.0070591077239813855
+    collision_tangent_enabled: true
