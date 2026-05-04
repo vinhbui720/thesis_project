@@ -91,6 +91,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("collision_force_scale", 1.0);
     this->declare_parameter<double>("collision_force_max", 5.0);
     this->declare_parameter<bool>("real_robot", true);
+    this->declare_parameter<bool>("integrate_target_vel_to_pose", true);
 
     this->declare_parameter<std::string>("move_instruction_type", "FREESPACE");
     this->declare_parameter<double>("ompl_planning_time", 10.0);
@@ -177,6 +178,8 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     collision_force_max_ =
         this->get_parameter("collision_force_max").as_double();
     real_robot_ = this->get_parameter("real_robot").as_bool();
+    integrate_target_vel_to_pose_ =
+        this->get_parameter("integrate_target_vel_to_pose").as_bool();
 
     const auto &overrides =
         this->get_node_parameters_interface()->get_parameter_overrides();
@@ -525,6 +528,7 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
             else if (n == "planning_chunk_size") { new_chunk_size = static_cast<int>(p.as_int()); chunk_changed = true; }
             else if (n == "planning_parallel_chunks") { new_parallel = static_cast<int>(p.as_int()); chunk_changed = true; }
             else if (n == "real_robot") { real_robot_ = p.as_bool(); first_velocity_read_ = true; qdot_filtered_.resize(0); have_velocity_filter_update_ = false; }
+            else if (n == "integrate_target_vel_to_pose") { integrate_target_vel_to_pose_ = p.as_bool(); }
             else if (n == "velocity_filter_cutoff_hz") { velocity_filter_cutoff_hz_ = p.as_double(); sanitizeTrackingParameters(); }
             else if (n == "max_cart_linear_acc") { max_cart_linear_acc_ = p.as_double(); sanitizeTrackingParameters(); }
             else if (n == "max_cart_angular_acc") { max_cart_angular_acc_ = p.as_double(); sanitizeTrackingParameters(); }

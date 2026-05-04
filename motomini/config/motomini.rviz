@@ -111,6 +111,11 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        test_obstacle:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
         tool0:
           Alpha: 1
           Show Axes: false
@@ -181,6 +186,8 @@ Visualization Manager:
           Value: true
         object_link:
           Value: true
+        test_obstacle:
+          Value: true
         tool0:
           Value: true
         workcell:
@@ -190,6 +197,8 @@ Visualization Manager:
         world:
           Value: true
         world_depth_camera_link:
+          Value: true
+        wp_0:
           Value: true
         x_carriage:
           Value: true
@@ -223,8 +232,12 @@ Visualization Manager:
                           tool0:
                             magnetic_link:
                               {}
+            test_obstacle:
+              {}
             world_depth_camera_link:
               {}
+          wp_0:
+            {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
@@ -313,7 +326,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        {}
+        online_planner_path: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -391,7 +404,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        {}
+        online_planner_path: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -471,5 +484,5 @@ Window Geometry:
   Views:
     collapsed: true
   Width: 960
-  X: 2880
-  Y: 0
+  X: 529
+  Y: 42

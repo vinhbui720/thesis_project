@@ -31,7 +31,7 @@
 namespace
 {
 constexpr int NUMBER_OF_JOINT = 6;
-constexpr double SAFETY_VELOCITY_ALPHA = 0.65;
+constexpr double SAFETY_VELOCITY_ALPHA = 0.9;
 constexpr double SAFETY_JOINT_PADDING_RAD = 5.0 * M_PI / 180.0;
 constexpr double POSITION_ERROR_THRESHOLD = 0.0005;
 constexpr double POSE_TIMEOUT_SEC = 3.0;
@@ -238,7 +238,10 @@ bool MotoMiniPlanningNode::getMeasuredJointVelocity(const Eigen::VectorXd &q,
     qdot_out = Eigen::VectorXd::Zero(static_cast<Eigen::Index>(joint_names_.size()));
 
     bool velocity_valid = false;
-    if (last_joint_state_ &&
+    // real_robot=true  → try joint_state hardware velocity first (falls back if invalid)
+    // real_robot=false → always use pose-differentiation; hardware vel is ignored
+    if (real_robot_ &&
+        last_joint_state_ &&
         last_joint_state_->velocity.size() >= joint_names_.size())
     {
         Eigen::VectorXd qdot_driver(static_cast<Eigen::Index>(joint_names_.size()));
@@ -280,6 +283,12 @@ bool MotoMiniPlanningNode::getMeasuredJointVelocity(const Eigen::VectorXd &q,
     const double dt_prev = have_q_prev ? (now - t_prev_q).seconds() : dt_hint;
     if (!velocity_valid)
     {
+        if (real_robot_)
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "[VEL] real_robot=true but hardware velocity invalid — falling back to pose diff.");
+        else
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "[VEL] real_robot=false → using pose-differentiation velocity.");
         if (have_q_prev && q_prev.size() == q.size() && dt_prev > 1e-6)
             qdot_out = (q - q_prev) / dt_prev;
         else
@@ -292,8 +301,9 @@ bool MotoMiniPlanningNode::getMeasuredJointVelocity(const Eigen::VectorXd &q,
 
     const double filter_dt =
         (dt_prev > 1e-6 && dt_prev < 1.0) ? dt_prev : dt_hint;
-    if (real_robot_)
-        qdot_out = filterJointVelocity(qdot_out, filter_dt);
+    // Always filter: pose-diff velocity (real_robot=false) is the noisiest signal
+    // and needs the low-pass filter even more than hardware velocity does.
+    qdot_out = filterJointVelocity(qdot_out, filter_dt);
 
     return qdot_out.allFinite();
 }
@@ -1001,22 +1011,21 @@ bool MotoMiniPlanningNode::computeControlStep(const Eigen::VectorXd &q,
         gamma = std::min(gamma, collision_projection_max_gamma_);
     }
 
+    // Virtual force terms (correct admittance form — no extra -D·ẋ_ref).
     Eigen::Vector3d f_goal_pos = k_pos * e_p_ + d_pos * edot_ref.head<3>();
+    Eigen::Vector3d f_goal_ori = k_ori * e_o_ + d_ori * edot_ref.tail<3>();
+
+    // Wall reaction: redirect goal force away from collision surface.
     if (collision_goal_suppression_ && gamma > 0.0)
     {
-        const double goal_into = f_goal_pos.dot(n_away);
-        if (goal_into < 0.0)
-            f_goal_pos -= gamma * goal_into * n_away;
+        const double F_into = f_goal_pos.dot(n_away);
+        if (F_into < 0.0)
+            f_goal_pos += -gamma * F_into * n_away;
     }
 
     Eigen::Matrix<double, 6, 1> xddot_ref;
-    xddot_ref.head<3>() =
-        (f_goal_pos - f_collision.head<3>() - d_pos * xdot_ref_.head<3>()) /
-        std::max(1e-9, m_pos);
-    xddot_ref.tail<3>() =
-        (k_ori * e_o_ + d_ori * edot_ref.tail<3>() -
-         f_collision.tail<3>() - d_ori * xdot_ref_.tail<3>()) /
-        std::max(1e-9, m_ori);
+    xddot_ref.head<3>() = (f_goal_pos - f_collision.head<3>()) / std::max(1e-9, m_pos);
+    xddot_ref.tail<3>() = (f_goal_ori - f_collision.tail<3>()) / std::max(1e-9, m_ori);
 
     const Eigen::Matrix<double, 6, 1> xdot_prev = xdot_ref_;
     Eigen::Matrix<double, 6, 1> xdot_next = xdot_ref_ + xddot_ref * dt_safe;
@@ -1033,7 +1042,47 @@ bool MotoMiniPlanningNode::computeControlStep(const Eigen::VectorXd &q,
     clampCartesianVelocity(xdot_ref_);
 
     theta_d = calcSrInverse(jacobian, manipulability, w0_, k0_) * xdot_ref_;
-    return theta_d.allFinite();
+    if (!theta_d.allFinite())
+        return false;
+
+    // Clamp joint velocity (scale theta_d, preserve direction, anti-windup).
+    double scale = 1.0;
+    const int n_j = std::min<int>(NUMBER_OF_JOINT, static_cast<int>(theta_d.size()));
+    for (int i = 0; i < n_j; ++i)
+    {
+        double lim = std::numeric_limits<double>::infinity();
+        if (velocity_limits_.rows() == theta_d.size() && velocity_limits_.cols() >= 2)
+            lim = std::max(std::abs(velocity_limits_(i, 0)),
+                           std::abs(velocity_limits_(i, 1)));
+        else if (theta_d.size() == NUMBER_OF_JOINT)
+            lim = FALLBACK_VELOCITY[static_cast<size_t>(i)];
+        lim *= SAFETY_VELOCITY_ALPHA;
+        const double a = std::abs(theta_d[i]);
+        if (std::isfinite(lim) && a > lim && a > 1e-12)
+            scale = std::min(scale, lim / a);
+    }
+    if (scale < 1.0)
+    {
+        theta_d *= scale;
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                             "Joint velocity clamped (scale=%.3f). Continuing tracking.", scale);
+        // Anti-windup: back-calculate xdot_ref_ from what theta_d can actually produce.
+        const Eigen::VectorXd xdot_limited = jacobian * theta_d;
+        if (xdot_limited.size() == 6 && xdot_limited.allFinite())
+        {
+            xdot_ref_ = xdot_limited;
+            clampCartesianVelocity(xdot_ref_);
+        }
+        // Re-project xdot_ref_ after anti-windup.
+        if (enable_collision_projection_ && collision_constraint_active && gamma > 0.0)
+        {
+            const double v_into2 = xdot_ref_.head<3>().dot(n_away);
+            if (v_into2 < 0.0)
+                xdot_ref_.head<3>() -= gamma * v_into2 * n_away;
+        }
+    }
+
+    return true;
 }
 
 void MotoMiniPlanningNode::handleTrackingIdle()
@@ -1175,13 +1224,8 @@ void MotoMiniPlanningNode::handleTrackingInit()
     if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt, theta_d))
         return;
 
-    if (!checkVelocityLimits(theta_d))
-    {
-        RCLCPP_WARN(this->get_logger(),
-                    "[TRACKING INIT] Joint velocity exceeded limit -> STOP");
-        tracking_state_ = TrackingStreamState::STOP;
-        return;
-    }
+    // Joint velocity is clamped inside computeControlStep().
+    // Do not enter STOP for normal command saturation.
 
     if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
         !initTrackedPositions())
@@ -1197,7 +1241,7 @@ void MotoMiniPlanningNode::handleTrackingInit()
         tracked_positions_[i] =
             q[static_cast<Eigen::Index>(i)] +
             theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-        tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
+        tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
     }
 
     if (!checkPositionLimits(tracked_positions_))
@@ -1255,6 +1299,7 @@ void MotoMiniPlanningNode::handleTrackingPoseFollow()
         (dt > 1e-6 && dt < 1.0) ? dt : (1.0 / std::max(1.0, rate_hz_));
 
     if ((this->now() - t_last_target_vel_cb_).seconds() < TARGET_VEL_TIMEOUT_SEC &&
+        integrate_target_vel_to_pose_ &&
         latest_target_vel_.norm() > 0.0)
     {
         des_pos.x() += latest_target_vel_(0) * dt_safe;
@@ -1280,13 +1325,8 @@ void MotoMiniPlanningNode::handleTrackingPoseFollow()
     if (!computeControlStep(q, des_pos, q_des.toRotationMatrix(), dt_safe, theta_d))
         return;
 
-    if (!checkVelocityLimits(theta_d))
-    {
-        RCLCPP_WARN(this->get_logger(),
-                    "[TRACKING FOLLOW] Joint velocity exceeded limit -> STOP");
-        tracking_state_ = TrackingStreamState::STOP;
-        return;
-    }
+    // Joint velocity is clamped inside computeControlStep().
+    // Do not enter STOP for normal command saturation.
 
     if (tracked_positions_.size() != static_cast<size_t>(theta_d.size()) &&
         !initTrackedPositions())
@@ -1300,7 +1340,7 @@ void MotoMiniPlanningNode::handleTrackingPoseFollow()
         tracked_positions_[i] =
             q[static_cast<Eigen::Index>(i)] +
             theta_d[static_cast<Eigen::Index>(i)] * dt_safe;
-        tracked_velocities_[i] = (tracked_positions_[i] - prev_pos[i]) / dt_safe;
+        tracked_velocities_[i] = theta_d[static_cast<Eigen::Index>(i)];
     }
 
     if (!checkPositionLimits(tracked_positions_))

@@ -184,6 +184,7 @@ private:
     bool is_init_done_{false};
     bool enable_seed_{false};
     bool real_robot_{true};
+    bool integrate_target_vel_to_pose_{true};
 
     geometry_msgs::msg::PoseStamped desired_pose_;
     geometry_msgs::msg::PoseStamped init_pose_;

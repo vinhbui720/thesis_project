@@ -159,11 +159,30 @@ CONFIG = {
     "ros2_publisher": {
         "frame_id": "world_depth_camera_link",   # Parent TF frame for published messages
         "tracking_frame_id": "tracking_task",     # Child TF frame representing tracked object
-        
+
         # Minimum ICP fitness to consider a retrigger successful.
-        # Mirrors init_pose.icp_min_fitness — override here if you want
-        # a different threshold for the service vs. the initial run.
         "icp_min_fitness": 0.5,
+
+        # ── Estimator (complementary filter) ──────────────────────────────
+        # How strongly to blend the velocity measurement in (0=never update, 1=always raw)
+        "vel_smooth_alpha":    0.85,
+        # How strongly to pull the position estimate toward the camera measurement
+        # (0=trust prediction only, 1=trust camera only)
+        "pos_correct_alpha":   0.30,
+        # Age (seconds) after which the camera is considered occluded
+        "cam_timeout_s":       0.25,
+
+        # ── Lead-time (interception prediction) ───────────────────────────
+        # Fixed fallback lead time used when robot EE position is unavailable
+        "lead_time_s":         0.30,
+        # Hard cap on lead time
+        "lead_time_max_s":     1.00,
+        # Assumed robot closing speed (m/s) used for dynamic lead-time:
+        #   lead_time = dist(EE → object) / approach_speed_m_s
+        "approach_speed_m_s":  0.15,
+
+        # ── Publisher timer rate ───────────────────────────────────────────
+        "pub_rate_hz":        50.0,
     },
     # endregion
 

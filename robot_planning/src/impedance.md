@@ -1,123 +1,199 @@
-You are given my ROS2 C++ file `motomini_feedback_stream.cpp`.
+give me an .tex file that give me detail about full of the report of KF and IK and jacobian and the mathmatic of the craig connvention(vinbui@vinh-ubuntu:~/vinh_ws$  python3 src/thesis_project/robot_planning/scripts/urdf_kin_params.py
 
-Please modify the controller from the current Jacobian-based Cartesian PD controller into an **adaptive Cartesian impedance/admittance-style velocity controller**, while keeping the existing ROS node structure unchanged.
+Reading URDF: /home/vinbui/vinh_ws/src/thesis_project/robot_model/urdf/motoman_motomini.urdf
+────────────────────────────────────────────────────────────────────────────────
+1. RAW URDF JOINT PARAMETERS  (what KDL reads from the URDF)
+────────────────────────────────────────────────────────────────────────────────
+Joint                type          x(m)     y(m)     z(m)      roll    pitch      yaw            axis     lower    upper  vel(r/s)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+joint_1_s            revolute    0.0000   0.0000   0.1030    0.0000   0.0000   0.0000  [ 0.00, 0.00, 1.00]   -2.9670   2.9670    5.4977
+joint_2_l            revolute    0.0200   0.0000   0.0000    0.0000   0.0000   0.0000  [ 0.00, 1.00, 0.00]   -1.4835   1.5707    5.4977
+joint_3_u            revolute    0.0000   0.0000   0.1650    0.0000   0.0000   0.0000  [ 0.00,-1.00, 0.00]   -0.8726   1.5707    7.3304
+joint_4_r            revolute    0.1650   0.0000   0.0000    0.0000   0.0000   0.0000  [-1.00, 0.00, 0.00]   -2.4434   2.4434   10.4719
+joint_5_b            revolute    0.0000   0.0000   0.0000    0.0000   0.0000   0.0000  [ 0.00,-1.00, 0.00]   -0.5235   3.6651   10.4719
+joint_6_t            revolute    0.0000   0.0000   0.0000    0.0000   0.0000   0.0000  [ 0.00, 0.00, 1.00]   -6.2831   6.2831   10.4719
+joint_6_t-tool0      fixed       0.0000   0.0000  -0.0400    3.1416   0.0000   0.0000  [ 0.00, 0.00, 1.00]    0.0000   0.0000    0.0000
 
-Important constraints:
+────────────────────────────────────────────────────────────────────────────────
+2. PER-JOINT FIXED TRANSFORM T_fixed  (KDL stores this as KDL::Frame for each segment)
+   = make_T(origin_xyz, origin_rpy)  — the part that does NOT change with joint angle
+────────────────────────────────────────────────────────────────────────────────
+  T_fixed[joint_1_s]:
+  [ 1.00000   0.00000   0.00000   0.00000]
+  [ 0.00000   1.00000   0.00000   0.00000]
+  [ 0.00000   0.00000   1.00000   0.10300]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-1. **Do not change the existing publishers, subscribers, services, topic names, state machine logic, or publish logic.**
-2. Keep using the existing output format:
-   - publish joint positions
-   - publish joint velocities
-   - keep `publishTrajectory()`, `publishToTopic()`, `handleInit()`, and `handlePoseFollow()` logic mostly unchanged.
+  T_fixed[joint_2_l]:
+  [ 1.00000   0.00000   0.00000   0.02000]
+  [ 0.00000   1.00000   0.00000   0.00000]
+  [ 0.00000   0.00000   1.00000   0.00000]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-3. The main change should be inside `computeControlStep()`.
-4. Keep the existing SR-inverse Jacobian mapping:
-   [
-   \dot q_{cmd} = J^#*{SR}(q)\dot x*{cmd}
-   ]
-5. Replace the old PD Cartesian velocity command:
-   [
-   \dot x = K_p e + K_d \Delta e
-   ]
-   with an adaptive impedance/admittance-style virtual dynamics controller:
-   [
-   \ddot{x}\_{ref}
-   ==============
+  T_fixed[joint_3_u]:
+  [ 1.00000   0.00000   0.00000   0.00000]
+  [ 0.00000   1.00000   0.00000   0.00000]
+  [ 0.00000   0.00000   1.00000   0.16500]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-   M_d(e,w)^{-1}
-   \left(
-   K_d(e,w)e
-   - D_e(e,w)\dot e
-   - ## F\_{collision}
+  T_fixed[joint_4_r]:
+  [ 1.00000   0.00000   0.00000   0.16500]
+  [ 0.00000   1.00000   0.00000   0.00000]
+  [ 0.00000   0.00000   1.00000   0.00000]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-   D*d(e,w)\dot{x}*{ref}
-   \right)
-   ]
+  T_fixed[joint_5_b]:
+  [ 1.00000   0.00000   0.00000   0.00000]
+  [ 0.00000   1.00000   0.00000   0.00000]
+  [ 0.00000   0.00000   1.00000   0.00000]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-6. For now, implement `F_collision` only as a placeholder:
+  T_fixed[joint_6_t]:
+  [ 1.00000   0.00000   0.00000   0.00000]
+  [ 0.00000   1.00000   0.00000   0.00000]
+  [ 0.00000   0.00000   1.00000   0.00000]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-   ```cpp
-   Eigen::Matrix<double, 6, 1> F_collision;
-   F_collision.setZero();
-   ```
+  T_fixed[joint_6_t-tool0]:
+  [ 1.00000   0.00000   0.00000   0.00000]
+  [ 0.00000  -1.00000  -0.00000   0.00000]
+  [ 0.00000   0.00000  -1.00000  -0.04000]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-   Do not implement obstacle detection yet.
+────────────────────────────────────────────────────────────────────────────────
+3. FORWARD KINEMATICS  (base_link → tool0)
+   KDL computes: T = T_fixed[j1] @ Rot(axis1,q1) @ T_fixed[j2] @ Rot(axis2,q2) @ ...
+────────────────────────────────────────────────────────────────────────────────
+  q = [0, 0, 0, 0, 0, 0]  (home)
+    Position  xyz  = [0.185000,  0.000000,  0.228000]  (m)
+    Orientation rpy = [180.000°,  -0.000°,  0.000°]
 
-7. Implement adaptive parameters:
-   [
-   s_t = 1 - e^{-\lambda t}
-   ]
-   [
-   s_e = \tanh(\alpha |e|)
-   ]
-   [
-   s_w = clamp(w/w_0, 0.2, 1.0)
-   ]
-   [
-   K*d = s_w \left[K*{min} + s*t s_e (K*{max}-K*{min})\right]
-   ]
-   [
-   M_d = M*{max} - s*t s_e (M*{max}-M\_{min})
-   ]
-   [
-   D_d = 2\zeta\sqrt{M_dK_d}
-   ]
-8. Use separate translational and rotational adaptive values:
-   - position stiffness/inertia/damping
-   - orientation stiffness/inertia/damping
+  [ 1.00000   0.00000   0.00000   0.18500]
+  [ 0.00000  -1.00000  -0.00000   0.00000]
+  [ 0.00000   0.00000  -1.00000   0.22800]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-9. Compute velocity error using target velocity if available:
-   - `latest_target_vel_` already exists
-   - if target velocity is stale, use zero desired velocity
-   - compute current Cartesian velocity as:
-     [
-     \dot x = J(q)\dot q
-     ]
-   - estimate `qdot` from `last_joint_state_->velocity` if available and valid; otherwise estimate from previous `q`.
+  q = [0, π/4, 0, 0, 0, 0]
+    Position  xyz  = [0.225061,  0.000000,  0.074716]  (m)
+    Orientation rpy = [180.000°,  45.000°,  0.000°]
 
-10. Add persistent member variable:
+  [ 0.70711   0.00000  -0.70711   0.22506]
+  [ 0.00000  -1.00000  -0.00000   0.00000]
+  [-0.70711   0.00000  -0.70711   0.07472]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-```cpp
-Eigen::Matrix<double, 6, 1> xdot_ref_;
-```
+  q = [0, 0, π/4, 0, 0, 0]
+    Position  xyz  = [0.164957,  0.000000,  0.356388]  (m)
+    Orientation rpy = [180.000°,  -45.000°,  0.000°]
 
-This stores the virtual Cartesian velocity state. 11. Reset `xdot_ref_` to zero whenever entering IDLE, STOP, INIT start, or POSE_FOLLOW start. 12. Add safety limits:
+  [ 0.70711  -0.00000   0.70711   0.16496]
+  [ 0.00000  -1.00000  -0.00000   0.00000]
+  [ 0.70711   0.00000  -0.70711   0.35639]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-- clamp `xdot_ref_` linear norm
-- clamp `xdot_ref_` angular norm
-- keep existing joint velocity and joint position safety checks unchanged.
+  q = [π/4]*6
+    Position  xyz  = [0.247457,  0.219173,  0.199673]  (m)
+    Orientation rpy = [120.361°,  8.421°,  104.639°]
 
-13. Add ROS parameters for tuning:
+  [-0.25000   0.45711   0.85355   0.24746]
+  [ 0.95711   0.25000   0.14645   0.21917]
+  [-0.14645   0.85355  -0.50000   0.19967]
+  [ 0.00000   0.00000   0.00000   1.00000]
 
-```cpp
-m_pos_min, m_pos_max
-k_pos_min, k_pos_max
-zeta_pos
+────────────────────────────────────────────────────────────────────────────────
+4. MODIFIED DH PARAMETERS  (Craig convention, extracted from URDF frames)
 
-m_ori_min, m_ori_max
-k_ori_min, k_ori_max
-zeta_ori
+   MDH convention for joint i:
+     T_i = Rot_x(α_{i-1}) · Trans_x(a_{i-1}) · Rot_z(θ_i + θ_offset) · Trans_z(d_i)
 
-adaptive_lambda
-adaptive_alpha_pos
-adaptive_alpha_ori
+   NOTE: KDL does NOT use DH internally — it uses the URDF origin+axis directly.
+   These DH values are derived from the URDF geometry for reference only.
+────────────────────────────────────────────────────────────────────────────────
+  Joint           a_prev(m)  α_prev(°)       d(m)  θ_offset(°)    axis in parent            z in base (at q=0)
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  joint_1_s         0.00000      0.000    0.10300        0.000  [ 0.00, 0.00, 1.00]        [ 0.000, 0.000, 1.000]
+  joint_2_l        -0.02000     90.000    0.00000        0.000  [ 0.00, 1.00, 0.00]        [ 0.000, 1.000, 0.000]
+  joint_3_u         0.00000    180.000    0.00000        0.000  [ 0.00,-1.00, 0.00]        [ 0.000,-1.000, 0.000]
+  joint_4_r         0.00000     90.000   -0.16500        0.000  [-1.00, 0.00, 0.00]        [-1.000, 0.000, 0.000]
+  joint_5_b         0.00000     90.000    0.00000        0.000  [ 0.00,-1.00, 0.00]        [ 0.000,-1.000, 0.000]
+  joint_6_t         0.00000     90.000    0.00000        0.000  [ 0.00, 0.00, 1.00]        [ 0.000, 0.000, 1.000]
 
-max_cart_linear_vel
-max_cart_angular_vel
-```
+────────────────────────────────────────────────────────────────────────────────
+5. SYMBOLIC FK CHAIN  — how each joint contributes
+────────────────────────────────────────────────────────────────────────────────
 
-14. Keep backward compatibility with existing params like `kp_max`, `ko_max`, `w0`, `k0`.
-15. Add clear comments explaining that this is an admittance-inspired Cartesian velocity controller, not a full torque-level impedance controller.
-16. Return the modified full C++ file, not just a diff.
+  KDL FK algorithm (ChainFkSolverPos_recursive):
+  ───────────────────────────────────────────────
+  T_result = I₄
 
-Current controller behavior to preserve:
+  For each segment i in the chain:
+    T_result = T_result  ×  T_fixed_i  ×  Rot(axis_i, q_i)
 
-- state machine: IDLE, INIT, POSE_FOLLOW, STOP
-- target pose integration from `/motomini/target_vel`
-- feedback publishers
-- SR inverse
-- joint safety checks
-- trajectory publishing
+  where:
+    T_fixed_i  = homogeneous transform from URDF <origin xyz rpy>
+               = [ R_rpy | t_xyz ]
+                 [  0 0 0 |   1  ]
 
-Goal:
-Upgrade only the main Cartesian control law so the robot moves smoother at startup, adapts faster when error is larger, softens near singularities, and is ready for future collision-force insertion.
+    Rot(axis, q) = [ Rodrigues(axis, q) | 0 ]   ← axis-angle rotation
+                   [      0   0   0     | 1 ]
+
+    Rodrigues:  R = I + sin(q)·[axis]× + (1−cos(q))·[axis]×²
+                [axis]× = skew-symmetric matrix of the unit axis vector
+
+  For the MotoMini chain:
+    T_base→tool0 = T_fix(j1) · Rz(q1)       ← joint_1_s  axis=[0,0,1]
+                 × T_fix(j2) · Ry(q2)        ← joint_2_l  axis=[0,1,0]
+                 × T_fix(j3) · R(-y)(q3)     ← joint_3_u  axis=[0,-1,0]
+                 × T_fix(j4) · R(-x)(q4)     ← joint_4_r  axis=[-1,0,0]
+                 × T_fix(j5) · R(-y)(q5)     ← joint_5_b  axis=[0,-1,0]
+                 × T_fix(j6) · Rz(q6)        ← joint_6_t  axis=[0,0,-1]  (wait: see actual)
+                 × T_fix(j6-tool0)            ← fixed offset: xyz=[0,0,-0.04] rpy=[π,0,0]
+
+────────────────────────────────────────────────────────────────────────────────
+6. IK ALGORITHM  (KDLInvKinChainLMA — Levenberg-Marquardt)
+────────────────────────────────────────────────────────────────────────────────
+
+  Minimises the task-space error  e(q) = log( T_fk(q)^{-1} · T_target )
+  (a 6-vector: 3 translation + 3 rotation)
+
+  Update rule per iteration:
+    Δq = −(JᵀWJ + λI)⁻¹ Jᵀ W e(q)
+
+  where:
+    J       = geometric Jacobian (6×6, see section below)
+    W       = diagonal task-space weight matrix  [configured via kdl_config.task_weights]
+              default all-ones: treats translation and rotation equally
+    λ       = Levenberg-Marquardt damping (auto-tuned each iteration)
+    e(q)    = 6D pose error vector in se(3) (twist coordinates)
+
+  Convergence check:  ‖e(q)‖ < ε  (default ε = 1e-5)
+  Max iterations: 500 (default)
+
+  Then:  q_{k+1} = q_k + Δq   (clipped to joint limits by KinematicGroup)
+
+────────────────────────────────────────────────────────────────────────────────
+7. JACOBIAN ALGORITHM  (KDL::ChainJntToJacSolver)
+────────────────────────────────────────────────────────────────────────────────
+
+  KDL computes the GEOMETRIC Jacobian expressed in the BASE frame.
+
+  For a 6-DOF revolute chain, column i of J (6×6):
+
+    J_i = [ z_{i-1} × (p_e − p_{i-1}) ]   ← linear  velocity part
+          [           z_{i-1}          ]   ← angular velocity part
+
+  where:
+    z_{i-1} = rotation axis of joint i, expressed in BASE frame
+            = R_{base→i-1} · axis_i_urdf
+
+    p_{i-1} = origin of joint i frame, in BASE coordinates
+            = T_base→i · [0,0,0,1]ᵀ (translation column)
+
+    p_e     = end-effector origin in BASE coordinates
+
+  Full matrix:
+    J(q) = [ z_0×(p_e-p_0)  z_1×(p_e-p_1)  ...  z_5×(p_e-p_5) ]
+           [     z_0              z_1        ...       z_5        ]
+
+  This is what your code calls as:
+    manip_->calcJacobian(q, base_link_, ee_link_)   →  Eigen::MatrixXd 6×6), write one tex file on (/home/vinbui/HCMUT/Thesis/LVTN/texdoc/chapter_ly_thuyet/) viết bằng tiếng việt và giải thích cụ thể 
