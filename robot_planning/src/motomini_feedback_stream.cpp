@@ -14,13 +14,13 @@
  * Topics:
  *   Sub:  /joint_states                    (sensor_msgs/JointState)
  *   Sub:  /motomini/target_pose            (geometry_msgs/PoseStamped)
- *   Sub:  /motomini/target_vel             (geometry_msgs/Twist — linear=world, angular=body)
+ *   Sub:  /motomini/target_vel             (geometry_msgs/TwistStamped — linear=world, angular=body)
  *   Sub:  /motomini/collision_wrench       (geometry_msgs/WrenchStamped)
  *   Sub:  /pose_following/init_pose        (geometry_msgs/PoseStamped, latched)
  *   Pub:  /joint_path_command              (trajectory_msgs/JointTrajectory – arm init, one-time)
  *   Pub:  joint_command                    (trajectory_msgs/JointTrajectory – streaming)
  *   Pub:  /motomini/feedback               (geometry_msgs/Twist — current EE xyz+rpy)
- *   Pub:  /motomini/feedback_vel           (geometry_msgs/Twist — current Cartesian J·θ̇)
+ *   Pub:  /motomini/feedback_vel           (geometry_msgs/TwistStamped — current Cartesian J·θ̇)
  *
  * Services:
  *   /pose_following/start      → reset to STATE_IDLE
@@ -125,6 +125,7 @@
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64.hpp>
@@ -327,7 +328,7 @@ public:
         // Current Cartesian velocity (J·θ̇) from joint feedback.
         // linear  = (vx, vy, vz)  [m/s]      base frame
         // angular = (ωx, ωy, ωz)  [rad/s]    base frame
-        pub_feedback_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(
+        pub_feedback_vel_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(
             "/motomini/feedback_vel", 10);
 
         // ----- Subscribers -----
@@ -343,7 +344,7 @@ public:
             "/pose_following/init_pose", 1,
             std::bind(&MotoMiniFeedbackStreamNode::initPoseCallback, this, std::placeholders::_1));
 
-        sub_target_vel_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        sub_target_vel_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
             "/motomini/target_vel", 10,
             std::bind(&MotoMiniFeedbackStreamNode::targetVelCallback, this, std::placeholders::_1));
 
@@ -747,13 +748,15 @@ private:
         const Eigen::MatrixXd J = manip_->calcJacobian(q, base_link_, ee_link_);
         const Eigen::VectorXd v_cart = J * qdot;
 
-        geometry_msgs::msg::Twist vmsg;
-        vmsg.linear.x = v_cart(0);
-        vmsg.linear.y = v_cart(1);
-        vmsg.linear.z = v_cart(2);
-        vmsg.angular.x = v_cart(3);
-        vmsg.angular.y = v_cart(4);
-        vmsg.angular.z = v_cart(5);
+        geometry_msgs::msg::TwistStamped vmsg;
+        vmsg.header.stamp = this->now();
+        vmsg.header.frame_id = base_link_;
+        vmsg.twist.linear.x = v_cart(0);
+        vmsg.twist.linear.y = v_cart(1);
+        vmsg.twist.linear.z = v_cart(2);
+        vmsg.twist.angular.x = v_cart(3);
+        vmsg.twist.angular.y = v_cart(4);
+        vmsg.twist.angular.z = v_cart(5);
         pub_feedback_vel_->publish(vmsg);
     }
 
@@ -1377,10 +1380,10 @@ private:
     // The velocity is integrated into desired_pose_ each tick (in handlePoseFollow).
     // This callback just caches what arrives. The integration guard in handlePoseFollow
     // uses the deadband to skip near-zero velocities, so no explicit zeroing is needed here.
-    void targetVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    void targetVelCallback(const geometry_msgs::msg::TwistStamped::SharedPtr msg)
     {
-        latest_target_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
-            msg->angular.x, msg->angular.y, msg->angular.z;
+        latest_target_vel_ << msg->twist.linear.x, msg->twist.linear.y, msg->twist.linear.z,
+            msg->twist.angular.x, msg->twist.angular.y, msg->twist.angular.z;
         t_last_target_vel_cb_ = this->now();
 
         // Velocity-only entry: seed desired_pose_ from current EE and start tracking.
@@ -1937,8 +1940,8 @@ private:
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_path_cmd_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_joint_cmd_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_vel_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_target_vel_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr pub_feedback_vel_;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_target_vel_;
     rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr sub_collision_wrench_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr sub_collision_distance_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr sub_collision_normal_;

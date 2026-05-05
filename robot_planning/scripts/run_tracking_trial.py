@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist, TwistStamped
 from rcl_interfaces.msg import Log
 from sensor_msgs.msg import JointState
 from tf2_ros import TransformBroadcaster, Buffer, TransformListener
@@ -54,7 +54,7 @@ class TrackingTrialNode(Node):
         self.rosout_sub = self.create_subscription(Log, '/rosout', self.rosout_cb, 100)
         self.feedback_sub = self.create_subscription(Twist, '/motomini/feedback', self.feedback_cb, 10)
         self.joint_sub = self.create_subscription(JointState, '/joint_states', self.joint_cb, 10)
-        self.feedback_vel_sub = self.create_subscription(Twist, '/motomini/feedback_vel', self.feedback_vel_cb, 10)
+        self.feedback_vel_sub = self.create_subscription(TwistStamped, '/motomini/feedback_vel', self.feedback_vel_cb, 10)
         
         self.tf_broadcaster = TransformBroadcaster(self)
         self.pose_topic = '/motomini/target_pose'
@@ -164,7 +164,7 @@ class TrackingTrialNode(Node):
         if not self.recording_active:
             return
         t = time.time() - self.recording_start_time
-        self.feedback_vel_data.append((t, msg.linear.x, msg.linear.y, msg.linear.z))
+        self.feedback_vel_data.append((t, msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z))
 
     def run_trial(self):
         # Spin the node in a background thread to ensure timers run smoothly

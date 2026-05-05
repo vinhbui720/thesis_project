@@ -2,13 +2,16 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <set>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <sstream>
 #include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <string>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -41,28 +44,25 @@ public:
         // Wrench framing
         this->declare_parameter<std::string>("wrench_frame", "world");
         this->declare_parameter<std::string>("wrench_reference_link", "tool0");
+        this->declare_parameter<std::string>("collision_command_frame", "world");
 
         // Force model
         this->declare_parameter<double>("collision_influence_distance", 0.10);
         this->declare_parameter<double>("collision_safe_distance", 0.04);
-        this->declare_parameter<double>("collision_k_rep", 0.0005);
         this->declare_parameter<double>("collision_k_hold", 50.0);
         this->declare_parameter<double>("collision_force_max_per_contact", 10.0);
         this->declare_parameter<double>("collision_force_max_total", 25.0);
         
-        // New Normal Force model
-        this->declare_parameter<double>("collision_normal_force_max", 6.0);
-        this->declare_parameter<double>("collision_normal_fade_power", 1.0);
+        this->declare_parameter<double>("collision_k_rep", 0.0002);
         this->declare_parameter<double>("collision_normal_damping", 8.0);
         
         // Tangential sliding force
         this->declare_parameter<bool>("collision_tangent_enabled", true);
         this->declare_parameter<double>("collision_tangent_gain", 4.0);
+        this->declare_parameter<double>("collision_tangent_damping", 1.0);
         this->declare_parameter<double>("collision_tangent_force_max", 4.0);
         this->declare_parameter<double>("collision_tangent_force_ratio", 0.35);
-        this->declare_parameter<double>("collision_tangent_gamma_power", 2.0);
-        this->declare_parameter<double>("collision_tangent_speed_scale", 0.05);
-        this->declare_parameter<double>("collision_tangent_velocity_deadband", 0.01);
+        this->declare_parameter<std::string>("collision_tangent_escape_axis", "z");
         
         // Force filtering
         this->declare_parameter<double>("collision_force_attack_hz", 20.0);
@@ -77,7 +77,6 @@ public:
         // Force-arrow shaping
         this->declare_parameter<double>("force_arrow_min_length", 0.01);
         this->declare_parameter<double>("force_arrow_max_length", 0.25);
-        this->declare_parameter<double>("force_arrow_length_gain", 0.04);
 
         std::string urdf_xml, srdf_xml;
         this->get_parameter("robot_description", urdf_xml);
@@ -93,6 +92,7 @@ public:
 
         wrench_frame_ = this->get_parameter("wrench_frame").as_string();
         wrench_reference_link_ = this->get_parameter("wrench_reference_link").as_string();
+        collision_command_frame_ = this->get_parameter("collision_command_frame").as_string();
 
         collision_influence_distance_ = this->get_parameter("collision_influence_distance").as_double();
         collision_safe_distance_ = this->get_parameter("collision_safe_distance").as_double();
@@ -101,17 +101,14 @@ public:
         collision_force_max_per_contact_ = this->get_parameter("collision_force_max_per_contact").as_double();
         collision_force_max_total_ = this->get_parameter("collision_force_max_total").as_double();
 
-        collision_normal_force_max_ = this->get_parameter("collision_normal_force_max").as_double();
-        collision_normal_fade_power_ = this->get_parameter("collision_normal_fade_power").as_double();
         collision_normal_damping_ = this->get_parameter("collision_normal_damping").as_double();
 
         collision_tangent_enabled_ = this->get_parameter("collision_tangent_enabled").as_bool();
         collision_tangent_gain_ = this->get_parameter("collision_tangent_gain").as_double();
+        collision_tangent_damping_ = this->get_parameter("collision_tangent_damping").as_double();
         collision_tangent_force_max_ = this->get_parameter("collision_tangent_force_max").as_double();
         collision_tangent_force_ratio_ = this->get_parameter("collision_tangent_force_ratio").as_double();
-        collision_tangent_gamma_power_ = this->get_parameter("collision_tangent_gamma_power").as_double();
-        collision_tangent_speed_scale_ = this->get_parameter("collision_tangent_speed_scale").as_double();
-        collision_tangent_velocity_deadband_ = this->get_parameter("collision_tangent_velocity_deadband").as_double();
+        collision_tangent_escape_axis_ = this->get_parameter("collision_tangent_escape_axis").as_string();
         
         collision_force_attack_hz_ = this->get_parameter("collision_force_attack_hz").as_double();
         collision_force_release_hz_ = this->get_parameter("collision_force_release_hz").as_double();
@@ -123,7 +120,6 @@ public:
 
         force_arrow_min_length_ = this->get_parameter("force_arrow_min_length").as_double();
         force_arrow_max_length_ = this->get_parameter("force_arrow_max_length").as_double();
-        force_arrow_length_gain_ = this->get_parameter("force_arrow_length_gain").as_double();
 
         threshold_ = std::max(1e-6, threshold_);
         contact_point_radius_ = std::max(1e-4, contact_point_radius_);
@@ -164,6 +160,12 @@ public:
         contact_manager_->setActiveCollisionObjects(env_->getActiveLinkNames());
         contact_manager_->setDefaultCollisionMargin(contact_margin_);
 
+        // Cache active (robot) link names for correct push-away direction selection.
+        // Tesseract does not guarantee which side of a contact pair is the robot,
+        // so we resolve it explicitly at runtime.
+        const auto active_links = env_->getActiveLinkNames();
+        active_link_names_ = std::set<std::string>(active_links.begin(), active_links.end());
+
         contact_request_ = tesseract_collision::ContactRequest(tesseract_collision::ContactTestType::ALL);
         contact_request_.calculate_distance = true;
         contact_request_.calculate_penetration = true;
@@ -181,12 +183,15 @@ public:
         joint_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 10,
             std::bind(&OnlineCollisionDebugger::jointStateCallback, this, std::placeholders::_1));
-        target_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        target_vel_sub_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
             "/motomini/target_vel", 10,
             std::bind(&OnlineCollisionDebugger::targetVelCallback, this, std::placeholders::_1));
-        feedback_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+        feedback_vel_sub_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
             "/motomini/feedback_vel", 10,
             std::bind(&OnlineCollisionDebugger::feedbackVelCallback, this, std::placeholders::_1));
+        target_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+            "/motomini/target_pose", 10,
+            std::bind(&OnlineCollisionDebugger::targetPoseCallback, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(),
                     "Online Collision Debugger started. threshold=%.3f m, influence=%.3f m, safe=%.3f m, "
@@ -195,6 +200,14 @@ public:
                     collision_guard_distance_, collision_task_distance_, collision_stop_distance_,
                     debug_markers_enabled_ ? "on" : "off",
                     publish_collision_wrench_ ? "on" : "off");
+
+        if (wrench_frame_ != collision_command_frame_)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Frame assumption warning: wrench_frame (%s) != collision_command_frame (%s). "
+                        "Twist topics have no header, so target/feedback velocities are assumed in collision_command_frame.",
+                        wrench_frame_.c_str(), collision_command_frame_.c_str());
+        }
     }
 
 private:
@@ -255,12 +268,9 @@ private:
     }
 
     double targetVelocityTimeout() const { return 0.2; }
-    double tangentialVelocityDeadband() const { return collision_tangent_velocity_deadband_; }
-    double tangentialSpeedScale() const { return collision_tangent_speed_scale_; }
     double tangentialForceLimit() const { 
         return std::min(collision_tangent_force_max_, collision_tangent_force_ratio_ * collision_force_max_total_); 
     }
-    double tangentialForceGain() const { return collision_tangent_gain_; }
     double collisionForceAttackHz() const { return collision_force_attack_hz_; }
     double collisionForceReleaseHz() const { return collision_force_release_hz_; }
 
@@ -270,11 +280,90 @@ private:
         if (age > 0.2)
             return 0.0;
 
-        const double v_n = latest_feedback_vel_linear_.dot(n_away);
+        if (!n_away.allFinite() || n_away.norm() < 1e-9)
+            return 0.0;
+
+        const Eigen::Vector3d n = n_away.normalized();
+        const double v_n = latest_feedback_vel_linear_.dot(n);
+
+        // Only damp motion going into the obstacle.
         if (v_n >= 0.0)
             return 0.0;
 
-        return collision_normal_damping_ * (-v_n);
+        const double raw = collision_normal_damping_ * (-v_n);
+
+        // Fixed cap for damping (e.g. 5.0) since we use inverse square spring force now
+        const double damping_cap = 5.0;
+
+        return std::clamp(raw, 0.0, damping_cap);
+    }
+
+    Eigen::Vector3d smoothDirection(const Eigen::Vector3d& raw_dir,
+                                    Eigen::Vector3d& filtered_dir,
+                                    bool& have_filtered_dir,
+                                    double alpha)
+    {
+        const double eps = 1e-9;
+
+        if (!raw_dir.allFinite() || raw_dir.norm() < eps)
+            return Eigen::Vector3d::Zero();
+
+        Eigen::Vector3d d = raw_dir.normalized();
+
+        if (!have_filtered_dir ||
+            !filtered_dir.allFinite() ||
+            filtered_dir.norm() < eps)
+        {
+            filtered_dir = d;
+            have_filtered_dir = true;
+            return filtered_dir;
+        }
+
+        // Prevent sudden 180 degree sign flip.
+        if (d.dot(filtered_dir) < 0.0)
+            d = -d;
+
+        filtered_dir = (1.0 - alpha) * filtered_dir + alpha * d;
+
+        if (!filtered_dir.allFinite() || filtered_dir.norm() < eps)
+        {
+            filtered_dir = d;
+        }
+        else
+        {
+            filtered_dir.normalize();
+        }
+
+        return filtered_dir;
+    }
+
+
+    Eigen::Vector3d smoothTangentialForce(const Eigen::Vector3d& raw_force)
+    {
+        const rclcpp::Time now = this->now();
+
+        double dt = 0.0;
+        if (have_force_filter_state_)
+            dt = (now - t_last_force_filter_update_).seconds();
+
+        if (!raw_force.allFinite())
+            return Eigen::Vector3d::Zero();
+
+        if (!have_filtered_tangent_force_ || dt <= 0.0 || dt > 1.0)
+        {
+            filtered_tangent_force_ = raw_force;
+            have_filtered_tangent_force_ = true;
+            return filtered_tangent_force_;
+        }
+
+        // Tangent should be slower than normal force because it changes direction more easily.
+        const double alpha = lowPassAlpha(4.0, dt);
+        filtered_tangent_force_ += alpha * (raw_force - filtered_tangent_force_);
+
+        if (filtered_tangent_force_.norm() < 1e-6 && raw_force.norm() < 1e-6)
+            filtered_tangent_force_.setZero();
+
+        return filtered_tangent_force_;
     }
 
     static double smoothstep(double x)
@@ -283,33 +372,85 @@ private:
         return x * x * (3.0 - 2.0 * x);
     }
 
+    static Eigen::Vector3d smoothSaturate(const Eigen::Vector3d& f, double limit)
+    {
+        if (!f.allFinite() || limit <= 1e-9)
+            return Eigen::Vector3d::Zero();
+
+        const double norm = f.norm();
+        if (norm < 1e-9)
+            return Eigen::Vector3d::Zero();
+
+        const double mag = limit * std::tanh(norm / limit);
+        return mag * f / norm;
+    }
+
     double tangentialProjectionEpsilon() const
     {
         const double span = std::max(1e-6, collision_guard_distance_ - collision_task_distance_);
         return std::max(1e-6, 0.05 * span);
     }
 
-    Eigen::Vector3d fallbackTangent(const Eigen::Vector3d &n_away) const
+    Eigen::Vector3d chooseEscapeDirectionOptionB(const Eigen::Vector3d& n) const
     {
-        Eigen::Vector3d tangent = n_away.cross(Eigen::Vector3d::UnitZ());
-        if (!tangent.allFinite() || tangent.norm() < tangentialProjectionEpsilon())
-            tangent = n_away.cross(Eigen::Vector3d::UnitX());
-        if (!tangent.allFinite() || tangent.norm() < tangentialProjectionEpsilon())
-            tangent = Eigen::Vector3d::UnitY();
-        return tangent.normalized();
+        const double eps = 1e-6;
+
+        Eigen::Vector3d nn = n;
+        if (!nn.allFinite() || nn.norm() < eps)
+            return Eigen::Vector3d::Zero();
+        nn.normalize();
+
+        const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - nn * nn.transpose();
+
+        auto project_axis = [&](const Eigen::Vector3d& axis) -> Eigen::Vector3d {
+            Eigen::Vector3d u = P * axis;
+            if (u.allFinite() && u.norm() > eps)
+                return u.normalized();
+            return Eigen::Vector3d::Zero();
+        };
+
+        Eigen::Vector3d u = Eigen::Vector3d::Zero();
+        if (collision_tangent_escape_axis_ == "x")
+        {
+            u = project_axis(Eigen::Vector3d::UnitX());
+        }
+        else if (collision_tangent_escape_axis_ == "y")
+        {
+            u = project_axis(Eigen::Vector3d::UnitY());
+        }
+        else
+        {
+            u = project_axis(Eigen::Vector3d::UnitZ());
+        }
+
+        if (u.norm() < eps) u = project_axis(Eigen::Vector3d::UnitX());
+        if (u.norm() < eps) u = project_axis(Eigen::Vector3d::UnitY());
+        if (u.norm() < eps) u = project_axis(Eigen::Vector3d::UnitZ());
+
+        // Keep only sign continuity from the previous tangent direction.
+        if (last_tangent_dir_.allFinite() &&
+            last_tangent_dir_.norm() > eps &&
+            u.norm() > eps &&
+            u.dot(last_tangent_dir_) < 0.0)
+        {
+            u = -u;
+        }
+
+        return u;
     }
 
-    Eigen::Vector3d computeTangentialForce(double distance, const Eigen::Vector3d &n_away) 
+    Eigen::Vector3d computeTangentialForceAdvanced(
+        double distance,
+        const Eigen::Vector3d& n_away,
+        const Eigen::Vector3d& ee_position,
+        const Eigen::Vector3d& /*obstacle_point*/,
+        const Eigen::Vector3d& f_push)
     {
-        if (!collision_tangent_enabled_) return Eigen::Vector3d::Zero();
-
-        const double target_age = (this->now() - t_last_target_vel_cb_).seconds();
-        const double v_deadband = tangentialVelocityDeadband();
-        if (target_age > targetVelocityTimeout())
+        if (!collision_tangent_enabled_)
             return Eigen::Vector3d::Zero();
 
-        Eigen::Vector3d v_goal = latest_target_vel_linear_;
-        if (!v_goal.allFinite() || v_goal.norm() <= v_deadband)
+        const double pose_age = (this->now() - t_last_target_pose_cb_).seconds();
+        if (!have_target_position_ || pose_age > 0.2)
             return Eigen::Vector3d::Zero();
 
         Eigen::Vector3d n = n_away;
@@ -317,35 +458,89 @@ private:
             return Eigen::Vector3d::Zero();
         n.normalize();
 
-        const double v_into = v_goal.dot(n);
-        if (v_into >= -v_deadband)
+        // Weight: 0 khi d >= d_influence, tăng dần đến 1 khi d <= d_safe.
+        const double d0  = std::max(1e-6, collision_influence_distance_);
+        const double d_s = std::clamp(collision_safe_distance_, 1e-6, d0 - 1e-6);
+        const double t   = std::clamp((d0 - distance) / std::max(1e-6, d0 - d_s), 0.0, 1.0);
+        const double w   = smoothstep(t);
+        if (w <= 1e-6)
             return Eigen::Vector3d::Zero();
 
-        const Eigen::Vector3d v_proj = v_goal - v_into * n;
-        Eigen::Vector3d tangent = Eigen::Vector3d::Zero();
-        if (v_proj.norm() >= tangentialProjectionEpsilon())
-            tangent = v_proj.normalized();
-        else if (last_tangent_dir_.allFinite() && last_tangent_dir_.norm() >= 1e-9)
-            tangent = last_tangent_dir_.normalized();
-        else
-            tangent = fallbackTangent(n);
+        // Projection matrix onto tangential plane (perpendicular to n_away).
+        const Eigen::Matrix3d P = Eigen::Matrix3d::Identity() - n * n.transpose();
 
-        if (last_tangent_dir_.allFinite() &&
-            last_tangent_dir_.norm() >= 1e-9 &&
-            tangent.dot(last_tangent_dir_) < 0.0)
-            tangent = -tangent;
-        last_tangent_dir_ = tangent;
+        // ── PD trong mặt phẳng tiếp tuyến ────────────────────────────────────
+        // e_tau: lỗi vị trí tiếp tuyến (từ EE đến target, chiếu lên mặt phẳng)
+        const Eigen::Vector3d e_tau = P * (latest_target_position_ - ee_position);
 
-        const double gamma = computeProjectionGamma(distance);
-        if (gamma <= 0.0)
+        // de_tau: lỗi vận tốc tiếp tuyến
+        Eigen::Vector3d de_tau = Eigen::Vector3d::Zero();
+        const double tvel_age  = (this->now() - t_last_target_vel_cb_).seconds();
+        const double fvel_age  = (this->now() - t_last_feedback_vel_cb_).seconds();
+        if (tvel_age <= targetVelocityTimeout() && fvel_age <= 0.2 &&
+            latest_target_vel_linear_.allFinite() &&
+            latest_feedback_vel_linear_.allFinite())
+        {
+            de_tau = P * (latest_target_vel_linear_ - latest_feedback_vel_linear_);
+        }
+
+        // Lực PD thuần — không có escape term (escape term gây lực sai hướng).
+        Eigen::Vector3d f_tan = collision_tangent_gain_ * e_tau
+                              + collision_tangent_damping_ * de_tau;
+
+        // Chiếu lại lần nữa để loại bỏ sai số số học (đảm bảo thuần tiếp tuyến).
+        f_tan = P * f_tan;
+
+        if (!f_tan.allFinite())
             return Eigen::Vector3d::Zero();
 
-        const double approach_ratio = std::clamp((-v_into - v_deadband) / tangentialSpeedScale(), 0.0, 1.0);
-        
-        const double gamma_shape = std::pow(std::clamp(gamma, 0.0, 1.0), collision_tangent_gamma_power_);
-        const double tangential_mag = tangentialForceGain() * gamma_shape * approach_ratio;
-        
-        return clampNorm(tangential_mag * tangent, tangentialForceLimit());
+        // ── Giới hạn biên độ ─────────────────────────────────────────────────
+        // Tangent không được chiếm phần lớn budget lực tổng.
+        const double push_norm = f_push.norm();
+        const double total_budget = std::max(0.0, collision_force_max_total_);
+        const double remaining = std::sqrt(
+            std::max(0.0, total_budget * total_budget - push_norm * push_norm));
+
+        const double cap = std::min(tangentialForceLimit(), remaining);
+        const double active_limit = w * cap;
+
+        // Scale down magnitude, keep direction.
+        const double mag = f_tan.norm();
+        if (mag > active_limit && mag > 1e-9)
+            f_tan *= (active_limit / mag);
+
+        // ── Safety: lực tiếp tuyến không được triệt tiêu lực pháp tuyến ─────
+        // Nếu (F_normal + F_tan) · n̂ < 0 → clip phần vi phạm.
+        const double fn_combined = (f_push + f_tan).dot(n);
+        if (fn_combined < 0.0)
+        {
+            // Bỏ phần của f_tan gây vi phạm.
+            f_tan -= fn_combined * n;
+            // Chiếu lại để đảm bảo thuần tiếp tuyến sau khi clip.
+            f_tan = P * f_tan;
+        }
+
+        return f_tan;
+    }
+
+    Eigen::Vector3d chooseObstaclePointForNaway(const tesseract_collision::ContactResult& result,
+                                                const Eigen::Vector3d& n_away) const
+    {
+        const Eigen::Vector3d p0 = result.nearest_points[0];
+        const Eigen::Vector3d p1 = result.nearest_points[1];
+        if (!p0.allFinite() || !p1.allFinite())
+            return 0.5 * (p0 + p1);
+
+        if (!n_away.allFinite() || n_away.norm() < 1e-9)
+            return 0.5 * (p0 + p1);
+
+        const Eigen::Vector3d n = n_away.normalized();
+        const Eigen::Vector3d mid = 0.5 * (p0 + p1);
+        const double s0 = (p0 - mid).dot(n);
+        const double s1 = (p1 - mid).dot(n);
+
+        // n_away points obstacle->EE, so obstacle-side point has smaller projection on n_away.
+        return (s0 <= s1) ? p0 : p1;
     }
 
     Eigen::Vector3d smoothPublishedForce(const Eigen::Vector3d &raw_force)
@@ -386,7 +581,6 @@ private:
     Eigen::Vector3d computeCollisionForce(double distance, const Eigen::Vector3d &push_dir) const
     {
         const double d0 = std::max(1e-6, collision_influence_distance_);
-        const double d_safe = std::clamp(collision_safe_distance_, 0.0, d0 - 1e-6);
 
         if (distance >= d0)
             return Eigen::Vector3d::Zero();
@@ -396,13 +590,22 @@ private:
             return Eigen::Vector3d::Zero();
         n.normalize();
 
-        const double s = std::clamp((d0 - distance) / std::max(1e-6, d0 - d_safe), 0.0, 1.0);
+        const double d = std::max(distance, 1e-4);
+
+        // gamma = 0 far from wall, gamma = 1 at/inside task wall.
         const double wall_gamma = computeProjectionGamma(distance);
 
-        const double fade = std::pow(std::clamp(1.0 - wall_gamma, 0.0, 1.0), collision_normal_fade_power_);
+        // Normal spring fades out as the controller wall activates.
+        // This prevents spring/string oscillation at the edge.
+        const double spring_scale = 1.0 - wall_gamma;
 
-        const double rep_mag = collision_normal_force_max_ * smoothstep(s) * fade;
+        const double rep_mag =
+            spring_scale *
+            collision_k_rep_ *
+            (1.0 / d - 1.0 / d0) /
+            (d * d);
 
+        // Emergency-only hold.
         double hold_mag = 0.0;
         if (distance < collision_stop_distance_)
         {
@@ -418,8 +621,6 @@ private:
 
     Eigen::Vector3d contactNormal0To1(const tesseract_collision::ContactResult &result) const
     {
-        // Tesseract normal points from link_names[0] to link_names[1], and is
-        // the direction to move link_names[1] away from link_names[0].
         Eigen::Vector3d normal = result.normal;
         if (!normal.allFinite() || normal.norm() < 1e-9)
             normal = result.nearest_points[1] - result.nearest_points[0];
@@ -641,18 +842,38 @@ private:
         collision_wrench_pub_->publish(msg);
     }
 
-    void targetVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    void targetVelCallback(const geometry_msgs::msg::TwistStamped::SharedPtr msg)
     {
         latest_target_vel_linear_ <<
-            msg->linear.x, msg->linear.y, msg->linear.z;
+            msg->twist.linear.x, msg->twist.linear.y, msg->twist.linear.z;
         t_last_target_vel_cb_ = this->now();
     }
 
-    void feedbackVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+    void feedbackVelCallback(const geometry_msgs::msg::TwistStamped::SharedPtr msg)
     {
         latest_feedback_vel_linear_ <<
-            msg->linear.x, msg->linear.y, msg->linear.z;
+            msg->twist.linear.x, msg->twist.linear.y, msg->twist.linear.z;
         t_last_feedback_vel_cb_ = this->now();
+    }
+
+    void targetPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+    {
+        if (!msg->header.frame_id.empty() &&
+            msg->header.frame_id != collision_command_frame_)
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 5000,
+                "Ignoring /motomini/target_pose in frame '%s' (expected '%s').",
+                msg->header.frame_id.c_str(), collision_command_frame_.c_str());
+            return;
+        }
+
+        latest_target_position_ <<
+            msg->pose.position.x,
+            msg->pose.position.y,
+            msg->pose.position.z;
+        t_last_target_pose_cb_ = this->now();
+        have_target_position_ = true;
     }
 
     // Publish closest-contact constraint data so the controller can run
@@ -770,6 +991,7 @@ private:
         double closest_distance = std::numeric_limits<double>::infinity();
         Eigen::Vector3d closest_n_away = Eigen::Vector3d::Zero();
         Eigen::Vector3d closest_contact_point = Eigen::Vector3d::Zero();
+        Eigen::Vector3d closest_obstacle_point = Eigen::Vector3d::Zero();
         bool has_closest = false;
 
         auto acm = env_->getAllowedCollisionMatrix();
@@ -799,21 +1021,41 @@ private:
                 const Eigen::Vector3d clearance_vector =
                     result.nearest_points[1] - result.nearest_points[0];
 
-                // Push-away convention from the upgrade plan:
-                //   normal_0_to_1 pushes link1 away from link0,
-                //   so the force on link0 uses -normal, link1 uses +normal.
+                // Determine which side of the contact pair is the robot.
+                // normal_0_to_1 points link0 → link1 (separates link1 from link0).
+                const bool link0_is_active = (active_link_names_.count(result.link_names[0]) > 0);
+                const bool link1_is_active = (active_link_names_.count(result.link_names[1]) > 0);
+                
+                bool robot_is_link1 = true;
+                if (link1_is_active && !link0_is_active) {
+                    robot_is_link1 = true;  // Robot is link1, push along +normal
+                } else if (link0_is_active && !link1_is_active) {
+                    robot_is_link1 = false; // Robot is link0, push along -normal
+                } else {
+                    // Self-collision (both active). 
+                    // We apply the wrench at the end-effector. We want the end-effector
+                    // to move away from the other link. Assume the higher-alphanumeric 
+                    // link name is closer to the end-effector (e.g. link_6_t > link_2_l).
+                    robot_is_link1 = (result.link_names[1] > result.link_names[0]);
+                }
+
+                // Direction the robot must move to escape the contact.
+                Eigen::Vector3d n_away_for_contact =
+                    robot_is_link1 ? normal_0_to_1 : -normal_0_to_1;
+
+                if (!n_away_for_contact.allFinite() || n_away_for_contact.norm() < 1e-9)
+                    n_away_for_contact = Eigen::Vector3d::Zero();
+                else
+                    n_away_for_contact.normalize();
+
+                // Per-link forces (kept for RViz arrows; controller uses n_away_for_contact).
                 const Eigen::Vector3d force_on_link0 =
                     computeCollisionForce(result.distance, -normal_0_to_1);
                 const Eigen::Vector3d force_on_link1 =
                     computeCollisionForce(result.distance, normal_0_to_1);
 
-                // Robot-side selection: pick the larger of the two as the
-                // controller-facing force. For external obstacles only one
-                // side is active; for self-collision both are equal-and-
-                // opposite and this picks one consistently.
-                Eigen::Vector3d force_for_controller = force_on_link0;
-                if (force_on_link1.norm() > force_on_link0.norm())
-                    force_for_controller = force_on_link1;
+                const Eigen::Vector3d force_for_controller =
+                    computeCollisionForce(result.distance, n_away_for_contact);
 
                 const Eigen::Vector3d contact_point =
                     0.5 * (result.nearest_points[0] + result.nearest_points[1]);
@@ -821,22 +1063,12 @@ private:
                 total_force += force_for_controller;
                 total_torque += (contact_point - wrench_ref).cross(force_for_controller);
 
-                // n_away MUST track the wrench's controller-facing direction.
-                // The two per-link forces have identical magnitude (same d,
-                // same model), so the wrench's tie-breaker always keeps
-                // force_on_link0; deriving n_away from force_for_controller
-                // guarantees the same sign and avoids a flipped-normal bug
-                // where the controller would project away the safe motion.
-                Eigen::Vector3d n_away_for_contact = Eigen::Vector3d::Zero();
-                if (force_for_controller.allFinite() &&
-                    force_for_controller.norm() > 1e-9)
-                    n_away_for_contact = force_for_controller.normalized();
-
                 if (result.distance < closest_distance)
                 {
                     closest_distance = result.distance;
                     closest_n_away = n_away_for_contact;
                     closest_contact_point = contact_point;
+                    closest_obstacle_point = chooseObstaclePointForNaway(result, n_away_for_contact);
                     has_closest = true;
                 }
 
@@ -873,12 +1105,101 @@ private:
         }
 
         Eigen::Vector3d tangential_force = Eigen::Vector3d::Zero();
-        if (has_closest)
-            tangential_force = computeTangentialForce(closest_distance, closest_n_away);
+        Eigen::Vector3d push_force_for_control = Eigen::Vector3d::Zero();
 
-        total_force += tangential_force;
-        total_force = clampNorm(total_force, collision_force_max_total_);
+        if (has_closest && !std::isfinite(closest_distance))
+        {
+            has_closest = false;
+        }
+
+        if (has_closest &&
+            (!closest_n_away.allFinite() || closest_n_away.norm() < 1e-9))
+        {
+            has_closest = false;
+        }
+
+        if (has_closest)
+        {
+            push_force_for_control =
+                computeCollisionForce(closest_distance, closest_n_away);
+
+            // ── Layer 1: Hard gate ────────────────────────────────────────────
+            // Khi robot đã xuyên vào vùng stop, pháp tuyến không ổn định và
+            // e_τ có thể trỏ xuyên qua vật cản.  Tắt hoàn toàn lực tiếp tuyến
+            // để chỉ còn lực đẩy cứng đưa robot ra ngoài.
+            const bool in_penetration_zone =
+                (closest_distance <= collision_stop_distance_);
+
+            if (!in_penetration_zone)
+            {
+                tangential_force = computeTangentialForceAdvanced(
+                    closest_distance,
+                    closest_n_away,
+                    wrench_ref,
+                    closest_obstacle_point,
+                    push_force_for_control);
+            }
+
+            // ── Layer 2: Distance fade-out ────────────────────────────────────
+            // Giảm dần lực tiếp tuyến khi tiến vào vùng [stop, task].
+            // Tránh chuyển đổi on/off đột ngột gây giật.
+            if (tangential_force.norm() > 1e-9)
+            {
+                const double span = std::max(
+                    1e-6, collision_task_distance_ - collision_stop_distance_);
+                const double fade = std::clamp(
+                    (closest_distance - collision_stop_distance_) / span,
+                    0.0, 1.0);
+                tangential_force *= fade;
+            }
+
+            // ── Layer 3: Net-force normal clamp ───────────────────────────────
+            // Đảm bảo lực tổng (pháp + tiếp tuyến) không bao giờ kéo robot vào
+            // vật cản.  Cắt bỏ phần thành phần âm dọc n̂ khỏi lực tiếp tuyến.
+            {
+                const double fn_combined =
+                    (push_force_for_control + tangential_force).dot(closest_n_away);
+                const double fn_normal = push_force_for_control.dot(closest_n_away);
+
+                if (fn_combined < fn_normal * 0.5)
+                {
+                    // Tiếp tuyến đang triệt tiêu hơn 50% lực pháp tuyến: cắt.
+                    const double excess = fn_combined - fn_normal * 0.5;
+                    tangential_force -= excess * closest_n_away;
+                }
+            }
+
+            // Remove any residual numerical normal component from tangential force.
+            const Eigen::Matrix3d P =
+                Eigen::Matrix3d::Identity() - closest_n_away * closest_n_away.transpose();
+            tangential_force = P * tangential_force;
+
+            total_force = push_force_for_control + tangential_force;
+
+            // Final safety clamp after normal + tangent are combined.
+            total_force = smoothSaturate(total_force, collision_force_max_total_);
+        }
+        else
+        {
+            total_force.setZero();
+            total_torque.setZero();
+
+            have_filtered_n_away_ = false;
+            filtered_n_away_.setZero();
+
+            have_filtered_tangent_dir_ = false;
+            filtered_tangent_dir_.setZero();
+
+            have_filtered_tangent_force_ = false;
+            filtered_tangent_force_.setZero();
+
+            last_tangent_dir_.setZero();
+        }
+
         total_force = smoothPublishedForce(total_force);
+
+        if (has_closest)
+            total_torque = (closest_contact_point - wrench_ref).cross(total_force);
 
         const std::string zone =
             has_closest ? classifyZone(closest_distance) : std::string("FREE");
@@ -918,14 +1239,16 @@ private:
     }
 
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr target_vel_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr feedback_vel_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr target_vel_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr feedback_vel_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_sub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr contact_debug_pub_;
     rclcpp::Publisher<geometry_msgs::msg::WrenchStamped>::SharedPtr collision_wrench_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr collision_distance_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Vector3Stamped>::SharedPtr collision_normal_pub_;
     std::shared_ptr<tesseract_environment::Environment> env_;
+    std::set<std::string> active_link_names_; // robot-side links for normal-direction selection
 
     tesseract_collision::DiscreteContactManager::Ptr contact_manager_;
     tesseract_collision::ContactRequest contact_request_;
@@ -941,6 +1264,7 @@ private:
 
     std::string wrench_frame_;
     std::string wrench_reference_link_;
+    std::string collision_command_frame_;
 
     double collision_influence_distance_;
     double collision_safe_distance_;
@@ -955,18 +1279,14 @@ private:
 
     double force_arrow_min_length_;
     double force_arrow_max_length_;
-    double force_arrow_length_gain_;
-    double collision_normal_force_max_;
-    double collision_normal_fade_power_;
     double collision_normal_damping_;
 
     bool collision_tangent_enabled_;
     double collision_tangent_gain_;
+    double collision_tangent_damping_;
     double collision_tangent_force_max_;
     double collision_tangent_force_ratio_;
-    double collision_tangent_gamma_power_;
-    double collision_tangent_speed_scale_;
-    double collision_tangent_velocity_deadband_;
+    std::string collision_tangent_escape_axis_;
     
     double collision_force_attack_hz_;
     double collision_force_release_hz_;
@@ -974,12 +1294,24 @@ private:
 
     Eigen::Vector3d latest_target_vel_linear_{Eigen::Vector3d::Zero()};
     rclcpp::Time t_last_target_vel_cb_{0, 0, RCL_ROS_TIME};
+    Eigen::Vector3d latest_target_position_{Eigen::Vector3d::Zero()};
+    rclcpp::Time t_last_target_pose_cb_{0, 0, RCL_ROS_TIME};
+    bool have_target_position_{false};
     Eigen::Vector3d latest_feedback_vel_linear_{Eigen::Vector3d::Zero()};
     rclcpp::Time t_last_feedback_vel_cb_{0, 0, RCL_ROS_TIME};
     Eigen::Vector3d last_tangent_dir_{Eigen::Vector3d::Zero()};
     Eigen::Vector3d filtered_total_force_{Eigen::Vector3d::Zero()};
     rclcpp::Time t_last_force_filter_update_{0, 0, RCL_ROS_TIME};
     bool have_force_filter_state_{false};
+
+    Eigen::Vector3d filtered_n_away_{Eigen::Vector3d::Zero()};
+    bool have_filtered_n_away_{false};
+
+    Eigen::Vector3d filtered_tangent_dir_{Eigen::Vector3d::Zero()};
+    bool have_filtered_tangent_dir_{false};
+
+    Eigen::Vector3d filtered_tangent_force_{Eigen::Vector3d::Zero()};
+    bool have_filtered_tangent_force_{false};
 };
 
 int main(int argc, char **argv)

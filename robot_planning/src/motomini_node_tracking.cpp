@@ -371,13 +371,15 @@ void MotoMiniPlanningNode::publishFeedback()
         const Eigen::MatrixXd jacobian = manip_->calcJacobian(q, base_link_, ee_link_);
         const Eigen::VectorXd v_cart = jacobian * qdot;
 
-        geometry_msgs::msg::Twist msg;
-        msg.linear.x = v_cart(0);
-        msg.linear.y = v_cart(1);
-        msg.linear.z = v_cart(2);
-        msg.angular.x = v_cart(3);
-        msg.angular.y = v_cart(4);
-        msg.angular.z = v_cart(5);
+        geometry_msgs::msg::TwistStamped msg;
+        msg.header.stamp = this->now();
+        msg.header.frame_id = base_link_;
+        msg.twist.linear.x = v_cart(0);
+        msg.twist.linear.y = v_cart(1);
+        msg.twist.linear.z = v_cart(2);
+        msg.twist.angular.x = v_cart(3);
+        msg.twist.angular.y = v_cart(4);
+        msg.twist.angular.z = v_cart(5);
         pub_feedback_vel_->publish(msg);
     }
 }
@@ -854,7 +856,7 @@ void MotoMiniPlanningNode::initPoseCallback(
 }
 
 void MotoMiniPlanningNode::targetVelCallback(
-    const geometry_msgs::msg::Twist::SharedPtr msg)
+    const geometry_msgs::msg::TwistStamped::SharedPtr msg)
 {
     if (!msg)
         return;
@@ -862,8 +864,8 @@ void MotoMiniPlanningNode::targetVelCallback(
     if (!tracking_enabled_)
         return;
 
-    latest_target_vel_ << msg->linear.x, msg->linear.y, msg->linear.z,
-        msg->angular.x, msg->angular.y, msg->angular.z;
+    latest_target_vel_ << msg->twist.linear.x, msg->twist.linear.y, msg->twist.linear.z,
+        msg->twist.angular.x, msg->twist.angular.y, msg->twist.angular.z;
     t_last_target_vel_cb_ = this->now();
 
     if (tracking_state_ == TrackingStreamState::IDLE &&

@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, TransformStamped, Twist, WrenchStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist, TwistStamped, WrenchStamped
 from rcl_interfaces.msg import Log
 from std_msgs.msg import Float64
 from sensor_msgs.msg import JointState
@@ -57,7 +57,7 @@ class CollisionTrialNode(Node):
 
         self.rosout_sub = self.create_subscription(Log, '/rosout', self.rosout_cb, 100)
         self.feedback_sub = self.create_subscription(Twist, '/motomini/feedback', self.feedback_cb, 10)
-        self.feedback_vel_sub = self.create_subscription(Twist, '/motomini/feedback_vel', self.feedback_vel_cb, 10)
+        self.feedback_vel_sub = self.create_subscription(TwistStamped, '/motomini/feedback_vel', self.feedback_vel_cb, 10)
         self.wrench_sub = self.create_subscription(WrenchStamped, '/motomini/collision_wrench', self.wrench_cb, 10)
         self.distance_sub = self.create_subscription(Float64, '/motomini/collision_distance', self.distance_cb, 10)
         
@@ -151,7 +151,7 @@ class CollisionTrialNode(Node):
     def feedback_vel_cb(self, msg):
         if not self.recording_active: return
         t = time.time() - self.recording_start_time
-        self.feedback_vel_data.append((t, msg.linear.x, msg.linear.y, msg.linear.z))
+        self.feedback_vel_data.append((t, msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z))
 
     def wrench_cb(self, msg):
         if not self.recording_active: return

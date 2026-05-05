@@ -37,6 +37,7 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <geometry_msgs/msg/wrench_stamped.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
@@ -111,7 +112,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_tracking_control_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_desired_pose_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr sub_init_pose_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_target_vel_;
+    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr sub_target_vel_;
     rclcpp::Subscription<geometry_msgs::msg::WrenchStamped>::SharedPtr sub_collision_wrench_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr sub_collision_distance_;
     rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr sub_collision_normal_;
@@ -129,7 +130,7 @@ private:
     //   /motomini/feedback     — current EE pose as Twist (linear=xyz, angular=rpy)
     //   /motomini/feedback_vel — current Cartesian velocity J(q)·θ̇
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr pub_feedback_vel_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr pub_feedback_vel_;
 
     // External offline trajectory streamer control. When tracking mode is on,
     // stop motomini_traj_streamer so only tracking writes /joint_command.
@@ -265,7 +266,7 @@ private:
     void trackingControlCallback(const std_msgs::msg::Bool::SharedPtr msg);
     void desiredPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
     void initPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
-    void targetVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
+    void targetVelCallback(const geometry_msgs::msg::TwistStamped::SharedPtr msg);
     void collisionWrenchCallback(const geometry_msgs::msg::WrenchStamped::SharedPtr msg);
     void collisionDistanceCallback(const std_msgs::msg::Float64::SharedPtr msg);
     void collisionNormalCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg);

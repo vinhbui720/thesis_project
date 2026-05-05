@@ -1,0 +1,16 @@
+{
+  "n_trials": 100,
+  "n_fail": 40,
+  "fail_rate": 0.4,
+  "best_trial": 71,
+  "best_cost": 274.6827788323265,
+  "best_params": {
+    "m_pos_min": 0.04444404029914921,
+    "m_pos_max": 0.18619859471731598,
+    "k_pos_min": 107.25774078345752,
+    "k_pos_max": 1024.947692428646,
+    "zeta_pos": 1.1443075417949233,
+    "adaptive_lambda": 75.7255920249179,
+    "adaptive_alpha_pos": 8.020815539727181
+  }
+}

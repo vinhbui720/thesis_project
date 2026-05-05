@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import datetime
 import time
 import yaml
 import json
@@ -7,6 +8,8 @@ import signal
 import subprocess
 import pandas as pd
 import optuna
+from optuna.trial import FrozenTrial, TrialState
+import optuna.distributions
 import numpy as np
 
 # Resolve paths relative to this script
@@ -60,7 +63,7 @@ def launch_controller(param_file):
     # Launch motomini.launch.py with bayesian:=true and feedback_yaml_file
     cmd = [
         'ros2', 'launch', 'motomini', 'motomini.launch.py',
-        'real_robot:=false', 'debug:=true', 'vel_streaming:=true', 'jogging:=true',
+        'real_robot:=true', 'debug:=true', 'vel_streaming:=true', 'jogging:=true',
         'bayesian:=true', f'feedback_yaml_file:={os.path.abspath(param_file)}'
     ]
     return subprocess.Popen(cmd, preexec_fn=os.setsid, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -275,10 +278,97 @@ def optuna_callback(study, trial):
         f"best={study.best_value:.6f}"
     )
 
+def load_past_trials(study: optuna.Study) -> int:
+    """Re-register all past CSV trials into `study` so TPE can warm-start.
+
+    Returns the number of trials successfully loaded.
+    """
+    if not os.path.exists(PARAMS_CSV) or not os.path.exists(SUMMARY_CSV):
+        print("[Resume] No existing trial data found — starting fresh.")
+        return 0
+
+    params_df = pd.read_csv(PARAMS_CSV)
+    summary_df = pd.read_csv(SUMMARY_CSV)
+
+    # Keep only the columns we need from summary.
+    summary_sub = summary_df[['trial', 'cost', 'safety_fail']].copy()
+    merged = pd.merge(params_df, summary_sub, on='trial', how='inner')
+    merged = merged.dropna(subset=['cost'])
+
+    if merged.empty:
+        print("[Resume] CSV files exist but contain no usable rows — starting fresh.")
+        return 0
+
+    # Build the distribution objects that match PARAM_BOUNDS.
+    distributions = {
+        k: optuna.distributions.FloatDistribution(lo, hi)
+        for k, (lo, hi) in PARAM_BOUNDS.items()
+    }
+
+    n_loaded = 0
+    for _, row in merged.iterrows():
+        # Only load params that are still in PARAM_BOUNDS (handles schema changes).
+        params = {
+            k: float(row[k])
+            for k in PARAM_BOUNDS
+            if k in row and pd.notna(row[k])
+        }
+        if len(params) != len(PARAM_BOUNDS):
+            # Skip rows where any parameter is missing.
+            continue
+
+        cost = float(row['cost'])
+        # Safety-fail trials are kept but with their large cost so TPE avoids
+        # that region — do not skip them.
+
+        # datetime_start/complete must be non-None for COMPLETE trials.
+        _ts = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=n_loaded)
+        frozen = FrozenTrial(
+            number=n_loaded,            # renumbered sequentially
+            trial_id=n_loaded,
+            state=TrialState.COMPLETE,
+            value=cost,
+            values=None,
+            datetime_start=_ts,
+            datetime_complete=_ts,
+            params=params,
+            distributions=distributions,
+            user_attrs={},
+            system_attrs={},
+            intermediate_values={},
+        )
+        study.add_trial(frozen)
+        n_loaded += 1
+
+    print(f"[Resume] Loaded {n_loaded} past trials into the study (TPE warm-start active).")
+    return n_loaded
+
+
+def restore_opt_state() -> None:
+    """Restore OPT_STATE from optimizer_state.json if it exists."""
+    if not os.path.exists(STATE_JSON):
+        return
+    try:
+        with open(STATE_JSON, 'r') as f:
+            saved = json.load(f)
+        OPT_STATE['best_cost']   = float(saved.get('best_cost',   float('inf')))
+        OPT_STATE['best_trial']  = saved.get('best_trial',  None)
+        OPT_STATE['best_params'] = saved.get('best_params', None)
+        OPT_STATE['n_trials']    = int(saved.get('n_trials', 0))
+        OPT_STATE['n_fail']      = int(saved.get('n_fail',   0))
+        print(f"[Resume] Restored OPT_STATE: best_cost={OPT_STATE['best_cost']:.6f}, "
+              f"n_trials={OPT_STATE['n_trials']}, n_fail={OPT_STATE['n_fail']}")
+    except Exception as e:
+        print(f"[Resume] Could not restore optimizer_state.json: {e}")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--n-trials', type=int, default=50)
+    parser.add_argument('--n-trials', type=int, default=50,
+                        help='Number of NEW trials to run (additional when --resume).')
+    parser.add_argument('--resume', action='store_true',
+                        help='Warm-start from existing CSV logs instead of starting fresh.')
     args = parser.parse_args()
 
     sampler = optuna.samplers.TPESampler(
@@ -292,6 +382,19 @@ def main():
         direction='minimize',
         sampler=sampler,
     )
+
+    if args.resume:
+        print("[Resume] Resume mode enabled — loading past trials …")
+        restore_opt_state()
+        n_loaded = load_past_trials(study)
+        if n_loaded == 0:
+            print("[Resume] No past trials found; running full search.")
+        else:
+            print(f"[Resume] Study now has {len(study.trials)} warm-start trials. "
+                  f"Running {args.n_trials} additional trial(s).")
+    else:
+        print("[Fresh] Starting a new optimization run (no history loaded).")
+
     study.optimize(objective, n_trials=args.n_trials, callbacks=[optuna_callback])
 
     study.trials_dataframe().to_csv(
@@ -305,7 +408,7 @@ def main():
     print("  Params: ")
     for key, value in trial.params.items():
         print(f"    {key}: {value}")
-        
+
     print("Best parameters saved to best_params.yaml")
     with open(os.path.join(PKG_DIR, 'tuning_results', 'best_params.yaml'), 'w') as f:
         yaml.safe_dump(trial.params, f)

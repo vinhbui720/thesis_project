@@ -348,7 +348,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         "/pose_following/init_pose", 1,
         std::bind(&MotoMiniPlanningNode::initPoseCallback, this, std::placeholders::_1));
 
-    sub_target_vel_ = this->create_subscription<geometry_msgs::msg::Twist>(
+    sub_target_vel_ = this->create_subscription<geometry_msgs::msg::TwistStamped>(
         "/motomini/target_vel", 10,
         std::bind(&MotoMiniPlanningNode::targetVelCallback, this, std::placeholders::_1));
 
@@ -378,7 +378,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     // Always-on Cartesian feedback (mirrors motomini_feedback_stream).
     pub_feedback_ = this->create_publisher<geometry_msgs::msg::Twist>(
         "/motomini/feedback", 10);
-    pub_feedback_vel_ = this->create_publisher<geometry_msgs::msg::Twist>(
+    pub_feedback_vel_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(
         "/motomini/feedback_vel", 10);
 
     traj_stream_start_client_ =

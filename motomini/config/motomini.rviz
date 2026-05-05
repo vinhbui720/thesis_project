@@ -111,11 +111,6 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        test_obstacle:
-          Alpha: 1
-          Show Axes: false
-          Show Trail: false
-          Value: true
         tool0:
           Alpha: 1
           Show Axes: false
@@ -170,23 +165,11 @@ Visualization Manager:
           Value: true
         gantry_tool_link:
           Value: true
-        link_1_s:
-          Value: true
-        link_2_l:
-          Value: true
-        link_3_u:
-          Value: true
-        link_4_r:
-          Value: true
-        link_5_b:
-          Value: true
         link_6_t:
           Value: true
         magnetic_link:
           Value: true
         object_link:
-          Value: true
-        test_obstacle:
           Value: true
         tool0:
           Value: true
@@ -198,10 +181,6 @@ Visualization Manager:
           Value: true
         world_depth_camera_link:
           Value: true
-        wp_0:
-          Value: true
-        x_carriage:
-          Value: true
         z_shaft:
           Value: true
       Marker Scale: 0.30000001192092896
@@ -212,32 +191,15 @@ Visualization Manager:
       Tree:
         world:
           gantry_base_link:
-            x_carriage:
-              z_shaft:
-                gantry_tool_link:
-                  working_tip:
-                    {}
+            {}
           object_link:
             {}
           workcell:
             base_link:
               base:
                 {}
-              link_1_s:
-                link_2_l:
-                  link_3_u:
-                    link_4_r:
-                      link_5_b:
-                        link_6_t:
-                          tool0:
-                            magnetic_link:
-                              {}
-            test_obstacle:
-              {}
             world_depth_camera_link:
               {}
-          wp_0:
-            {}
       Update Interval: 0
       Value: true
     - Class: rviz_default_plugins/Image
@@ -326,7 +288,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        online_planner_path: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -404,7 +366,7 @@ Visualization Manager:
       Enabled: true
       Name: Marker
       Namespaces:
-        online_planner_path: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -475,14 +437,14 @@ Visualization Manager:
 Window Geometry:
   Displays:
     collapsed: true
-  Height: 1043
+  Height: 1016
   Hide Left Dock: true
   Hide Right Dock: true
   Image:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000200000000000001f400000296fc0200000002fb000000100044006900730070006c006100790073000000003d00000296000000c900fffffffb0000000a0049006d00610067006500000002af0000012c0000002800ffffff000000010000018e0000039efc0200000001fb0000000a00560069006500770073000000003d0000039e000000a400ffffff000003c0000003b900000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000200000000000001f400000296fc0200000002fb000000100044006900730070006c006100790073000000003d00000296000000c900fffffffb0000000a0049006d00610067006500000002af0000012c0000002800ffffff000000010000018e0000039efc0200000001fb0000000a00560069006500770073000000003d0000039e000000a400ffffff000003c00000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: true
   Width: 960
-  X: 529
-  Y: 42
+  X: 0
+  Y: 27

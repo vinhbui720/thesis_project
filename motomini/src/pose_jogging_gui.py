@@ -12,7 +12,7 @@ import tkinter as tk
 from typing import Dict, List, Optional
 
 import rclpy
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -51,7 +51,7 @@ class PoseJoggingNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.target_pub = self.create_publisher(PoseStamped, "/motomini/target_pose", 10)
-        self.target_vel_pub = self.create_publisher(Twist, "/motomini/target_vel", 10)
+        self.target_vel_pub = self.create_publisher(TwistStamped, "/motomini/target_vel", 10)
         self.init_pose_pub = self.create_publisher(PoseStamped, "/pose_following/init_pose", 10)
 
         self.start_cli = self.create_client(Trigger, "/pose_following/start")
@@ -197,13 +197,15 @@ class PoseJoggingNode(Node):
         if msg is not None:
             self.target_pub.publish(msg)
 
-        vmsg = Twist()
-        vmsg.linear.x = float(lin_vec[0] * lin_rate)
-        vmsg.linear.y = float(lin_vec[1] * lin_rate)
-        vmsg.linear.z = float(lin_vec[2] * lin_rate)
-        vmsg.angular.x = float(ang_vec[0] * ang_rate)
-        vmsg.angular.y = float(ang_vec[1] * ang_rate)
-        vmsg.angular.z = float(ang_vec[2] * ang_rate)
+        vmsg = TwistStamped()
+        vmsg.header.stamp = self.get_clock().now().to_msg()
+        vmsg.header.frame_id = self.base_frame
+        vmsg.twist.linear.x = float(lin_vec[0] * lin_rate)
+        vmsg.twist.linear.y = float(lin_vec[1] * lin_rate)
+        vmsg.twist.linear.z = float(lin_vec[2] * lin_rate)
+        vmsg.twist.angular.x = float(ang_vec[0] * ang_rate)
+        vmsg.twist.angular.y = float(ang_vec[1] * ang_rate)
+        vmsg.twist.angular.z = float(ang_vec[2] * ang_rate)
         self.target_vel_pub.publish(vmsg)
 
     # ------------------------------------------------------------------

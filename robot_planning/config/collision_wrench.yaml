@@ -1,180 +1,233 @@
 ###############################################################################
-# online_collision_debugger.yaml
+# online_collision_debugger  —  Collision Wrench Publisher Configuration
+# File : config/collision_wrench.yaml
+###############################################################################
 #
-# Purpose:
-#   Real-time Tesseract collision-distance monitor and virtual collision-wrench
-#   publisher for local obstacle/self-collision avoidance.
+# ══════════════════════════════════════════════════════════════════════════════
+#  LÝ THUYẾT MÔ HÌNH LỰC PHẢN HỒI VẬT CẢN
+# ══════════════════════════════════════════════════════════════════════════════
 #
-#   This node reads /joint_states, updates the Tesseract environment, computes
-#   closest contact pairs, converts distance + contact normal into a virtual
-#   repulsive force, and publishes a total collision wrench that can be consumed
-#   by the main impedance/admittance controller.
+#  Node này sử dụng Tesseract để kiểm tra va chạm liên tục dựa trên /joint_states,
+#  sau đó tổng hợp một lực ảo (virtual repulsive wrench) gửi cho bộ điều khiển
+#  trở kháng.  Lực tổng bao gồm hai thành phần độc lập:
 #
-# Output wrench:
+#    F_total = F_normal + F_tangential
 #
-#   W_collision =
-#   [ Fx, Fy, Fz, Tx, Ty, Tz ]^T
+# ──────────────────────────────────────────────────────────────────────────────
+#  1.  THÀNH PHẦN PHÁP TUYẾN  (đẩy robot ra xa vật cản)
+# ──────────────────────────────────────────────────────────────────────────────
 #
-#   For the current controller, usually only the force part is used:
+#  Ký hiệu:
+#    d      = khoảng cách va chạm gần nhất (m)
+#    d0     = collision_influence_distance   (bắt đầu kích hoạt lực)
+#    d_s    = collision_safe_distance        (ngưỡng an toàn)
+#    d_stop = collision_stop_distance        (ngưỡng cứng / penetration)
+#    n̂      = hướng đẩy ra (unit push-away normal)
 #
-#   F_collision = [ Fx, Fy, Fz ]^T
+#  Bước 1 — Chuẩn hóa khoảng cách thành t ∈ [0,1]:
 #
-# Per-contact force model:
+#    t = clamp((d0 - d) / (d0 - d_s), 0, 1)
 #
-#   d_i  = contact distance
-#   n_i  = unit push-away direction
-#   d0   = collision_influence_distance
-#   ds   = collision_safe_distance
+#  Bước 2 — Smoothstep (tránh giật ở biên):
 #
-#   If d_i >= d0:
+#    s(t) = t² (3 - 2t)          ← smoothstep cổ điển
 #
-#       F_i = 0
+#  Bước 3 — Lực đẩy mềm (soft repulsion):
 #
-#   If d_i < d0:
+#    F_rep = collision_normal_force_max × s(t)² × n̂
 #
-#       F_rep,i =
-#           collision_k_rep *
-#           (1 / d_i - 1 / d0) *
-#           (1 / d_i^2) *
-#           n_i
+#    Dùng s² thay vì s cho kích hoạt mềm hơn (gradient nhỏ ở gần d0,
+#    tăng mạnh khi tiếp cận d_s).
 #
-#   If d_i < ds, add extra hold force:
+#  Bước 4 — Lực giữ cứng (hard stop, chỉ khi d < d_stop):
 #
-#       F_hold,i =
-#           collision_k_hold *
-#           (ds - d_i) *
-#           n_i
+#    F_hold = collision_k_hold × (d_stop - d) × n̂
 #
-#   Total per-contact force:
+#    Đây là lò xo tuyến tính chỉ kích hoạt khi robot đã xuyên vào vùng cấm.
+#    Ngăn robot tiếp tục xuyên qua vật cản.
 #
-#       F_i = F_rep,i + F_hold,i
+#  Bước 5 — Cản nhớt pháp tuyến (chỉ khi đang tiếp cận, v_n < 0):
 #
-#   Then clamp:
+#    v_n    = v_feedback · n̂
+#    F_damp = collision_normal_damping × |v_n| × n̂    (nếu v_n < 0)
+#    F_damp ≤ 0.5 × collision_normal_force_max         (hard cap)
 #
-#       |F_i| <= collision_force_max_per_contact
+#  Bước 6 — Tổng hợp và bão hòa:
 #
-# Total force:
+#    F_normal_raw = (F_rep + F_hold + F_damp) × n̂
+#    F_normal     = clamp(|F_normal_raw|, 0, collision_force_max_per_contact) × n̂
 #
-#       F_total = sum_i F_i
+# ──────────────────────────────────────────────────────────────────────────────
+#  2.  THÀNH PHẦN TIẾP TUYẾN  (trượt dọc bề mặt vật cản về phía đích)
+# ──────────────────────────────────────────────────────────────────────────────
 #
-#   Then clamp:
+#  Ký hiệu:
+#    P  = I - n̂n̂ᵀ            ← projection matrix (mặt phẳng tiếp tuyến)
+#    e_τ  = P (p_target - p_ee)         lỗi vị trí trong mặt phẳng tiếp tuyến
+#    ė_τ  = P (v_target - v_feedback)   lỗi vận tốc tiếp tuyến
 #
-#       |F_total| <= collision_force_max_total
+#  Lực tiếp tuyến:
 #
-# Torque part of wrench:
+#    F_tan_raw = K_tau × e_τ  +  D_tau × ė_τ  +  K_escape × blocked × α × u_esc
 #
-#   p_i   = contact point
-#   p_ref = pose of wrench_reference_link
-#   r_i   = p_i - p_ref
+#    Trong đó:
+#      K_tau = collision_tangent_gain
+#      D_tau = collision_tangent_damping
+#      blocked  = max(0, -n̂ · (p_target - p_safe))   (mức độ bị chặn)
+#      α = exp(-|e_τ|² / d_s²)                         (giảm dần khi có lỗi lớn)
+#      u_esc = hướng thoát tiếp tuyến (theo collision_tangent_escape_axis)
 #
-#       T_i = r_i x F_i
+#  Giới hạn lực tiếp tuyến:
 #
-#       T_total = sum_i T_i
+#    tangent_cap = min(collision_tangent_force_max,
+#                      collision_tangent_force_ratio × collision_force_max_total)
 #
-#   Note:
-#     The first controller version can ignore torque and only use force.
-#     Torque is mainly useful later for whole-body/link-level avoidance.
+#    F_tangential = smoothSaturate(P × F_tan_raw, w × tangent_cap)
+#    w = smoothstep(t)   (giảm về 0 khi xa vật cản)
 #
-# Important force-direction rule:
-#   Do not sum both sides of a contact pair blindly.
-#   Contact forces on link0 and link1 are equal and opposite, so summing both
-#   can cancel to zero. For controller avoidance, use the robot-side push force
-#   or the selected force_for_controller computed by this node.
+# ──────────────────────────────────────────────────────────────────────────────
+#  3.  LỌC VÀ GIỚI HẠN ĐẦU RA
+# ──────────────────────────────────────────────────────────────────────────────
 #
-# Parameter effects:
+#  Sau khi tổng hợp:
+#    F_total_raw = F_normal + F_tangential
+#    F_total_raw = smoothSaturate(F_total_raw, collision_force_max_total)  ← tanh-sat
 #
-#   collision_threshold:
-#     Distance margin used by Tesseract contact checking. Contacts with distance
-#     below this value are returned/visualized. Usually keep this equal to or
-#     slightly larger than collision_influence_distance.
+#  Qua bộ lọc thông thấp + slew-rate trước khi publish:
+#    • Khi |F| tăng: dùng attack cutoff = collision_force_attack_hz
+#    • Khi |F| giảm: dùng release cutoff = collision_force_release_hz
+#    • Giới hạn tốc độ thay đổi: collision_force_slew_rate (N/s)
 #
-#   contact_point_radius:
-#     RViz sphere size for nearest contact points only. No control effect.
+# ══════════════════════════════════════════════════════════════════════════════
+#  HƯỚNG DẪN TUNING
+# ══════════════════════════════════════════════════════════════════════════════
 #
-#   debug_markers_enabled:
-#     If true, publish RViz markers for distance lines, contact points, contact
-#     normals, and force arrows. If false, only computation/wrench publishing
-#     remains active.
+#  Bước 1 — Xác định vùng cảm nhận:
+#    Đặt collision_influence_distance = khoảng cách bạn muốn robot bắt đầu phản ứng.
+#    Đặt collision_safe_distance ≈ 40–60% của influence_distance (vùng lực tăng mạnh).
+#    Đặt collision_guard_distance < influence_distance (vùng bộ controller bắt đầu giảm tốc).
+#    Đặt collision_task_distance < guard_distance (robot không còn tracking chính xác).
+#    Đặt collision_stop_distance nhỏ nhất (dùng cho hard stop lò xo).
 #
-#   publish_collision_wrench:
-#     If true, publish the final W_collision topic for the main controller.
+#  Bước 2 — Điều chỉnh lực đẩy pháp tuyến:
+#    • Tăng collision_normal_force_max nếu robot không đủ mạnh để né vật cản.
+#    • Giảm nếu robot bị giật/rung sau va chạm.
+#    • Tăng collision_normal_damping nếu robot dao động khi áp vào vật cản.
+#    • Chú ý: damping_cap = 0.5 × normal_force_max (tự động).
 #
-#   publish_contact_debug_text:
-#     If true, publish readable contact/debug information as text.
+#  Bước 3 — Điều chỉnh hard stop:
+#    • Tăng collision_k_hold nếu robot vẫn tiếp tục xuyên vào vật cản sau khi
+#      đã đến collision_stop_distance.
+#    • Tham số này nên là 50–200 (N/m) tùy độ cứng vật cản.
 #
-#   marker_frame:
-#     Frame used for RViz markers.
+#  Bước 4 — Điều chỉnh lực tiếp tuyến:
+#    • Đặt collision_tangent_enabled: false để debug thành phần pháp tuyến trước.
+#    • Tăng collision_tangent_gain để robot trượt nhanh hơn về phía đích.
+#    • Tăng collision_tangent_damping để giảm dao động khi trượt.
+#    • Đặt collision_tangent_escape_axis = hướng thoát ưu tiên (x/y/z trong world).
+#    • collision_tangent_force_ratio giới hạn tỉ lệ lực tiếp tuyến / tổng.
 #
-#   wrench_frame:
-#     Frame used in the WrenchStamped message. This should match the frame used
-#     by the main controller for Cartesian force input.
+#  Bước 5 — Điều chỉnh bộ lọc:
+#    • collision_force_attack_hz: cao = phản ứng nhanh hơn khi chạm vật cản.
+#    • collision_force_release_hz: thấp = nhả lực chậm hơn (giảm jitter sau va chạm).
+#    • collision_force_slew_rate: giới hạn tốc độ thay đổi lực (N/s). Giảm giá trị
+#      này nếu robot bị giật mạnh khi va chạm đột ngột.
 #
-#   wrench_reference_link:
-#     Link used as the reference point p_ref for torque calculation.
-#     Common choice: tool0.
+#  Ghi chú về collision_threshold:
+#    Nên đặt >= collision_influence_distance để Tesseract trả về đủ contact pairs.
+#    Nếu đặt nhỏ hơn influence_distance, lực có thể không được tính đúng.
 #
-#   collision_influence_distance:
-#     Distance d0 where repulsive force starts. Larger value makes avoidance
-#     start earlier. Smaller value makes avoidance react later.
-#
-#   collision_safe_distance:
-#     Distance ds where stronger hold force starts. Larger value is safer but
-#     more conservative.
-#
-#   collision_k_rep:
-#     Gain for smooth inverse-distance repulsive force. Increase for stronger
-#     early avoidance. Decrease if the robot is pushed away too aggressively.
-#
-#   collision_k_hold:
-#     Gain for close-range hold force. Increase if the robot still approaches
-#     too close. Decrease if near-contact behavior is too abrupt.
-#
-#   collision_force_max_per_contact:
-#     Saturation for each individual contact force. Prevents one bad/noisy
-#     contact from dominating the controller.
-#
-#   collision_force_max_total:
-#     Saturation for total published force. This is the final safety clamp before
-#     sending the wrench to the controller.
-#
-#   force_arrow_min_length:
-#     Minimum visible length for RViz force arrows.
-#
-#   force_arrow_max_length:
-#     Maximum visible length for RViz force arrows.
-#
-#   force_arrow_length_gain:
-#     Optional scale factor for force arrow length if the implementation uses
-#     direct length = gain * |F|. No control effect.
 ###############################################################################
 online_collision_debugger:
   ros__parameters:
-    # Contact detection
-    collision_threshold: 0.05
+
+    # ── Contact detection ────────────────────────────────────────────────────
+    # collision_threshold: bán kính tìm kiếm va chạm của Tesseract (m).
+    # Đặt >= collision_influence_distance để không bỏ sót contact pairs.
+    collision_threshold: 0.10
     contact_point_radius: 0.004
 
-    # Output channels
+    # ── Output channels ──────────────────────────────────────────────────────
     debug_markers_enabled: true
     publish_collision_wrench: true
     publish_contact_debug_text: true
 
-    # Frames
+    # ── Frames ───────────────────────────────────────────────────────────────
     marker_frame: world
     wrench_frame: world
     wrench_reference_link: tool0
+    collision_command_frame: world
 
-    # Force model
-    collision_influence_distance: 0.05
-    collision_safe_distance: 0.02
-    collision_k_rep:  0.0002
-    collision_k_hold: 15.0
+    # ── Zone distances (m) ───────────────────────────────────────────────────
+    # Thứ tự bắt buộc: stop < task < guard < safe < influence
+    #
+    # collision_influence_distance: bắt đầu kích hoạt lực đẩy pháp tuyến
+    # collision_safe_distance:      lực đạt ngưỡng tham chiếu (s→1 ở đây)
+    # collision_guard_distance:     bộ controller bắt đầu giảm gamma projection
+    # collision_task_distance:      dưới đây gamma = 1 (tracking tắt hoàn toàn)
+    # collision_stop_distance:      kích hoạt lò xo cứng F_hold
+    #
+    # Motomini: robot nhỏ, làm việc gần vật cản → vùng ảnh hưởng nhỏ hơn robot thông thường.
+    collision_influence_distance: 0.08
+    collision_safe_distance:      0.025
+    collision_guard_distance:     0.035
+    collision_task_distance:      0.007
+    collision_stop_distance:      0.002
+
+    # ── Normal repulsion model ────────────────────────────────────────────────
+    # collision_k_rep: hệ số đẩy nghịch đảo bình phương
+    collision_k_rep: 0.0002
+
+    # collision_normal_damping: hệ số cản nhớt theo hướng pháp tuyến (N·s/m)
+    #   Motomini làm việc gần vật cản → cần damping cao để tránh bounce.
+    collision_normal_damping: 12.0
+
+    # collision_k_hold: hệ số lò xo cứng khi d < collision_stop_distance (N/m)
+    #   Tăng nếu robot vẫn xuyên qua vật cản.
+    collision_k_hold: 80.0
+
+    # collision_force_max_per_contact: giới hạn lực trên mỗi contact pair (N)
     collision_force_max_per_contact: 8.0
-    collision_force_max_total: 24.0
-    # Force-arrow shaping (length is proportional to |F|)
-    force_arrow_min_length: 0.01
-    force_arrow_max_length: 0.25
-    force_arrow_length_gain: 0.04
 
-    collision_guard_distance: 0.02
-    collision_task_distance: 0.003
-    collision_stop_distance: 0.001
+    # collision_force_max_total: giới hạn lực tổng trước khi publish (N)
+    #   Dùng bão hòa tanh. Giữ thấp cho Motomini để tránh giật khớp.
+    collision_force_max_total: 15.0
+
+    # ── Tangential sliding force ──────────────────────────────────────────────
+    # Cho phép robot trượt dọc bề mặt vật cản để tiếp cận đích.
+    # !! Đặt false lúc debug pháp tuyến — bật lại sau khi lực pháp tuyến đã đúng hướng.
+    collision_tangent_enabled: false
+
+    # collision_tangent_gain: K_tau — kéo robot về lỗi vị trí tiếp tuyến (N/m)
+    collision_tangent_gain: 3.0
+
+    # collision_tangent_damping: D_tau — cản dao động tiếp tuyến (N·s/m)
+    collision_tangent_damping: 1.5
+
+    # collision_tangent_force_max: giới hạn tuyệt đối lực tiếp tuyến (N)
+    #   Giữ nhỏ cho Motomini, tăng dần khi đã ổn định.
+    collision_tangent_force_max: 3.0
+
+    # collision_tangent_force_ratio: giới hạn tỉ lệ lực tiếp tuyến / total (0–1)
+    collision_tangent_force_ratio: 0.30
+
+    # collision_tangent_escape_axis: trục ưu tiên thoát khi mục tiêu bị chặn
+    #   Giá trị hợp lệ: "x", "y", "z"
+    collision_tangent_escape_axis: "z"
+
+    # ── Output force filter ───────────────────────────────────────────────────
+    # collision_force_attack_hz: tần số cắt low-pass khi lực TĂNG (Hz)
+    #   Cao → phản ứng nhanh khi chạm vật cản. Motomini: 15–25 Hz.
+    collision_force_attack_hz: 20.0
+
+    # collision_force_release_hz: tần số cắt low-pass khi lực GIẢM (Hz)
+    #   Thấp → nhả lực chậm, giảm jitter sau thoát. Motomini: 5–8 Hz.
+    collision_force_release_hz: 6.0
+
+    # collision_force_slew_rate: tốc độ thay đổi lực tối đa (N/s)
+    #   Motomini nhẹ → giảm slew_rate để tránh giật khớp đột ngột.
+    collision_force_slew_rate: 50.0
+
+    # ── RViz visualization (không ảnh hưởng điều khiển) ──────────────────────
+    force_arrow_min_length: 0.01
+    force_arrow_max_length: 0.20
