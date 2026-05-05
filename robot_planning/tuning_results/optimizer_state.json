@@ -1,7 +1,7 @@
 {
-  "n_trials": 100,
-  "n_fail": 40,
-  "fail_rate": 0.4,
+  "n_trials": 115,
+  "n_fail": 41,
+  "fail_rate": 0.3565217391304348,
   "best_trial": 71,
   "best_cost": 274.6827788323265,
   "best_params": {

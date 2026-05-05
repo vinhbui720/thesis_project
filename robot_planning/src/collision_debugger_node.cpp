@@ -471,7 +471,21 @@ private:
 
         // ── PD trong mặt phẳng tiếp tuyến ────────────────────────────────────
         // e_tau: lỗi vị trí tiếp tuyến (từ EE đến target, chiếu lên mặt phẳng)
-        const Eigen::Vector3d e_tau = P * (latest_target_position_ - ee_position);
+        Eigen::Vector3d e_tau = P * (latest_target_position_ - ee_position);
+
+        // ── Xử lý điểm kỳ dị (Singularity / Local Minima) ────────────────────
+        // Nếu EE, vật cản, và Target nằm thẳng hàng, hình chiếu e_tau sẽ tụt về 0.
+        // Robot bị kẹt. Ta thêm một lỗi mồi (nudge) theo trục escape để phá vỡ thế cân bằng.
+        const double total_pos_error = (latest_target_position_ - ee_position).norm();
+        if (total_pos_error > 0.02 && e_tau.norm() < tangentialProjectionEpsilon())
+        {
+            Eigen::Vector3d escape_dir = chooseEscapeDirectionOptionB(n);
+            if (escape_dir.norm() > 1e-6)
+            {
+                // Bơm một lỗi mồi đủ lớn để sinh lực đẩy ngang
+                e_tau = escape_dir * std::min(total_pos_error, 0.05);
+            }
+        }
 
         // de_tau: lỗi vận tốc tiếp tuyến
         Eigen::Vector3d de_tau = Eigen::Vector3d::Zero();
@@ -484,7 +498,7 @@ private:
             de_tau = P * (latest_target_vel_linear_ - latest_feedback_vel_linear_);
         }
 
-        // Lực PD thuần — không có escape term (escape term gây lực sai hướng).
+        // Lực PD thuần
         Eigen::Vector3d f_tan = collision_tangent_gain_ * e_tau
                               + collision_tangent_damping_ * de_tau;
 

@@ -144,7 +144,7 @@ online_collision_debugger:
     # ── Contact detection ────────────────────────────────────────────────────
     # collision_threshold: bán kính tìm kiếm va chạm của Tesseract (m).
     # Đặt >= collision_influence_distance để không bỏ sót contact pairs.
-    collision_threshold: 0.10
+    collision_threshold: 0.05
     contact_point_radius: 0.004
 
     # ── Output channels ──────────────────────────────────────────────────────
@@ -168,15 +168,15 @@ online_collision_debugger:
     # collision_stop_distance:      kích hoạt lò xo cứng F_hold
     #
     # Motomini: robot nhỏ, làm việc gần vật cản → vùng ảnh hưởng nhỏ hơn robot thông thường.
-    collision_influence_distance: 0.08
+    collision_influence_distance: 0.03
     collision_safe_distance:      0.025
-    collision_guard_distance:     0.035
-    collision_task_distance:      0.007
-    collision_stop_distance:      0.002
+    collision_guard_distance:     0.015
+    collision_task_distance:      0.005
+    collision_stop_distance:      0.001
 
     # ── Normal repulsion model ────────────────────────────────────────────────
     # collision_k_rep: hệ số đẩy nghịch đảo bình phương
-    collision_k_rep: 0.0002
+    collision_k_rep: 0.00020982720514447687
 
     # collision_normal_damping: hệ số cản nhớt theo hướng pháp tuyến (N·s/m)
     #   Motomini làm việc gần vật cản → cần damping cao để tránh bounce.
@@ -196,13 +196,13 @@ online_collision_debugger:
     # ── Tangential sliding force ──────────────────────────────────────────────
     # Cho phép robot trượt dọc bề mặt vật cản để tiếp cận đích.
     # !! Đặt false lúc debug pháp tuyến — bật lại sau khi lực pháp tuyến đã đúng hướng.
-    collision_tangent_enabled: false
+    collision_tangent_enabled: true
 
     # collision_tangent_gain: K_tau — kéo robot về lỗi vị trí tiếp tuyến (N/m)
-    collision_tangent_gain: 3.0
+    collision_tangent_gain: 13.55520878452949
 
     # collision_tangent_damping: D_tau — cản dao động tiếp tuyến (N·s/m)
-    collision_tangent_damping: 1.5
+    collision_tangent_damping: 0.17492671123579662
 
     # collision_tangent_force_max: giới hạn tuyệt đối lực tiếp tuyến (N)
     #   Giữ nhỏ cho Motomini, tăng dần khi đã ổn định.

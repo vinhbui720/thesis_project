@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import datetime
 import time
 import yaml
 import json
@@ -7,6 +8,8 @@ import signal
 import subprocess
 import pandas as pd
 import optuna
+from optuna.trial import FrozenTrial, TrialState
+import optuna.distributions
 import numpy as np
 import argparse
 
@@ -19,42 +22,12 @@ SUMMARY_CSV = os.path.join(PKG_DIR, 'tuning_results', 'collision_trials_summary.
 PARAMS_CSV = os.path.join(PKG_DIR, 'tuning_results', 'collision_params_history.csv')
 STATE_JSON = os.path.join(PKG_DIR, 'tuning_results', 'collision_optimizer_state.json')
 
-PHASE_1_SPACE = {
-    'collision_normal_force_max': (2.0, 10.0),
+PARAM_BOUNDS = {
+    'collision_k_rep': (0.00005, 0.0005),
     'collision_normal_damping': (2.0, 25.0),
-    'collision_force_max_per_contact': (2.0, 10.0),
-    'collision_force_attack_hz': (8.0, 35.0),
-    'collision_force_release_hz': (3.0, 20.0),
-    'collision_force_slew_rate': (20.0, 150.0),
+    'collision_tangent_gain': (1.0, 15.0),
+    'collision_tangent_damping': (0.1, 5.0),
 }
-
-PHASE_2_SPACE = {
-    'collision_tangent_gain': (0.5, 10.0),
-    'collision_tangent_force_max': (1.0, 8.0),
-    'collision_tangent_force_ratio': (0.15, 0.60),
-    'collision_tangent_gamma_power': (1.0, 3.5),
-    'collision_tangent_speed_scale': (0.02, 0.15),
-    'collision_tangent_velocity_deadband': (0.003, 0.03),
-}
-
-PHASE_3_SPACE = {
-    'collision_force_release_hz': (4.0, 25.0),
-    'collision_force_slew_rate': (20.0, 150.0),
-    'collision_normal_fade_power': (0.7, 3.0),
-    'collision_force_scale': (0.3, 1.5),
-    'collision_force_max': (2.0, 8.0),
-    'collision_constraint_timeout_sec': (0.08, 0.35),
-}
-
-DISTANCE_SPACE = {
-    'collision_influence_distance': (0.02, 0.08),
-    'collision_safe_distance': (0.01, 0.04),
-    'collision_guard_distance': (0.005, 0.03),
-    'collision_task_distance': (0.002, 0.015),
-}
-
-GLOBAL_PHASE = 'all'
-PARAM_BOUNDS = {}
 
 OPT_STATE = {
     'best_cost': float('inf'),
@@ -78,20 +51,21 @@ def load_yaml(path):
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
-def write_trial_yaml(base_path, trial_path, params):
-    data = load_yaml(base_path)
+def write_trial_yaml(trial_path, params):
+    data = load_yaml(trial_path)
+    if data is None:
+        data = {'online_collision_debugger': {'ros__parameters': {}}}
     if 'online_collision_debugger' not in data:
         data['online_collision_debugger'] = {'ros__parameters': {}}
+    if 'ros__parameters' not in data['online_collision_debugger']:
+        data['online_collision_debugger']['ros__parameters'] = {}
+        
     ros_params = data['online_collision_debugger']['ros__parameters']
     
     for k, v in params.items():
         ros_params[k] = float(v) if isinstance(v, (int, float)) else v
         
-    # Enable tangent force if we are tuning Phase 2, 3, 4, or All
-    if GLOBAL_PHASE in ['2', '3', '4', 'all']:
-        ros_params['collision_tangent_enabled'] = True
-    else:
-        ros_params['collision_tangent_enabled'] = False
+    ros_params['collision_tangent_enabled'] = True
         
     with open(trial_path, 'w') as f:
         yaml.safe_dump(data, f, sort_keys=False)
@@ -121,8 +95,8 @@ def stop_process(proc):
 
 def run_one_trial(params, trial_index):
     trial_start = time.time()
-    write_trial_yaml(BASE_YAML, TRIAL_YAML, params)
-    print(f"--- Starting Collision Trial {trial_index} (Phase: {GLOBAL_PHASE}) ---")
+    write_trial_yaml(TRIAL_YAML, params)
+    print(f"--- Starting Collision Trial {trial_index} ---")
 
     proc = launch_controller(TRIAL_YAML)
     try:
@@ -176,12 +150,6 @@ def compute_cost(m):
     error_at_stop = float(m.get('error_at_stop', 1.0))
     dynamic_tracking_error = float(m.get('dynamic_tracking_error', 1.0))
 
-    # Cost function ưu tiên:
-    # 1. Tới được đích (progress_error tiến về 0) => Vượt qua vật cản
-    # 2. Bắt kịp target TRƯỚC khi target dừng (error_at_stop)
-    # 3. Không xuyên vật cản sâu (penetration)
-    # 4. Chống nhảy qua nhảy lại sau khi né (arrival_jitter, final_error)
-    # 5. Lực tác động và vận tốc mượt mà (jitter, spike)
     cost = (
         1000.0 * progress_error / 0.1
         + 800.0 * error_at_stop / 0.01
@@ -225,7 +193,10 @@ def save_trial(trial_index, params, metrics, cost, trial_duration_sec=0.0):
         OPT_STATE['best_params'] = dict(params)
 
     x_now = normalize_params(params, PARAM_BOUNDS)
-    exploration_distance = 0.0 if OPT_STATE['prev_x'] is None else float(np.linalg.norm(x_now - OPT_STATE['prev_x']))
+    if OPT_STATE['prev_x'] is None or len(OPT_STATE['prev_x']) != len(x_now):
+        exploration_distance = 0.0
+    else:
+        exploration_distance = float(np.linalg.norm(x_now - OPT_STATE['prev_x']))
     OPT_STATE['prev_x'] = x_now
     fail_rate = OPT_STATE['n_fail'] / max(OPT_STATE['n_trials'], 1)
 
@@ -254,19 +225,20 @@ def save_trial(trial_index, params, metrics, cost, trial_duration_sec=0.0):
     params_row.update(params)
     pd.DataFrame([params_row]).to_csv(PARAMS_CSV, mode='a', index=False, header=not os.path.exists(PARAMS_CSV))
 
+    with open(STATE_JSON, 'w') as f:
+        json.dump({
+            'n_trials': OPT_STATE['n_trials'],
+            'n_fail': OPT_STATE['n_fail'],
+            'fail_rate': fail_rate,
+            'best_trial': OPT_STATE['best_trial'],
+            'best_cost': OPT_STATE['best_cost'],
+            'best_params': OPT_STATE['best_params'],
+        }, f, indent=2)
+
 def objective(trial):
     params = {}
     for param_name, (low, high) in PARAM_BOUNDS.items():
         params[param_name] = trial.suggest_float(param_name, low, high)
-
-    # Reject invalid distance constraints if we are tuning distances
-    if 'collision_influence_distance' in params:
-        inf = params['collision_influence_distance']
-        saf = params['collision_safe_distance']
-        grd = params['collision_guard_distance']
-        tsk = params['collision_task_distance']
-        if not (inf > saf and saf > grd and grd > tsk):
-            return 1e9
 
     cost = run_one_trial(params, trial.number)
     return cost
@@ -274,33 +246,99 @@ def objective(trial):
 def optuna_callback(study, trial):
     print(f"[Optuna] trial={trial.number} value={trial.value:.6f} best={study.best_value:.6f}")
 
+def load_past_trials(study: optuna.Study) -> int:
+    if not os.path.exists(PARAMS_CSV) or not os.path.exists(SUMMARY_CSV):
+        print("[Resume] No existing trial data found — starting fresh.")
+        return 0
+
+    params_df = pd.read_csv(PARAMS_CSV)
+    summary_df = pd.read_csv(SUMMARY_CSV)
+
+    summary_sub = summary_df[['trial', 'cost', 'safety_fail']].copy()
+    merged = pd.merge(params_df, summary_sub, on='trial', how='inner')
+    merged = merged.dropna(subset=['cost'])
+
+    if merged.empty:
+        print("[Resume] CSV files exist but contain no usable rows — starting fresh.")
+        return 0
+
+    distributions = {
+        k: optuna.distributions.FloatDistribution(lo, hi)
+        for k, (lo, hi) in PARAM_BOUNDS.items()
+    }
+
+    n_loaded = 0
+    for _, row in merged.iterrows():
+        params = {
+            k: float(row[k])
+            for k in PARAM_BOUNDS
+            if k in row and pd.notna(row[k])
+        }
+        if len(params) != len(PARAM_BOUNDS):
+            continue
+
+        cost = float(row['cost'])
+
+        _ts = datetime.datetime(2000, 1, 1) + datetime.timedelta(seconds=n_loaded)
+        frozen = FrozenTrial(
+            number=n_loaded,
+            trial_id=n_loaded,
+            state=TrialState.COMPLETE,
+            value=cost,
+            values=None,
+            datetime_start=_ts,
+            datetime_complete=_ts,
+            params=params,
+            distributions=distributions,
+            user_attrs={},
+            system_attrs={},
+            intermediate_values={},
+        )
+        study.add_trial(frozen)
+        n_loaded += 1
+
+    print(f"[Resume] Loaded {n_loaded} past trials into the study (TPE warm-start active).")
+    return n_loaded
+
+def restore_opt_state() -> None:
+    if not os.path.exists(STATE_JSON):
+        return
+    try:
+        with open(STATE_JSON, 'r') as f:
+            saved = json.load(f)
+        OPT_STATE['best_cost']   = float(saved.get('best_cost',   float('inf')))
+        OPT_STATE['best_trial']  = saved.get('best_trial',  None)
+        OPT_STATE['best_params'] = saved.get('best_params', None)
+        OPT_STATE['n_trials']    = int(saved.get('n_trials', 0))
+        OPT_STATE['n_fail']      = int(saved.get('n_fail',   0))
+        print(f"[Resume] Restored OPT_STATE: best_cost={OPT_STATE['best_cost']:.6f}, "
+              f"n_trials={OPT_STATE['n_trials']}, n_fail={OPT_STATE['n_fail']}")
+    except Exception as e:
+        print(f"[Resume] Could not restore optimizer_state.json: {e}")
+
 def main():
-    global GLOBAL_PHASE, PARAM_BOUNDS
     parser = argparse.ArgumentParser()
-    parser.add_argument('--n-trials', type=int, default=50)
-    parser.add_argument('--phase', type=str, choices=['1', '2', '3', '4', 'all'], default='all', 
-                        help='Phase to tune (1: Normal, 2: Tangent, 3: Release, 4: Distances, all: All combined)')
+    parser.add_argument('--n-trials', type=int, default=50, help='Number of NEW trials to run (additional when --resume).')
+    parser.add_argument('--resume', action='store_true', help='Warm-start from existing CSV logs instead of starting fresh.')
     args = parser.parse_args()
     
-    GLOBAL_PHASE = args.phase
-    
-    if args.phase == '1':
-        PARAM_BOUNDS = PHASE_1_SPACE
-    elif args.phase == '2':
-        PARAM_BOUNDS = PHASE_2_SPACE
-    elif args.phase == '3':
-        PARAM_BOUNDS = PHASE_3_SPACE
-    elif args.phase == '4':
-        PARAM_BOUNDS = DISTANCE_SPACE
-    else:
-        # All phases
-        PARAM_BOUNDS = {**PHASE_1_SPACE, **PHASE_2_SPACE, **PHASE_3_SPACE, **DISTANCE_SPACE}
-
-    print(f"Starting Bayesian Optimization for Collision Phase: {args.phase}")
+    print(f"Starting Bayesian Optimization for Collision Avoidance")
     print(f"Parameters to tune: {list(PARAM_BOUNDS.keys())}")
 
     sampler = optuna.samplers.TPESampler(n_startup_trials=10, multivariate=True, group=True, seed=0)
     study = optuna.create_study(direction='minimize', sampler=sampler)
+
+    if args.resume:
+        print("[Resume] Resume mode enabled — loading past trials …")
+        restore_opt_state()
+        n_loaded = load_past_trials(study)
+        if n_loaded == 0:
+            print("[Resume] No past trials found; running full search.")
+        else:
+            print(f"[Resume] Study now has {len(study.trials)} warm-start trials. Running {args.n_trials} additional trial(s).")
+    else:
+        print("[Fresh] Starting a new optimization run (no history loaded).")
+
     study.optimize(objective, n_trials=args.n_trials, callbacks=[optuna_callback])
 
     study.trials_dataframe().to_csv(os.path.join(PKG_DIR, 'tuning_results', 'optuna_collision_trials.csv'), index=False)

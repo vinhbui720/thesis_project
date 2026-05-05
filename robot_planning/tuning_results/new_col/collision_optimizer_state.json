@@ -1,0 +1,13 @@
+{
+  "n_trials": 230,
+  "n_fail": 86,
+  "fail_rate": 0.3739130434782609,
+  "best_trial": 43,
+  "best_cost": 12920.827438350736,
+  "best_params": {
+    "collision_k_rep": 0.00020982720514447687,
+    "collision_normal_damping": 7.8838715380777495,
+    "collision_tangent_gain": 13.55520878452949,
+    "collision_tangent_damping": 0.17492671123579662
+  }
+}
