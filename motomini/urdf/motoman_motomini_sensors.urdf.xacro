@@ -14,7 +14,7 @@
                 izz="0.001" />
         </inertial>
     </link>
-    <link name="test_obstacle">
+    <!-- <link name="test_obstacle">
         <visual>
             <geometry>
                 <cylinder radius="0.015" length="0.25" />
@@ -36,8 +36,8 @@
     <joint name="obstacle_joint" type="fixed">
         <parent link="workcell" />
         <child link="test_obstacle" />
-        <origin xyz="0.27 -0.05 -0.08" rpy="0 0 0" />
-    </joint>
+        <origin xyz="0.27 -0.05 0.1" rpy="0 0 0" />
+    </joint> -->
     <joint name="world_depth_camera_joint" type="fixed">
         <parent link="workcell" />
         <child link="world_depth_camera_link" />

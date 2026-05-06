@@ -20,6 +20,7 @@ TRIAL_YAML = os.path.join(PKG_DIR, 'config', 'feedback_controller_trial.yaml')
 SUMMARY_CSV = os.path.join(PKG_DIR, 'tuning_results', 'trials_summary.csv')
 PARAMS_CSV = os.path.join(PKG_DIR, 'tuning_results', 'params_history.csv')
 STATE_JSON = os.path.join(PKG_DIR, 'tuning_results', 'optimizer_state.json')
+CONTROLLER_LOG = os.path.join(PKG_DIR, 'tuning_results', 'controller_launch.log')
 
 PARAM_BOUNDS = {
     'm_pos_min': (0.001, 0.1),
@@ -29,6 +30,11 @@ PARAM_BOUNDS = {
     'zeta_pos': (0.5, 1.2),
     'adaptive_lambda': (10.0, 100.0),
     'adaptive_alpha_pos': (5.0, 50.0),
+    # Core integral terms only
+    'i_gain_pos': (300.0, 2000.0),
+    'i_gain_ori': (10.0, 120.0),
+    'i_clamp_pos': (0.002, 0.05),
+    'i_clamp_ori': (0.0002, 0.01),
 }
 
 OPT_STATE = {
@@ -52,6 +58,7 @@ def load_yaml(path):
         return yaml.safe_load(f)
 
 def write_trial_yaml(base_path, trial_path, params):
+    # Clone the full controller config, then override only optimizer-tuned fields.
     data = load_yaml(base_path)
     ros_params = data['/**']['ros__parameters']
     for k, v in params.items():
@@ -66,7 +73,45 @@ def launch_controller(param_file):
         'real_robot:=true', 'debug:=true', 'vel_streaming:=true', 'jogging:=true',
         'bayesian:=true', f'feedback_yaml_file:={os.path.abspath(param_file)}'
     ]
-    return subprocess.Popen(cmd, preexec_fn=os.setsid, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.makedirs(os.path.dirname(CONTROLLER_LOG), exist_ok=True)
+    log_fp = open(CONTROLLER_LOG, 'a', buffering=1)
+    log_fp.write(f"\n===== Trial launch @ {datetime.datetime.now().isoformat()} =====\n")
+    proc = subprocess.Popen(
+        cmd,
+        preexec_fn=os.setsid,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    proc._launch_log_fp = log_fp  # keep handle so we can close it on shutdown
+    return proc
+
+
+def wait_for_controller_ready(proc, timeout_sec=45.0):
+    ready_token = 'motomini_feedback_stream ready.'
+    start = time.time()
+    read_offset = 0
+
+    while (time.time() - start) < timeout_sec:
+        if proc.poll() is not None:
+            raise RuntimeError(f"Controller process exited early with code {proc.returncode}")
+
+        if os.path.exists(CONTROLLER_LOG):
+            with open(CONTROLLER_LOG, 'r') as f:
+                f.seek(read_offset)
+                chunk = f.read()
+                read_offset = f.tell()
+            if chunk:
+                for line in chunk.splitlines():
+                    if ready_token in line:
+                        print(f"[Ready] {line.strip()}")
+                        return
+
+        time.sleep(0.1)
+
+    raise TimeoutError(
+        f"Timed out waiting for controller readiness log ('{ready_token}') in {CONTROLLER_LOG}"
+    )
 
 def stop_process(proc):
     if proc is None:
@@ -79,6 +124,13 @@ def stop_process(proc):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except Exception:
             pass
+    finally:
+        log_fp = getattr(proc, '_launch_log_fp', None)
+        if log_fp is not None:
+            try:
+                log_fp.close()
+            except Exception:
+                pass
 
 def run_one_trial(params, trial_index):
     trial_start = time.time()
@@ -87,20 +139,14 @@ def run_one_trial(params, trial_index):
 
     proc = launch_controller(TRIAL_YAML)
     try:
-        time.sleep(10.0)  # wait controller startup and joint state sync
-
-        # Reset services
-        subprocess.run(['ros2', 'service', 'call', '/pose_following/stop', 'std_srvs/srv/Trigger', '{}'], timeout=5)
-        time.sleep(0.5)
-        subprocess.run(['ros2', 'service', 'call', '/pose_following/start', 'std_srvs/srv/Trigger', '{}'], timeout=5)
-        time.sleep(0.5)
+        wait_for_controller_ready(proc)
 
         # Run tracking trial. This script should print JSON metrics to stdout.
         cmd = [
             'python3', os.path.join(SCRIPT_DIR, 'run_tracking_trial.py'),
             '--ros-args', '-p', f'trial_index:={trial_index}', '-p', 'duration:=10.0'
         ]
-        out = subprocess.check_output(cmd, text=True, timeout=30.0)
+        out = subprocess.check_output(cmd, text=True, timeout=70.0)
         
         # parse the last line which should be JSON
         metrics_line = out.strip().splitlines()[-1]
@@ -109,6 +155,14 @@ def run_one_trial(params, trial_index):
         except json.JSONDecodeError:
             metrics = {'error': 'Failed to parse JSON', 'safety_fail': True, 'raw_out': out}
             print(f"JSON Parse Error. Output was: {out}")
+
+        print(
+            "[TrialMetrics] "
+            f"safety_fail={metrics.get('safety_fail', False)} "
+            f"overshoot={metrics.get('overshoot', 'n/a')} "
+            f"rmse={metrics.get('rmse', 'n/a')} "
+            f"rise_time={metrics.get('rise_time', 'n/a')}"
+        )
 
         cost = compute_cost(metrics)
         trial_duration_sec = time.time() - trial_start
@@ -138,6 +192,8 @@ def compute_cost(m):
     settling_time = float(m.get('settling_time', 10.0))
     max_feedback_vel = float(m.get('max_feedback_vel', 0.0))
     max_joint_vel_ratio = float(m.get('max_joint_vel_ratio', 0.0))
+    orientation_rmse = float(m.get('orientation_rmse', 0.0))
+    orientation_max_error = float(m.get('orientation_max_error', 0.0))
 
     cost = (
         1.5 * rise_time / 1.0
@@ -146,6 +202,8 @@ def compute_cost(m):
         + 50.0 * overshoot / 0.001
         + 4.0 * jitter / 0.0002
         + 1.0 * settling_time / 1.0
+        + 6.0 * orientation_rmse / 0.05
+        + 4.0 * orientation_max_error / 0.1
     )
 
     if overshoot > 0.001:
@@ -156,6 +214,10 @@ def compute_cost(m):
 
     if max_joint_vel_ratio > 0.95:
         cost += 1e6 + (max_joint_vel_ratio - 0.95) * 1e6
+
+    # Hard penalty if orientation drifts too much during ramp tracking.
+    if orientation_max_error > 0.20:
+        cost += 5e5 + (orientation_max_error - 0.20) * 1e6
 
     return float(cost)
 
@@ -207,6 +269,7 @@ def save_trial(trial_index, params, metrics, cost, trial_duration_sec=0.0):
         'J_approach': metrics.get('J_approach', np.nan),
         'J_near': metrics.get('J_near', np.nan),
         'J_tracking': metrics.get('J_tracking', np.nan),
+        'J_orientation': metrics.get('J_orientation', np.nan),
 
         'rmse': metrics.get('rmse', np.nan),
         'ramp_lag': metrics.get('ramp_lag', np.nan),
@@ -219,6 +282,8 @@ def save_trial(trial_index, params, metrics, cost, trial_duration_sec=0.0):
         'max_feedback_vel': metrics.get('max_feedback_vel', np.nan),
         'max_joint_vel_ratio': metrics.get('max_joint_vel_ratio', np.nan),
         'vel_violation': metrics.get('vel_violation', np.nan),
+        'orientation_rmse': metrics.get('orientation_rmse', np.nan),
+        'orientation_max_error': metrics.get('orientation_max_error', np.nan),
 
         'exploration_distance': float(exploration_distance),
         'trial_duration_sec': float(trial_duration_sec),
@@ -259,7 +324,11 @@ def objective(trial):
         'k_pos_max': trial.suggest_float('k_pos_max', 1000.0, 3000.0),
         'zeta_pos': trial.suggest_float('zeta_pos', 0.5, 1.2),
         'adaptive_lambda': trial.suggest_float('adaptive_lambda', 10.0, 100.0),
-        'adaptive_alpha_pos': trial.suggest_float('adaptive_alpha_pos', 5.0, 50.0)
+        'adaptive_alpha_pos': trial.suggest_float('adaptive_alpha_pos', 5.0, 50.0),
+        'i_gain_pos': trial.suggest_float('i_gain_pos', 300.0, 2000.0),
+        'i_gain_ori': trial.suggest_float('i_gain_ori', 10.0, 120.0),
+        'i_clamp_pos': trial.suggest_float('i_clamp_pos', 0.002, 0.05),
+        'i_clamp_ori': trial.suggest_float('i_clamp_ori', 0.0002, 0.01),
     }
     
     # Ensure min < max

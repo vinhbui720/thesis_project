@@ -1,21 +1,29 @@
 /**:
   ros__parameters:
     rate_hz: 50.0
-    m_pos_min: 0.007352367614692211
-    m_pos_max: 0.3650802891708597
-    k_pos_min: 329.87657972805715
-    k_pos_max: 1022.7331155480122
-    zeta_pos: 0.9371049878432245
+    m_pos_min: 0.029542273340615672
+    m_pos_max: 0.3794729278400772
+    k_pos_min: 413.2531186672825
+    k_pos_max: 1281.4984838973373
+    zeta_pos: 0.94157995783777
     m_ori_min: 0.02
     m_ori_max: 0.15
-    k_ori_min: 2.0
-    k_ori_max: 15.0
-    zeta_ori: 1.0
-    adaptive_lambda: 29.84878615827663
-    adaptive_alpha_pos: 19.305766863246415
+    k_ori_min: 4.0
+    k_ori_max: 35.0
+    zeta_ori: 1.3
+    adaptive_lambda: 59.806376157295
+    adaptive_alpha_pos: 38.66672496214706
     adaptive_alpha_ori: 5.0
+    i_gain_pos: 617.1722149189104
+    i_gain_ori: 44.898586003749884
+    i_clamp_pos: 0.009378994808858294
+    i_clamp_ori: 0.00508026237091076
+    i_force_ref: 1.0
+    i_force_shape: 10.0
+    i_force_min_scale: 0.0
+    i_collision_decay_rate: 14.0
     max_cart_linear_vel: 5.0
-    max_cart_angular_vel: 4.0
+    max_cart_angular_vel: 1.2
     max_cart_linear_acc: 3.0
     max_cart_angular_acc: 1.0
     w0: 0.001

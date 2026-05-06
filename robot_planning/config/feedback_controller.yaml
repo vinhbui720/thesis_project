@@ -185,14 +185,14 @@
     #   Raise k_ori_max if orientation lags.
     #   Lower k_ori_max if wrist joints hit velocity limits or oscillate.
     #   Lower k_ori_min for a softer settle near the target orientation.
-    k_ori_min: 2.0
-    k_ori_max: 15.0
+    k_ori_min: 4.0
+    k_ori_max: 35.0
 
     # Orientation damping ratio.
     # Tuning:
     #   Increase if orientation overshoots.
     #   Decrease slightly if orientation feels overdamped.
-    zeta_ori: 1.0
+    zeta_ori: 1.3
 
     # ===========================================================================
     # ADAPTATION PROFILE
@@ -214,6 +214,31 @@
     adaptive_alpha_ori: 5.0
 
     # ===========================================================================
+    # INTEGRAL ACTION (CONTINUOUS FORCE-ADAPTIVE)
+    # ===========================================================================
+    # Baseline I gains used when collision force is small.
+    i_gain_pos: 1200.0
+    i_gain_ori: 40.0
+
+    # Integral state clamp (simple anti-windup for each axis).
+    i_clamp_pos: 0.015
+    i_clamp_ori: 0.0015
+
+    # Continuous attenuation by collision force magnitude ||F||:
+    #   i_scale = i_force_min_scale + (1-i_force_min_scale) * exp(-(||F||/i_force_ref)^i_force_shape)
+    #   I_eff   = I_base * i_scale
+    #
+    # i_force_ref   [N]: force level where I starts dropping significantly.
+    # i_force_shape [-]: curve steepness (higher = steeper drop).
+    # i_force_min_scale in [0,1]: minimum retained I scale at very high force.
+    i_force_ref: 1.0
+    i_force_shape: 10.0
+    i_force_min_scale: 0.0
+
+    # Extra integral bleed-off [1/s] as I attenuation increases.
+    i_collision_decay_rate: 14.0
+
+    # ===========================================================================
     # CARTESIAN VELOCITY SAFETY LIMITS
     # ===========================================================================
     # Clamp the integrated virtual Cartesian velocity before converting to joints.
@@ -221,7 +246,7 @@
     #   Lower these first if the robot feels abrupt.
     #   Raise only after confirming joint velocity safety does not trip.
     max_cart_linear_vel: 5.0    # [m/s]
-    max_cart_angular_vel: 4.0   # [rad/s]
+    max_cart_angular_vel: 1.2   # [rad/s]
     max_cart_linear_acc: 3.0
     max_cart_angular_acc: 1.0
     # ===========================================================================

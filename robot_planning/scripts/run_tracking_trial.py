@@ -42,6 +42,7 @@ class TrackingTrialNode(Node):
         self.recording_active = False
         self.ready_timeout = 40.0 # Wait up to 40 seconds for robot to be ready
         self.start_time = time.time()
+        self.motion_start_time = self.start_time
         self.recording_start_time = None
         
         self.tf_buffer = Buffer()
@@ -76,7 +77,8 @@ class TrackingTrialNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'world'
 
-        current_time = (time.time() - self.recording_start_time) if self.recording_active else 0.0
+        # Start motion exactly when controller FOLLOW state is detected.
+        current_time = (time.time() - self.motion_start_time) if self.recording_active else 0.0
 
         start_x = self.start_x
         start_y = self.start_y
@@ -87,10 +89,7 @@ class TrackingTrialNode(Node):
         
         # S-curve interpolation from initial pose to start pose during warmup
         if current_time < warmup_time:
-            if not self.recording_active:
-                progress = 0.0
-            else:
-                progress = current_time / max(warmup_time, 1e-9)
+            progress = current_time / max(warmup_time, 1e-9)
             s_curve = 0.5 * (1.0 - math.cos(math.pi * progress))
             target_x = self.initial_pose.translation.x + (start_x - self.initial_pose.translation.x) * s_curve
             target_y = self.initial_pose.translation.y + (start_y - self.initial_pose.translation.y) * s_curve
@@ -111,7 +110,7 @@ class TrackingTrialNode(Node):
         msg.pose.orientation = self.initial_pose.rotation
 
         self.pose_pub.publish(msg)
-        
+
         if self.recording_active:
             t = time.time() - self.recording_start_time
             self.target_data.append((t, msg.pose.position.x, msg.pose.position.y, msg.pose.position.z))
@@ -128,31 +127,42 @@ class TrackingTrialNode(Node):
 
         self.tf_broadcaster.sendTransform(tf_msg)
 
+    def _start_recording_once(self, reason: str):
+        if self.recording_active:
+            return
+        self.recording_active = True
+        self.recording_start_time = time.time()
+        self.motion_start_time = self.recording_start_time
+        self.get_logger().info(f'Starting trial recording ({reason}).')
+
     def rosout_cb(self, msg):
-        if msg.name == 'motomini_feedback_stream':
-            if not self.recording_active:
-                if 'STATE_POSE_FOLLOW: tracking' in msg.msg:
-                    self.get_logger().info('Robot is now in STATE_POSE_FOLLOW. Starting recording.')
-                    self.recording_active = True
-                    self.recording_start_time = time.time()
-            
-            # Continuously monitor for errors
-            msg_text = msg.msg
-            if 'limit → holding' in msg_text or 'limit -> holding' in msg_text:
-                self.safety_fail = True
-                self.safety_reason = 'Joint position limit hit'
-            elif 'safety exceeded' in msg_text or 'exceeds limit' in msg_text:
-                self.safety_fail = True
-                self.safety_reason = 'Velocity safety exceeded'
-            elif 'Pose input timeout' in msg_text:
-                self.safety_fail = True
-                self.safety_reason = 'Pose input timeout'
+        msg_text = msg.msg or ''
+        msg_lower = msg_text.lower()
+
+        # Accept any node/log format that includes STATE_POSE_FOLLOW.
+        if (not self.recording_active) and ('state_pose_follow' in msg_lower):
+            self._start_recording_once('detected STATE_POSE_FOLLOW in /rosout')
+
+        # Continuously monitor for errors.
+        if 'limit → holding' in msg_text or 'limit -> holding' in msg_text:
+            self.safety_fail = True
+            self.safety_reason = 'Joint position limit hit'
+        elif 'safety exceeded' in msg_lower or 'exceeds limit' in msg_lower:
+            self.safety_fail = True
+            self.safety_reason = 'Velocity safety exceeded'
+        elif 'pose input timeout' in msg_lower:
+            self.safety_fail = True
+            self.safety_reason = 'Pose input timeout'
 
     def feedback_cb(self, msg):
+        # Do not start recording from feedback alone; controller publishes feedback
+        # in IDLE/ARMING too. We synchronize strictly on FOLLOW logs.
         if not self.recording_active:
             return
         t = time.time() - self.recording_start_time
-        self.feedback_data.append((t, msg.linear.x, msg.linear.y, msg.linear.z))
+        self.feedback_data.append(
+            (t, msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.x, msg.angular.y, msg.angular.z)
+        )
 
     def joint_cb(self, msg):
         if not self.recording_active:
@@ -212,6 +222,7 @@ class TrackingTrialNode(Node):
         y_target = np.array([d[2] for d in self.target_data])
         t_fb = np.array([d[0] for d in self.feedback_data])
         y_fb = np.array([d[2] for d in self.feedback_data])
+        rpy_fb = np.array([[d[4], d[5], d[6]] for d in self.feedback_data], dtype=float)
 
         start_y = self.start_y
         end_y = self.end_y
@@ -290,20 +301,30 @@ class TrackingTrialNode(Node):
 
         J_tracking = 5.0 * tracking_rmse + 3.0 * phase_lag + 2.0 * velocity_noise
 
-        # Total Cost
-        J_total = J_approach + J_near + J_tracking
+        # Orientation consistency: keep wrist orientation close to initial tracking orientation.
+        ref_rpy = rpy_fb[0]
+        rpy_err = np.arctan2(np.sin(rpy_fb - ref_rpy), np.cos(rpy_fb - ref_rpy))
+        rpy_err_norm = np.linalg.norm(rpy_err, axis=1)
+        orientation_rmse = float(np.sqrt(np.mean(rpy_err_norm ** 2)))
+        orientation_max_error = float(np.max(np.abs(rpy_err_norm)))
+        J_orientation = 8.0 * orientation_rmse + 4.0 * orientation_max_error
 
-        # Reject constraints
-        if overshoot > 0.001 or vel_violation > 1.0:
-            return {'safety_fail': True, 'cost': 1e9, 'error': f"Constraints violated: overshoot={overshoot:.4f}, vel_ratio={vel_violation:.2f}"}
+        # Total Cost
+        J_total = J_approach + J_near + J_tracking + J_orientation
+
+        # Do not hard-fail for moderate overshoot. Let the optimizer objective
+        # shape this via penalties so trials remain informative.
+        constraints_violated = bool(overshoot > 0.001 or vel_violation > 1.0)
 
         return {
             'safety_fail': False,
             'cost': float(J_total),
+            'constraints_violated': constraints_violated,
 
             'J_approach': float(J_approach),
             'J_near': float(J_near),
             'J_tracking': float(J_tracking),
+            'J_orientation': float(J_orientation),
 
             'rmse': float(tracking_rmse),
             'ramp_lag': float(lag_error),
@@ -316,6 +337,8 @@ class TrackingTrialNode(Node):
             'max_feedback_vel': float(max_feedback_vel),
             'max_joint_vel_ratio': float(max_joint_vel_ratio),
             'vel_violation': float(vel_violation),
+            'orientation_rmse': float(orientation_rmse),
+            'orientation_max_error': float(orientation_max_error),
         }
 
 def main(args=None):

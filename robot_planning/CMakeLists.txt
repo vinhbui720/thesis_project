@@ -173,9 +173,19 @@ ament_target_dependencies(motomini_vel_tracking
   tesseract_rosutils
 )
 
-add_executable(motomini_feedback_stream src/motomini_feedback_stream.cpp)
+add_executable(motomini_feedback_stream
+  src/motomini_feedback_stream_setup.cpp
+  src/motomini_feedback_stream_control.cpp
+  src/motomini_feedback_stream_callbacks.cpp
+  src/motomini_feedback_stream_main.cpp
+)
+target_include_directories(motomini_feedback_stream PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
 ament_target_dependencies(motomini_feedback_stream
   rclcpp
+  std_msgs
   geometry_msgs
   sensor_msgs
   trajectory_msgs
