@@ -17,8 +17,8 @@ environment:
       type: override_urdf
 
       pose:
-        xyz: [0.225, -0.0, 0.35]
-        rpy: [0.0, 0.0, 1.57142857143]
+        xyz: [0.3, 0.0, 0.5]
+        rpy: [0.0, 3.1415, -1.57142857143]
 
       sensor:
         type: realsense_d435

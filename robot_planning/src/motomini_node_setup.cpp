@@ -204,7 +204,7 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     bool use_ompl = this->get_parameter("use_ompl").as_bool();
     std::string manipulator_group = this->get_parameter("manipulator_group").as_string();
     base_link_ = this->get_parameter("base_link").as_string();
-    
+
     // Priority: tool_param > ee_link
     std::string tool_p = this->get_parameter("tool_param").as_string();
     if (!tool_p.empty())
@@ -262,30 +262,30 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
         cfg.ompl_rrt_range_1 = this->get_parameter("ompl_rrt_range_1").as_double();
         cfg.ompl_rrt_range_2 = this->get_parameter("ompl_rrt_range_2").as_double();
         cfg.use_ompl_runtime = this->get_parameter("use_ompl").as_bool();
-        
+
         cfg.ifopt_cart_coeff_x = this->get_parameter("ifopt_cart_coeff_x").as_double();
         cfg.ifopt_cart_coeff_y = this->get_parameter("ifopt_cart_coeff_y").as_double();
         cfg.ifopt_cart_coeff_z = this->get_parameter("ifopt_cart_coeff_z").as_double();
         cfg.ifopt_cart_coeff_rx = this->get_parameter("ifopt_cart_coeff_rx").as_double();
         cfg.ifopt_cart_coeff_ry = this->get_parameter("ifopt_cart_coeff_ry").as_double();
         cfg.ifopt_cart_coeff_rz = this->get_parameter("ifopt_cart_coeff_rz").as_double();
-        
+
         cfg.ifopt_joint_cost_coeff = this->get_parameter("ifopt_joint_cost_coeff").as_double();
         cfg.ifopt_coll_cost_margin = this->get_parameter("ifopt_coll_cost_margin").as_double();
         cfg.ifopt_coll_cost_coeff = this->get_parameter("ifopt_coll_cost_coeff").as_double();
         cfg.ifopt_coll_margin_buffer = this->get_parameter("ifopt_coll_margin_buffer").as_double();
         cfg.ifopt_coll_eval_type = this->get_parameter("ifopt_coll_eval_type").as_int();
         cfg.ifopt_coll_lvs_length = this->get_parameter("ifopt_coll_lvs_length").as_double();
-        
+
         cfg.ifopt_smooth_vel = this->get_parameter("ifopt_smooth_vel_coeff").as_double();
         cfg.ifopt_smooth_acc = this->get_parameter("ifopt_smooth_acc_coeff").as_double();
         cfg.ifopt_smooth_jerk = this->get_parameter("ifopt_smooth_jerk_coeff").as_double();
-        
+
         cfg.ifopt_max_iter = this->get_parameter("ifopt_max_iter").as_int();
         cfg.ifopt_min_approx_improve = this->get_parameter("ifopt_min_approx_improve").as_double();
         cfg.ifopt_min_trust_box_size = this->get_parameter("ifopt_min_trust_box_size").as_double();
         cfg.ifopt_initial_trust_box_size = this->get_parameter("ifopt_initial_trust_box_size").as_double();
-        
+
         cfg.ifopt_joint_cost_enable = this->get_parameter("ifopt_joint_cost_enable").as_bool();
         cfg.ifopt_cart_constraint_enable = this->get_parameter("ifopt_cart_constraint_enable").as_bool();
         cfg.ifopt_cart_cost_enable = this->get_parameter("ifopt_cart_cost_enable").as_bool();
@@ -421,12 +421,17 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
                 marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
                 marker.action = visualization_msgs::msg::Marker::ADD;
                 marker.scale.x = 0.005;
-                marker.color.r = 0.0f; marker.color.g = 1.0f; marker.color.b = 0.0f; marker.color.a = 1.0f;
+                marker.color.r = 0.0f;
+                marker.color.g = 1.0f;
+                marker.color.b = 0.0f;
+                marker.color.a = 1.0f;
 
                 for (const auto &pt : path)
                 {
                     geometry_msgs::msg::Point p;
-                    p.x = pt.x(); p.y = pt.y(); p.z = pt.z();
+                    p.x = pt.x();
+                    p.y = pt.y();
+                    p.z = pt.z();
                     marker.points.push_back(p);
                 }
                 pub_ee_path_->publish(marker);
@@ -491,49 +496,120 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
         const std::string &n = p.get_name();
         try
         {
-            if (n == "move_instruction_type") cfg.use_linear = (p.as_string() == "LINEAR");
-            else if (n == "use_ompl") cfg.use_ompl_runtime = p.as_bool();
-            else if (n == "ifopt_cart_coeff_x") cfg.ifopt_cart_coeff_x = p.as_double();
-            else if (n == "ifopt_cart_coeff_y") cfg.ifopt_cart_coeff_y = p.as_double();
-            else if (n == "ifopt_cart_coeff_z") cfg.ifopt_cart_coeff_z = p.as_double();
-            else if (n == "ifopt_cart_coeff_rx") cfg.ifopt_cart_coeff_rx = p.as_double();
-            else if (n == "ifopt_cart_coeff_ry") cfg.ifopt_cart_coeff_ry = p.as_double();
-            else if (n == "ifopt_cart_coeff_rz") cfg.ifopt_cart_coeff_rz = p.as_double();
-            else if (n == "ifopt_coll_eval_type") cfg.ifopt_coll_eval_type = static_cast<int>(p.as_int());
-            else if (n == "ifopt_coll_lvs_length") cfg.ifopt_coll_lvs_length = p.as_double();
-            else if (n == "ifopt_joint_cost_coeff") cfg.ifopt_joint_cost_coeff = p.as_double();
-            else if (n == "ifopt_coll_cost_margin") cfg.ifopt_coll_cost_margin = p.as_double();
-            else if (n == "ifopt_coll_cost_coeff") cfg.ifopt_coll_cost_coeff = p.as_double();
-            else if (n == "ifopt_coll_margin_buffer") cfg.ifopt_coll_margin_buffer = p.as_double();
-            else if (n == "ifopt_smooth_vel_coeff") cfg.ifopt_smooth_vel = p.as_double();
-            else if (n == "ifopt_smooth_acc_coeff") cfg.ifopt_smooth_acc = p.as_double();
-            else if (n == "ifopt_smooth_jerk_coeff") cfg.ifopt_smooth_jerk = p.as_double();
-            else if (n == "ifopt_max_iter") cfg.ifopt_max_iter = static_cast<int>(p.as_int());
-            else if (n == "ifopt_min_approx_improve") cfg.ifopt_min_approx_improve = p.as_double();
-            else if (n == "ifopt_min_trust_box_size") cfg.ifopt_min_trust_box_size = p.as_double();
-            else if (n == "ifopt_initial_trust_box_size") cfg.ifopt_initial_trust_box_size = p.as_double();
-            else if (n == "ifopt_joint_cost_enable") cfg.ifopt_joint_cost_enable = p.as_bool();
-            else if (n == "ifopt_cart_constraint_enable") cfg.ifopt_cart_constraint_enable = p.as_bool();
-            else if (n == "ifopt_cart_cost_enable") cfg.ifopt_cart_cost_enable = p.as_bool();
-            else if (n == "ifopt_coll_constraint_enable") cfg.ifopt_coll_constraint_enable = p.as_bool();
-            else if (n == "ifopt_coll_cost_enable") cfg.ifopt_coll_cost_enable = p.as_bool();
-            else if (n == "ifopt_smooth_vel_enable") cfg.ifopt_smooth_vel_enable = p.as_bool();
-            else if (n == "ifopt_smooth_acc_enable") cfg.ifopt_smooth_acc_enable = p.as_bool();
-            else if (n == "ifopt_smooth_jerk_enable") cfg.ifopt_smooth_jerk_enable = p.as_bool();
-            else if (n == "ompl_planning_time") cfg.ompl_planning_time = p.as_double();
-            else if (n == "ompl_max_solutions") cfg.ompl_max_solutions = static_cast<int>(p.as_int());
-            else if (n == "ompl_simplify") cfg.ompl_simplify = p.as_bool();
-            else if (n == "ompl_rrt_range_1") cfg.ompl_rrt_range_1 = p.as_double();
-            else if (n == "ompl_rrt_range_2") cfg.ompl_rrt_range_2 = p.as_double();
-            else if (n == "planning_chunk_size") { new_chunk_size = static_cast<int>(p.as_int()); chunk_changed = true; }
-            else if (n == "planning_parallel_chunks") { new_parallel = static_cast<int>(p.as_int()); chunk_changed = true; }
-            else if (n == "real_robot") { real_robot_ = p.as_bool(); first_velocity_read_ = true; qdot_filtered_.resize(0); have_velocity_filter_update_ = false; }
-            else if (n == "integrate_target_vel_to_pose") { integrate_target_vel_to_pose_ = p.as_bool(); }
-            else if (n == "velocity_filter_cutoff_hz") { velocity_filter_cutoff_hz_ = p.as_double(); sanitizeTrackingParameters(); }
-            else if (n == "max_cart_linear_acc") { max_cart_linear_acc_ = p.as_double(); sanitizeTrackingParameters(); }
-            else if (n == "max_cart_angular_acc") { max_cart_angular_acc_ = p.as_double(); sanitizeTrackingParameters(); }
-            else if (n == "measured_cart_linear_vel_limit") { measured_cart_linear_vel_limit_ = p.as_double(); sanitizeTrackingParameters(); }
-            else if (n == "measured_cart_angular_vel_limit") { measured_cart_angular_vel_limit_ = p.as_double(); sanitizeTrackingParameters(); }
+            if (n == "move_instruction_type")
+                cfg.use_linear = (p.as_string() == "LINEAR");
+            else if (n == "use_ompl")
+                cfg.use_ompl_runtime = p.as_bool();
+            else if (n == "ifopt_cart_coeff_x")
+                cfg.ifopt_cart_coeff_x = p.as_double();
+            else if (n == "ifopt_cart_coeff_y")
+                cfg.ifopt_cart_coeff_y = p.as_double();
+            else if (n == "ifopt_cart_coeff_z")
+                cfg.ifopt_cart_coeff_z = p.as_double();
+            else if (n == "ifopt_cart_coeff_rx")
+                cfg.ifopt_cart_coeff_rx = p.as_double();
+            else if (n == "ifopt_cart_coeff_ry")
+                cfg.ifopt_cart_coeff_ry = p.as_double();
+            else if (n == "ifopt_cart_coeff_rz")
+                cfg.ifopt_cart_coeff_rz = p.as_double();
+            else if (n == "ifopt_coll_eval_type")
+                cfg.ifopt_coll_eval_type = static_cast<int>(p.as_int());
+            else if (n == "ifopt_coll_lvs_length")
+                cfg.ifopt_coll_lvs_length = p.as_double();
+            else if (n == "ifopt_joint_cost_coeff")
+                cfg.ifopt_joint_cost_coeff = p.as_double();
+            else if (n == "ifopt_coll_cost_margin")
+                cfg.ifopt_coll_cost_margin = p.as_double();
+            else if (n == "ifopt_coll_cost_coeff")
+                cfg.ifopt_coll_cost_coeff = p.as_double();
+            else if (n == "ifopt_coll_margin_buffer")
+                cfg.ifopt_coll_margin_buffer = p.as_double();
+            else if (n == "ifopt_smooth_vel_coeff")
+                cfg.ifopt_smooth_vel = p.as_double();
+            else if (n == "ifopt_smooth_acc_coeff")
+                cfg.ifopt_smooth_acc = p.as_double();
+            else if (n == "ifopt_smooth_jerk_coeff")
+                cfg.ifopt_smooth_jerk = p.as_double();
+            else if (n == "ifopt_max_iter")
+                cfg.ifopt_max_iter = static_cast<int>(p.as_int());
+            else if (n == "ifopt_min_approx_improve")
+                cfg.ifopt_min_approx_improve = p.as_double();
+            else if (n == "ifopt_min_trust_box_size")
+                cfg.ifopt_min_trust_box_size = p.as_double();
+            else if (n == "ifopt_initial_trust_box_size")
+                cfg.ifopt_initial_trust_box_size = p.as_double();
+            else if (n == "ifopt_joint_cost_enable")
+                cfg.ifopt_joint_cost_enable = p.as_bool();
+            else if (n == "ifopt_cart_constraint_enable")
+                cfg.ifopt_cart_constraint_enable = p.as_bool();
+            else if (n == "ifopt_cart_cost_enable")
+                cfg.ifopt_cart_cost_enable = p.as_bool();
+            else if (n == "ifopt_coll_constraint_enable")
+                cfg.ifopt_coll_constraint_enable = p.as_bool();
+            else if (n == "ifopt_coll_cost_enable")
+                cfg.ifopt_coll_cost_enable = p.as_bool();
+            else if (n == "ifopt_smooth_vel_enable")
+                cfg.ifopt_smooth_vel_enable = p.as_bool();
+            else if (n == "ifopt_smooth_acc_enable")
+                cfg.ifopt_smooth_acc_enable = p.as_bool();
+            else if (n == "ifopt_smooth_jerk_enable")
+                cfg.ifopt_smooth_jerk_enable = p.as_bool();
+            else if (n == "ompl_planning_time")
+                cfg.ompl_planning_time = p.as_double();
+            else if (n == "ompl_max_solutions")
+                cfg.ompl_max_solutions = static_cast<int>(p.as_int());
+            else if (n == "ompl_simplify")
+                cfg.ompl_simplify = p.as_bool();
+            else if (n == "ompl_rrt_range_1")
+                cfg.ompl_rrt_range_1 = p.as_double();
+            else if (n == "ompl_rrt_range_2")
+                cfg.ompl_rrt_range_2 = p.as_double();
+            else if (n == "planning_chunk_size")
+            {
+                new_chunk_size = static_cast<int>(p.as_int());
+                chunk_changed = true;
+            }
+            else if (n == "planning_parallel_chunks")
+            {
+                new_parallel = static_cast<int>(p.as_int());
+                chunk_changed = true;
+            }
+            else if (n == "real_robot")
+            {
+                real_robot_ = p.as_bool();
+                first_velocity_read_ = true;
+                qdot_filtered_.resize(0);
+                have_velocity_filter_update_ = false;
+            }
+            else if (n == "integrate_target_vel_to_pose")
+            {
+                integrate_target_vel_to_pose_ = p.as_bool();
+            }
+            else if (n == "velocity_filter_cutoff_hz")
+            {
+                velocity_filter_cutoff_hz_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "max_cart_linear_acc")
+            {
+                max_cart_linear_acc_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "max_cart_angular_acc")
+            {
+                max_cart_angular_acc_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "measured_cart_linear_vel_limit")
+            {
+                measured_cart_linear_vel_limit_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "measured_cart_angular_vel_limit")
+            {
+                measured_cart_angular_vel_limit_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
             else if (n == "ee_link" || n == "tool_param")
             {
                 ee_link_ = p.as_string();

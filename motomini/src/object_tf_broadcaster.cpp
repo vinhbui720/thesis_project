@@ -20,8 +20,8 @@ public:
         ee_link_ = this->get_parameter("ee_link").as_string();
         real_robot_ = this->get_parameter("real_robot").as_bool();
 
-        enable_client_ = this->create_client<std_srvs::srv::Trigger>("/robot_enable");
-        disable_client_ = this->create_client<std_srvs::srv::Trigger>("/robot_disable");
+        enable_client_ = this->create_client<std_srvs::srv::Trigger>("/tool_enable");
+        disable_client_ = this->create_client<std_srvs::srv::Trigger>("/tool_disable");
 
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 

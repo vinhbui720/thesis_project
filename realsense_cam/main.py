@@ -24,7 +24,6 @@ rclpy.init()
 parser = argparse.ArgumentParser()
 parser.add_argument("--realcam", action="store_true", help="Enable real camera (live stream)")
 parser.add_argument("--bag", type=str, help="Path to the bag file (overrides config)")
-parser.add_argument("--tuning", action="store_true", help="Launch interactive GUI tuning mode to calibrate threshold, blur, etc.")
 args = parser.parse_args()
 
 # --- Source Selection ---
@@ -53,17 +52,6 @@ intr = (src.fx, src.fy, src.cx, src.cy, src.width, src.height)
 
 icp_node = PoseInitICPAsync(CONFIG, "data/test1_cam_view.pcd", (src.fx, src.fy, src.cx, src.cy))
 ros2_pub  = ROS2Publisher(CONFIG, icp_node)
-
-# --- Tuning GUI branching ---
-if args.tuning:
-    print("[INFO] Launching interactive Tuning GUI...")
-    from tools.tuning_gui import TuningGUI
-    tuner = TuningGUI(src, CONFIG, initial_bg)
-    tuner.start()
-    
-    # Tuning gui will run and block. When done it will close the src.
-    rclpy.shutdown()
-    exit(0)
 
 # Spin the ROS 2 node (ros2_publisher) in a background thread
 # so the service handler can block without stalling the pipeline.

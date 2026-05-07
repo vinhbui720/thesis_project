@@ -36,6 +36,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -71,19 +72,24 @@ static constexpr int SPLICE_HALF_WINDOW = 4; // ±4 ticks = 80 ms at 50 Hz
 // Processing mode selected by the worker thread per incoming trajectory.
 //   FAITHFUL — single/fresh path: Hermite resample only, no filtering, no blend.
 //   SPLICE   — MPC continuous mode: sigmoid handover + full FIR filter.
-enum class ProcessingMode { FAITHFUL, SPLICE };
+enum class ProcessingMode
+{
+    FAITHFUL,
+    SPLICE
+};
 
-struct ProcessedCache {
+struct ProcessedCache
+{
     std::vector<std::array<double, 6>> pos;
     std::vector<std::array<double, 6>> vel;
-    std::vector<double>                time;
+    std::vector<double> time;
 
-    double         t_splice     {0.0};
-    double         dt           {0.02};
-    bool           dense_filled {false};
-    bool           skip_blend   {false}; // Mode A: RT thread skips Hermite blend
-    ProcessingMode mode         {ProcessingMode::SPLICE};
-    rclcpp::Time   created_at;
+    double t_splice{0.0};
+    double dt{0.02};
+    bool dense_filled{false};
+    bool skip_blend{false}; // Mode A: RT thread skips Hermite blend
+    ProcessingMode mode{ProcessingMode::SPLICE};
+    rclcpp::Time created_at;
 };
 
 /**
@@ -93,7 +99,7 @@ struct HermiteBlend
 {
     double p0{0.0}, v0{0.0};
     double p1{0.0}, v1{0.0};
-    double T{0.04}; 
+    double T{0.04};
 
     double pos(double t) const
     {
@@ -143,6 +149,9 @@ public:
 
         pub_arm_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_path_command", 10);
         pub_stream_ = this->create_publisher<trajectory_msgs::msg::JointTrajectory>("/joint_command", 10);
+        pub_execution_state_ = this->create_publisher<std_msgs::msg::Bool>(
+            "/trajectory_executing", rclcpp::QoS(1).transient_local());
+        publishExecutionState(false);
 
         sub_joint_state_ = this->create_subscription<sensor_msgs::msg::JointState>(
             "/joint_states", 20,
@@ -173,6 +182,18 @@ public:
     }
 
 private:
+    void publishExecutionState(bool executing)
+    {
+        if (execution_state_initialized_ && execution_state_ == executing)
+            return;
+
+        std_msgs::msg::Bool msg;
+        msg.data = executing;
+        pub_execution_state_->publish(msg);
+        execution_state_ = executing;
+        execution_state_initialized_ = true;
+    }
+
     enum State
     {
         STATE_WAIT_JOINT,
@@ -201,7 +222,7 @@ private:
                         const size_t idxp = static_cast<size_t>(
                             std::distance(last_joint_state_->name.begin(), itp));
                         const double raw = (msg->position[idx] - last_joint_state_->position[idxp]) / dt_js;
-                        est_vel_[i] = 0.3 * raw + 0.7 * est_vel_[i]; 
+                        est_vel_[i] = 0.3 * raw + 0.7 * est_vel_[i];
                     }
                 }
             }
@@ -211,28 +232,32 @@ private:
 
     void trajectoryCallback(const trajectory_msgs::msg::JointTrajectory::SharedPtr msg)
     {
-        if (msg->points.size() <= 1) return;
-        if (state_.load() != STATE_STREAMING) return;
+        if (msg->points.size() <= 1)
+            return;
+        if (state_.load() != STATE_STREAMING)
+            return;
 
         const double since_last = (this->now() - last_traj_accept_time_).seconds();
         const double min_update_interval =
             std::max(0.0, min_traj_update_interval_sec_);
         if (last_traj_accept_time_.nanoseconds() > 0 &&
-            since_last < min_update_interval) {
+            since_last < min_update_interval)
+        {
             return;
         }
         last_traj_accept_time_ = this->now();
 
         bool expected = false;
-        if (!worker_busy_.compare_exchange_strong(expected, true)) {
+        if (!worker_busy_.compare_exchange_strong(expected, true))
+        {
             RCLCPP_DEBUG(this->get_logger(), "Worker thread busy, dropping incoming trajectory.");
             return;
         }
 
-        worker_future_ = std::async(std::launch::async, [this, msg]() {
+        worker_future_ = std::async(std::launch::async, [this, msg]()
+                                    {
             this->processTrajectory(msg);
-            this->worker_busy_.store(false, std::memory_order_release);
-        });
+            this->worker_busy_.store(false, std::memory_order_release); });
     }
 
     void processTrajectory(const trajectory_msgs::msg::JointTrajectory::SharedPtr msg)
@@ -255,7 +280,8 @@ private:
 
         // ── Joint index mapping ───────────────────────────────────────────────
         std::vector<int> src_idx(n_joints_, -1);
-        for (size_t i = 0; i < n_joints_; ++i) {
+        for (size_t i = 0; i < n_joints_; ++i)
+        {
             auto it = std::find(msg->joint_names.begin(), msg->joint_names.end(), joint_names_[i]);
             if (it != msg->joint_names.end())
                 src_idx[i] = static_cast<int>(std::distance(msg->joint_names.begin(), it));
@@ -263,27 +289,38 @@ private:
 
         // ── Splice Point (Mode B only; Mode A always t_splice = 0) ───────────
         double t_splice = 0.0;
-        if (!is_faithful && !snap_pos.empty() && !snap_vel.empty()) {
+        if (!is_faithful && !snap_pos.empty() && !snap_vel.empty())
+        {
             double min_cost = std::numeric_limits<double>::max();
             const double min_splice_time = 2.0 * dt_;
-            for (const auto &pt : msg->points) {
+            for (const auto &pt : msg->points)
+            {
                 const double t_k = rclcpp::Duration(pt.time_from_start).seconds();
-                if (t_k < min_splice_time) continue;
+                if (t_k < min_splice_time)
+                    continue;
                 double cost_pos = 0.0, cost_vel = 0.0;
-                for (size_t i = 0; i < n_joints_; ++i) {
+                for (size_t i = 0; i < n_joints_; ++i)
+                {
                     int s = src_idx[i];
-                    if (s < 0) continue;
-                    if (static_cast<size_t>(s) < pt.positions.size()) {
+                    if (s < 0)
+                        continue;
+                    if (static_cast<size_t>(s) < pt.positions.size())
+                    {
                         double d = pt.positions[static_cast<size_t>(s)] - snap_pos[i];
                         cost_pos += d * d;
                     }
-                    if (static_cast<size_t>(s) < pt.velocities.size()) {
+                    if (static_cast<size_t>(s) < pt.velocities.size())
+                    {
                         double d = pt.velocities[static_cast<size_t>(s)] - snap_vel[i];
                         cost_vel += d * d;
                     }
                 }
                 const double J = splice_w_pos_ * cost_pos + splice_w_vel_ * cost_vel;
-                if (J < min_cost) { min_cost = J; t_splice = t_k; }
+                if (J < min_cost)
+                {
+                    min_cost = J;
+                    t_splice = t_k;
+                }
             }
             const double t_end = rclcpp::Duration(msg->points.back().time_from_start).seconds();
             t_splice = std::clamp(t_splice, 0.0, t_end * 0.5);
@@ -291,46 +328,50 @@ private:
 
         // ── Build cache header ────────────────────────────────────────────────
         auto cache = std::make_shared<ProcessedCache>();
-        cache->t_splice   = t_splice;
-        cache->dt         = dt_;
+        cache->t_splice = t_splice;
+        cache->dt = dt_;
         cache->created_at = this->now();
-        cache->mode       = is_faithful ? ProcessingMode::FAITHFUL : ProcessingMode::SPLICE;
+        cache->mode = is_faithful ? ProcessingMode::FAITHFUL : ProcessingMode::SPLICE;
         cache->skip_blend = is_faithful;
 
         // ── Raw data extraction ───────────────────────────────────────────────
         const size_t n_pts = msg->points.size();
         std::vector<std::array<double, 6>> raw_pos(n_pts);
         std::vector<std::array<double, 6>> raw_vel(n_pts);
-        std::vector<double>                raw_time(n_pts);
+        std::vector<double> raw_time(n_pts);
 
-        for (size_t k = 0; k < n_pts; ++k) {
+        for (size_t k = 0; k < n_pts; ++k)
+        {
             raw_time[k] = rclcpp::Duration(msg->points[k].time_from_start).seconds();
-            for (size_t i = 0; i < n_joints_; ++i) {
+            for (size_t i = 0; i < n_joints_; ++i)
+            {
                 const int s = src_idx[i];
                 raw_pos[k][i] = (s >= 0 && static_cast<size_t>(s) < msg->points[k].positions.size())
-                    ? msg->points[k].positions[static_cast<size_t>(s)]
-                    : ((k == 0) ? snap_pos[i] : raw_pos[k - 1][i]);
-                raw_vel[k][i] = (s >= 0 && !msg->points[k].velocities.empty()
-                                 && static_cast<size_t>(s) < msg->points[k].velocities.size())
-                    ? msg->points[k].velocities[static_cast<size_t>(s)]
-                    : 0.0;
+                                    ? msg->points[k].positions[static_cast<size_t>(s)]
+                                    : ((k == 0) ? snap_pos[i] : raw_pos[k - 1][i]);
+                raw_vel[k][i] = (s >= 0 && !msg->points[k].velocities.empty() && static_cast<size_t>(s) < msg->points[k].velocities.size())
+                                    ? msg->points[k].velocities[static_cast<size_t>(s)]
+                                    : 0.0;
             }
         }
         // Fill missing velocities via finite differences
-        for (size_t i = 0; i < n_joints_; ++i) {
+        for (size_t i = 0; i < n_joints_; ++i)
+        {
             const int s = src_idx[i];
-            for (size_t k = 0; k < n_pts; ++k) {
+            for (size_t k = 0; k < n_pts; ++k)
+            {
                 if (msg->points[k].velocities.empty() || s < 0 ||
-                    static_cast<size_t>(s) >= msg->points[k].velocities.size()) {
+                    static_cast<size_t>(s) >= msg->points[k].velocities.size())
+                {
                     if (k == 0 && n_pts > 1)
                         raw_vel[k][i] = (raw_pos[1][i] - raw_pos[0][i]) /
                                         std::max(1e-9, raw_time[1] - raw_time[0]);
                     else if (k == n_pts - 1 && n_pts > 1)
-                        raw_vel[k][i] = (raw_pos[k][i] - raw_pos[k-1][i]) /
-                                        std::max(1e-9, raw_time[k] - raw_time[k-1]);
+                        raw_vel[k][i] = (raw_pos[k][i] - raw_pos[k - 1][i]) /
+                                        std::max(1e-9, raw_time[k] - raw_time[k - 1]);
                     else if (k > 0 && k < n_pts - 1)
-                        raw_vel[k][i] = (raw_pos[k+1][i] - raw_pos[k-1][i]) /
-                                        std::max(1e-9, raw_time[k+1] - raw_time[k-1]);
+                        raw_vel[k][i] = (raw_pos[k + 1][i] - raw_pos[k - 1][i]) /
+                                        std::max(1e-9, raw_time[k + 1] - raw_time[k - 1]);
                 }
             }
         }
@@ -343,21 +384,24 @@ private:
         cache->time.resize(dense_n);
 
         size_t raw_idx = 0;
-        for (size_t i = 0; i < dense_n; ++i) {
+        for (size_t i = 0; i < dense_n; ++i)
+        {
             const double t = i * dt_;
             cache->time[i] = t;
-            while (raw_idx + 1 < n_pts - 1 && raw_time[raw_idx + 1] < t) raw_idx++;
+            while (raw_idx + 1 < n_pts - 1 && raw_time[raw_idx + 1] < t)
+                raw_idx++;
 
             const double t0 = raw_time[raw_idx];
             const double t1 = raw_time[std::min(raw_idx + 1, n_pts - 1)];
-            const double T  = std::max(1e-9, t1 - t0);
-            for (size_t j = 0; j < n_joints_; ++j) {
+            const double T = std::max(1e-9, t1 - t0);
+            for (size_t j = 0; j < n_joints_; ++j)
+            {
                 HermiteBlend h;
                 h.p0 = raw_pos[raw_idx][j];
                 h.v0 = raw_vel[raw_idx][j];
                 h.p1 = raw_pos[std::min(raw_idx + 1, n_pts - 1)][j];
                 h.v1 = raw_vel[std::min(raw_idx + 1, n_pts - 1)][j];
-                h.T  = T;
+                h.T = T;
                 cache->pos[i][j] = h.pos(t - t0);
                 cache->vel[i][j] = h.vel(t - t0);
             }
@@ -365,23 +409,28 @@ private:
         cache->dense_filled = true;
 
         // ── Mode B Post-Processing ────────────────────────────────────────────
-        if (!is_faithful) {
+        if (!is_faithful)
+        {
             const int n = static_cast<int>(cache->pos.size());
 
             // Step 1 — Full FIR Gaussian filter: removes MPC numeric noise from the
             // resampled trajectory before we compute the merge waypoints.
-            if (n > 4) {
+            if (n > 4)
+            {
                 static const double w[5] = {0.0625, 0.25, 0.375, 0.25, 0.0625};
                 auto pos_copy = cache->pos;
-                for (int k = 2; k < n - 2; ++k) {
-                    for (size_t j = 0; j < n_joints_; ++j) {
+                for (int k = 2; k < n - 2; ++k)
+                {
+                    for (size_t j = 0; j < n_joints_; ++j)
+                    {
                         double s = 0.0;
                         for (int o = -2; o <= 2; ++o)
                             s += w[o + 2] * pos_copy[k + o][j];
                         cache->pos[k][j] = s;
                     }
                 }
-                for (int k = 1; k < n - 1; ++k) {
+                for (int k = 1; k < n - 1; ++k)
+                {
                     for (size_t j = 0; j < n_joints_; ++j)
                         cache->vel[k][j] = (cache->pos[k + 1][j] - cache->pos[k - 1][j]) / (2.0 * dt_);
                 }
@@ -392,13 +441,19 @@ private:
             size_t i_match = 0;
             {
                 double min_d = std::numeric_limits<double>::max();
-                for (size_t k = 0; k < cache->pos.size(); ++k) {
+                for (size_t k = 0; k < cache->pos.size(); ++k)
+                {
                     double d = 0.0;
-                    for (size_t j = 0; j < n_joints_; ++j) {
+                    for (size_t j = 0; j < n_joints_; ++j)
+                    {
                         const double dd = cache->pos[k][j] - snap_pos[j];
                         d += dd * dd;
                     }
-                    if (d < min_d) { min_d = d; i_match = k; }
+                    if (d < min_d)
+                    {
+                        min_d = d;
+                        i_match = k;
+                    }
                 }
             }
 
@@ -409,16 +464,19 @@ private:
             const int hw = SPLICE_HALF_WINDOW;
             const size_t i_end = std::min(i_match + static_cast<size_t>(hw),
                                           cache->pos.size() - 1);
-            if (i_end > i_match && !snap_pos.empty()) {
+            if (i_end > i_match && !snap_pos.empty())
+            {
                 const double T_bridge = static_cast<double>(i_end - i_match) * dt_;
-                for (size_t j = 0; j < n_joints_; ++j) {
+                for (size_t j = 0; j < n_joints_; ++j)
+                {
                     HermiteBlend h;
                     h.p0 = snap_pos[j];
                     h.v0 = snap_vel[j];
                     h.p1 = cache->pos[i_end][j];
                     h.v1 = cache->vel[i_end][j];
-                    h.T  = T_bridge;
-                    for (size_t k = i_match; k <= i_end; ++k) {
+                    h.T = T_bridge;
+                    for (size_t k = i_match; k <= i_end; ++k)
+                    {
                         const double t_local = static_cast<double>(k - i_match) * dt_;
                         cache->pos[k][j] = h.pos(t_local);
                         cache->vel[k][j] = h.vel(t_local);
@@ -431,23 +489,28 @@ private:
             cache->t_splice = static_cast<double>(i_match) * dt_;
 
             RCLCPP_DEBUG(this->get_logger(),
-                "Mode B: i_match=%zu t_splice=%.3fs bridge→i_end=%zu", i_match, cache->t_splice, i_end);
-        } else {
+                         "Mode B: i_match=%zu t_splice=%.3fs bridge→i_end=%zu", i_match, cache->t_splice, i_end);
+        }
+        else
+        {
             RCLCPP_DEBUG(this->get_logger(),
-                "Mode A: faithful, %zu dense pts, no filtering", dense_n);
+                         "Mode A: faithful, %zu dense pts, no filtering", dense_n);
         }
 
         std::atomic_store_explicit(&active_cache_, cache, std::memory_order_release);
+        // A valid cache means there are waypoints available for execution.
+        publishExecutionState(true);
     }
 
     void startCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
                        std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
         // Wait for any in-flight worker to finish before resetting state
-        if (worker_future_.valid()) {
+        if (worker_future_.valid())
+        {
             worker_future_.wait();
         }
-        
+
         state_.store(STATE_WAIT_JOINT);
         tracked_pos_.clear();
 
@@ -458,6 +521,7 @@ private:
 
         std::atomic_store_explicit(&active_cache_, std::shared_ptr<ProcessedCache>(nullptr), std::memory_order_release);
         arm_trigger_sent_ = false;
+        publishExecutionState(false);
         stream_epoch_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         last_traj_accept_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
         res->success = true;
@@ -469,12 +533,14 @@ private:
                       std::shared_ptr<std_srvs::srv::Trigger::Response> res)
     {
         // Wait for any in-flight worker to finish before resetting state
-        if (worker_future_.valid()) {
+        if (worker_future_.valid())
+        {
             worker_future_.wait();
         }
 
         state_.store(STATE_STOPPED);
         std::atomic_store_explicit(&active_cache_, std::shared_ptr<ProcessedCache>(nullptr), std::memory_order_release);
+        publishExecutionState(false);
 
         if (!tracked_pos_.empty())
         {
@@ -610,27 +676,43 @@ private:
         auto cache = std::atomic_load_explicit(&active_cache_, std::memory_order_acquire);
 
         // New cache arrived — align stream clock to the bridge entry point
-        if (cache && cache->created_at != current_cache_time_) {
+        if (cache && cache->created_at != current_cache_time_)
+        {
             current_cache_time_ = cache->created_at;
             traj_start_time_ = this->now() - rclcpp::Duration::from_seconds(cache->t_splice);
-            RCLCPP_INFO(this->get_logger(), "[RT] Cache swap: %s | pts=%zu t_splice=%.3fs",
-                cache->mode == ProcessingMode::FAITHFUL ? "Mode-A" : "Mode-B",
-                cache->pos.size(), cache->t_splice);
+            RCLCPP_DEBUG(this->get_logger(), "[RT] Cache swap: %s | pts=%zu t_splice=%.3fs",
+                         cache->mode == ProcessingMode::FAITHFUL ? "Mode-A" : "Mode-B",
+                         cache->pos.size(), cache->t_splice);
         }
 
         std::vector<double> out_pos = tracked_pos_;
         std::vector<double> out_vel(n_joints_, 0.0);
 
-        if (cache && cache->dense_filled && !cache->pos.empty()) {
+        if (cache && cache->dense_filled && !cache->pos.empty())
+        {
             const double elapsed = (this->now() - traj_start_time_).seconds();
-            if (elapsed >= 0.0) {
+            if (elapsed >= 0.0)
+            {
                 sampleCache(cache, elapsed, out_pos, out_vel);
+                if (elapsed >= cache->time.back())
+                {
+                    const bool was_executing = execution_state_;
+                    publishExecutionState(false);
+                    if (was_executing)
+                    {
+                        RCLCPP_INFO(this->get_logger(),
+                                    "Final waypoint sent from active cache; /trajectory_executing=false.");
+                    }
+                }
             }
         }
 
-        if (!checkLimits(out_pos)) {
+        if (!checkLimits(out_pos))
+        {
             out_vel.assign(n_joints_, 0.0);
-        } else {
+        }
+        else
+        {
             tracked_pos_ = out_pos;
         }
 
@@ -681,7 +763,7 @@ private:
                 return;
             if (!initTrackedPositions())
                 return;
-                
+
             {
                 std::lock_guard<std::mutex> lock(sensor_state_mutex_);
                 est_vel_.assign(n_joints_, 0.0);
@@ -730,6 +812,7 @@ private:
 
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_arm_;
     rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr pub_stream_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_execution_state_;
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr sub_joint_state_;
     rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr sub_traj_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_start_, srv_stop_;
@@ -738,15 +821,16 @@ private:
     // Concurrency
     std::future<void> worker_future_;
     std::atomic<bool> worker_busy_{false};
-    
 
     std::shared_ptr<ProcessedCache> active_cache_{nullptr};
-    
+
     std::mutex sensor_state_mutex_;
     std::mutex splice_state_mutex_;
 
     std::vector<double> committed_pos_;
     std::vector<double> committed_vel_;
+    bool execution_state_{false};
+    bool execution_state_initialized_{false};
 
     double splice_w_pos_{1.0};
     double splice_w_vel_{0.5};

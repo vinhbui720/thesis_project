@@ -70,7 +70,7 @@ def launch_controller(param_file):
     # Launch motomini.launch.py with bayesian:=true and feedback_yaml_file
     cmd = [
         'ros2', 'launch', 'motomini', 'motomini.launch.py',
-        'real_robot:=true', 'debug:=true', 'vel_streaming:=true', 'jogging:=true',
+        'real_robot:=false', 'debug:=true', 'vel_streaming:=true', 'jogging:=true',
         'bayesian:=true', f'feedback_yaml_file:={os.path.abspath(param_file)}'
     ]
     os.makedirs(os.path.dirname(CONTROLLER_LOG), exist_ok=True)

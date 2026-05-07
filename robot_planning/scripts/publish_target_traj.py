@@ -16,6 +16,7 @@ import time
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from rcl_interfaces.msg import Log
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
@@ -43,28 +44,56 @@ class TargetTrajPublisher(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
 
         self.initial_pose = None
-        self.start_time = None  # set when first pose is obtained
+        # self.motion_active = False
+        # self.motion_start_time = None
+        self.motion_active = True
+        self.motion_start_time = time.time()
+        self.node_start_time = time.time()
+        self.ready_timeout = 40.0  # seconds to wait for STATE_POSE_FOLLOW
 
         self.pose_pub = self.create_publisher(PoseStamped, '/motomini/target_pose', 10)
+        self.rosout_sub = self.create_subscription(Log, '/rosout', self._rosout_cb, 100)
         self.create_timer(0.02, self._publish_pose)  # 50 Hz
 
         self.get_logger().info(
             f'Publishing trajectory: start=({self.start_x}, {self.start_y}, {self.start_z}), '
             f'end_y={self.end_y}, vel={self.target_velocity} m/s, warmup={self.warmup_time} s'
         )
+        self.get_logger().info('Waiting for STATE_POSE_FOLLOW in /rosout before starting motion...')
+
+    def _rosout_cb(self, msg: Log):
+        pass
+        # if self.motion_active:
+        #     return
+        # self.motion_active = True
+        # if 'state_pose_follow' in (msg.msg or '').lower():
+        #     self.motion_active = True
+        #     self.motion_start_time = time.time()
+        #     if self.initial_pose is not None:
+        #         p = self.initial_pose.translation
+        #         self.get_logger().info(
+        #             f'Detected STATE_POSE_FOLLOW — starting trajectory from EE pose '
+        #             f'({p.x:.4f}, {p.y:.4f}, {p.z:.4f}).'
+        #         )
+        #     else:
+        #         self.get_logger().warning('STATE_POSE_FOLLOW detected but no TF pose yet; waiting.')
 
     def _publish_pose(self):
-        # Acquire initial pose from TF once
+        # Keep refreshing the initial pose until motion starts, so the s-curve
+        # warmup always begins from wherever the EE actually is when triggered.
         if self.initial_pose is None:
+        # if not self.motion_active:
             try:
                 t = self.tf_buffer.lookup_transform('world', 'magnetic_link', rclpy.time.Time())
                 self.initial_pose = t.transform
-                self.start_time = time.time()
-                self.get_logger().info('Got initial pose from TF. Starting trajectory.')
             except Exception:
-                return
+                return  # no TF yet — skip until available
 
-        elapsed = time.time() - self.start_time
+        if self.initial_pose is None:
+            return
+
+        # Before motion starts, current_time = 0 → s-curve at progress 0 → stays at current EE pose
+        elapsed = (time.time() - self.motion_start_time) if self.motion_active else 0.0
 
         target_x, target_y, target_z = self._compute_position(elapsed)
 

@@ -56,7 +56,7 @@ namespace robot_planning
   constexpr double kJoint4VelLimit = M_PI * 10.0 / 3.0;
   constexpr double kJoint5VelLimit = M_PI * 10.0 / 3.0;
   constexpr double kJoint6VelLimit = M_PI * 10.0 / 3.0;
-  constexpr double kSafetyVelocityAlpha = 0.9;
+  constexpr double kSafetyVelocityAlpha = 1.0;
 
   constexpr double kDefaultLegacyKpMax = 3.5;
   constexpr double kDefaultLegacyKoMax = 2.5;

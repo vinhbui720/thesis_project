@@ -122,6 +122,9 @@ class TrackerKalman:
     # MAIN
     # =========================
     def process(self, data):
+        data["tracking_started"] = False
+        data["tracking_stopped"] = False
+        data["gate_in_zone"] = False
 
         if "bbox" not in data or "depth_image" not in data:
             return data
@@ -134,11 +137,13 @@ class TrackerKalman:
         if self.gate_enabled:
             in_zone = self._in_gate(cx, cy)
             data["tracking_active"] = in_zone
+            data["gate_in_zone"] = in_zone
 
             if not in_zone:
                 # Object left the zone — full reset (hand may carry it back)
                 if self.tracking_active:
                     self._reset_kalman()
+                    data["tracking_stopped"] = True
                 self.tracking_active = False
                 return data
 
@@ -147,8 +152,10 @@ class TrackerKalman:
                 # so the filter never starts from zero or a cached reverse velocity
                 self._reset_kalman(cx, cy)
                 self.tracking_active = True
+                data["tracking_started"] = True
         else:
             data["tracking_active"] = True
+            data["gate_in_zone"] = True
             
         current_time = time.time()
 

@@ -157,8 +157,11 @@ CONFIG = {
     # region ROS2 PUBLISHER
     # =========================
     "ros2_publisher": {
-        "frame_id": "world_depth_camera_link",   # Parent TF frame for published messages
+        "frame_id": "world_depth_camera_link",    # Parent TF frame for published messages
         "tracking_frame_id": "tracking_task",     # Child TF frame representing tracked object
+        "debug_tracking_frame_id": "tracking_target",
+        "world_frame": "world",
+        "magnetic_link_frame": "magnetic_link",
 
         # Minimum ICP fitness to consider a retrigger successful.
         "icp_min_fitness": 0.5,
@@ -171,6 +174,15 @@ CONFIG = {
         "pos_correct_alpha":   0.30,
         # Age (seconds) after which the camera is considered occluded
         "cam_timeout_s":       0.25,
+        # Added to the tracked object Z target during follow/predict
+        "target_z_offset_m":   0.01,
+
+        # ── Bootstrap from magnetic_link ──────────────────────────────────
+        # First published poses start from magnetic_link then converge rapidly
+        # to the tracked object estimate.
+        "bootstrap_gain":              12.0,
+        "bootstrap_pos_tolerance_m":   0.01,
+        "bootstrap_max_duration_s":    0.35,
 
         # ── Lead-time (interception prediction) ───────────────────────────
         # Fixed fallback lead time used when robot EE position is unavailable
@@ -180,6 +192,10 @@ CONFIG = {
         # Assumed robot closing speed (m/s) used for dynamic lead-time:
         #   lead_time = dist(EE → object) / approach_speed_m_s
         "approach_speed_m_s":  0.15,
+
+        # ── Prediction rollout after temporary camera loss ────────────────
+        "prediction_max_time_s":      0.75,
+        "prediction_max_distance_m":  0.25,
 
         # ── Publisher timer rate ───────────────────────────────────────────
         "pub_rate_hz":        50.0,

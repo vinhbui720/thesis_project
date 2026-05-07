@@ -32,7 +32,8 @@ def generate_launch_description():
     gantry_mode_tesser = IfCondition(PythonExpression(["'", gantry_mode, "' == 'tesser'"]))
     gantry_mode_loop = IfCondition(PythonExpression(["'", gantry_mode, "' == 'loop'"]))
     gantry_mode_gui = IfCondition(PythonExpression(["'", gantry_mode, "' == 'gui'"]))
-
+    gantry_mode_none = IfCondition(PythonExpression(["'", gantry_mode, "' == 'none'"]))
+    
     # 3. Dynamic Logic
     # Simplified the PythonExpression by using f-strings for readability
     concrete_ee_link = PythonExpression([
