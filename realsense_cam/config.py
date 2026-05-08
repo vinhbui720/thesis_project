@@ -162,6 +162,8 @@ CONFIG = {
         "debug_tracking_frame_id": "tracking_target",
         "world_frame": "world",
         "magnetic_link_frame": "magnetic_link",
+        "controller_pose_topic": "/motomini/target_pose",
+        "controller_vel_topic": "/motomini/target_vel",
 
         # Minimum ICP fitness to consider a retrigger successful.
         "icp_min_fitness": 0.5,
@@ -180,9 +182,9 @@ CONFIG = {
         # ── Bootstrap from magnetic_link ──────────────────────────────────
         # First published poses start from magnetic_link then converge rapidly
         # to the tracked object estimate.
-        "bootstrap_gain":              12.0,
+        "bootstrap_gain":              1.0,
         "bootstrap_pos_tolerance_m":   0.01,
-        "bootstrap_max_duration_s":    0.35,
+        "bootstrap_max_duration_s":    0.8,
 
         # ── Lead-time (interception prediction) ───────────────────────────
         # Fixed fallback lead time used when robot EE position is unavailable

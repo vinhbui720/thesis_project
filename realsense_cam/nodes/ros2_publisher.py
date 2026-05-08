@@ -12,7 +12,7 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
-_IDENTITY_QUAT = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+_IDENTITY_QUAT = np.array([1.0, 1.0, 0.0, 0.0], dtype=np.float64)
 
 
 def _quat_normalize(quat):
@@ -89,12 +89,14 @@ class ROS2Publisher(Node):
         self.debug_tracking_frame_id = ros_cfg.get("debug_tracking_frame_id", "tracking_target")
         self.world_frame = ros_cfg.get("world_frame", "world")
         self.magnetic_link_frame = ros_cfg.get("magnetic_link_frame", "magnetic_link")
+        self.controller_pose_topic = ros_cfg.get("controller_pose_topic", "/motomini/target_pose")
+        self.controller_vel_topic = ros_cfg.get("controller_vel_topic", "/motomini/target_vel")
 
         self._vel_alpha = ros_cfg.get("vel_smooth_alpha", 0.85)
         self._pos_alpha = ros_cfg.get("pos_correct_alpha", 0.30)
         self._cam_timeout = ros_cfg.get("cam_timeout_s", 0.25)
         self._target_z_offset = ros_cfg.get("target_z_offset_m", 0.01)
-        self._bootstrap_gain = ros_cfg.get("bootstrap_gain", 12.0)
+        self._bootstrap_gain = ros_cfg.get("bootstrap_gain", 5.0)
         self._bootstrap_tol = ros_cfg.get("bootstrap_pos_tolerance_m", 0.01)
         self._bootstrap_max_duration = ros_cfg.get("bootstrap_max_duration_s", 0.35)
         self._prediction_max_time = ros_cfg.get("prediction_max_time_s", 0.75)
@@ -126,6 +128,8 @@ class ROS2Publisher(Node):
 
         self._pub_pose = self.create_publisher(PoseStamped, '/tracking_target_pose', 10)
         self._pub_vel = self.create_publisher(TwistStamped, '/object/velocity', 10)
+        self._pub_ctrl_pose = self.create_publisher(PoseStamped, self.controller_pose_topic, 10)
+        self._pub_ctrl_vel = self.create_publisher(TwistStamped, self.controller_vel_topic, 10)
         self._pub_status = self.create_publisher(String, '/object/tracking_status', 10)
         self._pub_active = self.create_publisher(Bool, '/object/tracking_active', 10)
 
@@ -148,6 +152,16 @@ class ROS2Publisher(Node):
         self._icp_result_success = False
         self._icp_result_lock = threading.Lock()
         self._service_event = threading.Event()
+        self._log_times = {}
+        self._debug_tf_seen = False
+
+    def _log_throttled(self, key, level, interval_s, message):
+        now = time.monotonic()
+        last = self._log_times.get(key)
+        if last is not None and (now - last) < interval_s:
+            return
+        self._log_times[key] = now
+        getattr(self.get_logger(), level)(message)
 
     def _feedback_cb(self, msg):
         with self._ee_lock:
@@ -211,6 +225,7 @@ class ROS2Publisher(Node):
         self._publish_source = reason
         self._status_error = ""
         self._pending_start = False
+        self.get_logger().info(f'Tracking finished: reason={reason}')
 
     def _try_lookup_bootstrap_pose(self):
         try:
@@ -218,6 +233,9 @@ class ROS2Publisher(Node):
                 self.world_frame, self.magnetic_link_frame, rclpy.time.Time())
         except TransformException as exc:
             self._status_error = f"bootstrap_tf:{exc}"
+            self._log_throttled(
+                "bootstrap_tf_fail", "warning", 1.0,
+                f'Cannot start bootstrap: missing TF {self.world_frame} -> {self.magnetic_link_frame}: {exc}')
             return None, None
 
         world_pos = np.array([
@@ -240,6 +258,9 @@ class ROS2Publisher(Node):
                 self.frame_id, self.world_frame, rclpy.time.Time())
         except TransformException as exc:
             self._status_error = f"frame_tf:{exc}"
+            self._log_throttled(
+                "frame_tf_fail", "warning", 1.0,
+                f'Cannot convert bootstrap pose into publish frame {self.frame_id}: {exc}')
             return None, None
 
         frame_world = _transform_matrix(
@@ -382,21 +403,31 @@ class ROS2Publisher(Node):
                 self._retrigger_pending = False
             self._service_event.set()
 
-        tracking_started = data.get("tracking_started", False)
-        tracking_stopped = data.get("tracking_stopped", False)
-        gate_active = data.get("tracking_active", None)
+        tracking_started = bool(data.get("tracking_started", False))
+        tracking_stopped = bool(data.get("tracking_stopped", False))
+        gate_active_raw = data.get("tracking_active", None)
+        gate_active = None if gate_active_raw is None else bool(gate_active_raw)
 
         if tracking_started:
+            self.get_logger().info('Tracker reported start-line crossing.')
             self._pending_start = True
             self._reset_track_session()
             self._pending_start = True
 
         if tracking_stopped:
+            self.get_logger().info('Tracker reported stop-line exit.')
             self._finish_tracking("stop_line")
 
-        if self._pending_start and gate_active is True and self._est_state != "tracking":
+        if self._pending_start and gate_active and self._est_state != "tracking":
+            self._log_throttled(
+                "bootstrap_attempt", "info", 1.0,
+                'Bootstrap attempt: gate is active and publisher is waiting to start tracking.')
             if self._start_tracking_session():
                 self._pending_start = False
+            else:
+                self._log_throttled(
+                    "bootstrap_retry", "info", 1.0,
+                    'Tracking start pending, waiting for TF needed to bootstrap from magnetic_link.')
 
         meas_pos, meas_vel = self._extract_measurement(data)
         now = time.monotonic()
@@ -404,8 +435,12 @@ class ROS2Publisher(Node):
         if self._est_state != "tracking":
             passive_pos = meas_pos
             if passive_pos is not None:
-                self._publish_transform(stamp, passive_pos, _IDENTITY_QUAT)
+                self._publish_transform(stamp, passive_pos, _IDENTITY_QUAT, publish_debug=False)
             self._publish_active_flag(False)
+            self._log_throttled(
+                "publisher_wait", "info", 1.0,
+                f'Publisher idle: gate_active={gate_active} pending_start={self._pending_start} '
+                f'has_measurement={meas_pos is not None} error="{self._status_error}"')
             self._publish_status(stamp, data)
             return data
 
@@ -435,6 +470,11 @@ class ROS2Publisher(Node):
         else:
             self._publish_active_flag(False)
 
+        self._log_throttled(
+            "publisher_active", "info", 1.0,
+            f'Publisher active: phase={self._publish_phase} source={self._publish_source} '
+            f'cam_fresh={meas_pos is not None} pos='
+            f'[{self._publish_pos[0]:.3f}, {self._publish_pos[1]:.3f}, {self._publish_pos[2]:.3f}]')
         self._publish_status(stamp, data)
         return data
 
@@ -468,9 +508,33 @@ class ROS2Publisher(Node):
         ts.twist.linear.z = float(vel_now[2])
         self._pub_vel.publish(ts)
 
+        world_pos, world_quat = self._target_to_world(pos_now, quat, update_error=True)
+        if world_pos is not None and world_quat is not None:
+            ctrl_pose = PoseStamped()
+            ctrl_pose.header.stamp = stamp
+            ctrl_pose.header.frame_id = self.world_frame
+            ctrl_pose.pose.position.x = float(world_pos[0])
+            ctrl_pose.pose.position.y = float(world_pos[1])
+            ctrl_pose.pose.position.z = float(world_pos[2])
+            ctrl_pose.pose.orientation.x = float(world_quat[0])
+            ctrl_pose.pose.orientation.y = float(world_quat[1])
+            ctrl_pose.pose.orientation.z = float(world_quat[2])
+            ctrl_pose.pose.orientation.w = float(world_quat[3])
+            self._pub_ctrl_pose.publish(ctrl_pose)
+
+            world_vel = self._vector_to_world(vel_now)
+            if world_vel is not None:
+                ctrl_vel = TwistStamped()
+                ctrl_vel.header.stamp = stamp
+                ctrl_vel.header.frame_id = self.world_frame
+                ctrl_vel.twist.linear.x = float(world_vel[0])
+                ctrl_vel.twist.linear.y = float(world_vel[1])
+                ctrl_vel.twist.linear.z = float(world_vel[2])
+                self._pub_ctrl_vel.publish(ctrl_vel)
+
         self._publish_active_flag(True)
 
-    def _publish_transform(self, stamp, translation, quaternion):
+    def _publish_transform(self, stamp, translation, quaternion, publish_debug=True):
         t = TransformStamped()
         t.header.stamp = stamp
         t.header.frame_id = self.frame_id
@@ -483,33 +547,55 @@ class ROS2Publisher(Node):
         t.transform.rotation.z = float(quaternion[2])
         t.transform.rotation.w = float(quaternion[3])
         self._tf_broadcaster.sendTransform(t)
-        self._publish_world_debug_transform(stamp, translation, quaternion)
+        if publish_debug:
+            self._publish_world_debug_transform(stamp, translation, quaternion)
+
+    def _frame_to_world_transform(self, update_error=False, context_key="frame_to_world"):
+        if self.world_frame == self.frame_id:
+            return np.eye(4, dtype=np.float64)
+        try:
+            tf_world_frame = self._tf_buffer.lookup_transform(
+                self.world_frame, self.frame_id, rclpy.time.Time())
+        except TransformException as exc:
+            if update_error:
+                self._status_error = f"{context_key}:{exc}"
+            self._log_throttled(
+                f"{context_key}_fail", "warning", 1.0,
+                f'Cannot transform {self.frame_id} -> {self.world_frame} for {context_key}: {exc}')
+            return None
+        return _transform_matrix(
+            [tf_world_frame.transform.translation.x,
+             tf_world_frame.transform.translation.y,
+             tf_world_frame.transform.translation.z],
+            [tf_world_frame.transform.rotation.x,
+             tf_world_frame.transform.rotation.y,
+             tf_world_frame.transform.rotation.z,
+             tf_world_frame.transform.rotation.w],
+        )
+
+    def _target_to_world(self, translation, quaternion, update_error=False):
+        if self.world_frame == self.frame_id:
+            return np.asarray(translation, dtype=np.float64), _quat_normalize(quaternion)
+        world_frame_tfm = self._frame_to_world_transform(update_error=update_error, context_key="target_world")
+        if world_frame_tfm is None:
+            return None, None
+        frame_target_tfm = _transform_matrix(translation, quaternion)
+        world_target_tfm = world_frame_tfm @ frame_target_tfm
+        return world_target_tfm[:3, 3].copy(), _rot_to_quat(world_target_tfm[:3, :3])
+
+    def _vector_to_world(self, vec):
+        vec = np.asarray(vec, dtype=np.float64)
+        if self.world_frame == self.frame_id:
+            return vec.copy()
+        world_frame_tfm = self._frame_to_world_transform(update_error=False, context_key="vel_world")
+        if world_frame_tfm is None:
+            return None
+        return world_frame_tfm[:3, :3] @ vec
 
     def _publish_world_debug_transform(self, stamp, translation, quaternion):
-        if self.world_frame == self.frame_id:
-            world_pos = np.asarray(translation, dtype=np.float64)
-            world_quat = _quat_normalize(quaternion)
-        else:
-            try:
-                tf_world_frame = self._tf_buffer.lookup_transform(
-                    self.world_frame, self.frame_id, rclpy.time.Time())
-            except TransformException as exc:
-                self._status_error = f"debug_tf:{exc}"
-                return
-
-            world_frame_tfm = _transform_matrix(
-                [tf_world_frame.transform.translation.x,
-                 tf_world_frame.transform.translation.y,
-                 tf_world_frame.transform.translation.z],
-                [tf_world_frame.transform.rotation.x,
-                 tf_world_frame.transform.rotation.y,
-                 tf_world_frame.transform.rotation.z,
-                 tf_world_frame.transform.rotation.w],
-            )
-            frame_target_tfm = _transform_matrix(translation, quaternion)
-            world_target_tfm = world_frame_tfm @ frame_target_tfm
-            world_pos = world_target_tfm[:3, 3].copy()
-            world_quat = _rot_to_quat(world_target_tfm[:3, :3])
+        world_pos, world_quat = self._target_to_world(translation, quaternion, update_error=True)
+        if world_pos is None or world_quat is None:
+            return
 
         t = TransformStamped()
         t.header.stamp = stamp
@@ -523,6 +609,10 @@ class ROS2Publisher(Node):
         t.transform.rotation.z = float(world_quat[2])
         t.transform.rotation.w = float(world_quat[3])
         self._tf_broadcaster.sendTransform(t)
+        if not self._debug_tf_seen:
+            self._debug_tf_seen = True
+            self.get_logger().info(
+                f'Publishing debug TF {self.world_frame} -> {self.debug_tracking_frame_id}.')
 
     def _publish_status(self, stamp, data):
         del stamp
