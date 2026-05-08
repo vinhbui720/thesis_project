@@ -216,6 +216,14 @@ private:
     double adaptive_alpha_ori_{6.0};
     double max_cart_linear_vel_{0.5};
     double max_cart_angular_vel_{1.5};
+    double i_gain_pos_{1200.0};
+    double i_gain_ori_{350.0};
+    double i_clamp_pos_{0.04};
+    double i_clamp_ori_{0.40};
+    double i_force_ref_{1.0};
+    double i_force_shape_{2.0};
+    double i_force_min_scale_{0.0};
+    double i_collision_decay_rate_{6.0};
     double max_cart_linear_acc_{0.8};
     double max_cart_angular_acc_{2.5};
     double velocity_filter_cutoff_hz_{15.0};
@@ -227,6 +235,8 @@ private:
     Eigen::Matrix<double, 6, 1> xdot_ref_{Eigen::Matrix<double, 6, 1>::Zero()};
     Eigen::Vector3d e_p_{Eigen::Vector3d::Zero()};
     Eigen::Vector3d e_o_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d e_p_int_{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d e_o_int_{Eigen::Vector3d::Zero()};
 
     // ---- Measured θ̇ history for safety/start initialization ----
     Eigen::VectorXd q_prev_ctrl_;
@@ -271,6 +281,8 @@ private:
     void collisionDistanceCallback(const std_msgs::msg::Float64::SharedPtr msg);
     void collisionNormalCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg);
     void sanitizeTrackingParameters();
+    const char *trackingStateLabel(TrackingStreamState state) const;
+    void transitionTrackingState(TrackingStreamState next_state, const char *reason = nullptr);
     bool currentJointVector(Eigen::VectorXd &q) const;
     Eigen::VectorXd filterJointVelocity(const Eigen::VectorXd &qdot_raw, double dt);
     bool getMeasuredJointVelocity(const Eigen::VectorXd &q,
@@ -294,14 +306,12 @@ private:
                             const Eigen::Matrix3d &des_rot,
                             double dt,
                             Eigen::VectorXd &theta_d);
-    bool checkVelocityLimits(const Eigen::VectorXd &theta_d) const;
     bool checkCartesianVelocitySafety(const Eigen::Matrix<double, 6, 1> &xdot_actual);
     void clampCartesianVelocity(Eigen::Matrix<double, 6, 1> &xdot) const;
     void limitCartesianAcceleration(Eigen::Matrix<double, 6, 1> &xdot_next,
                                     const Eigen::Matrix<double, 6, 1> &xdot_prev,
                                     double dt) const;
-    bool checkPositionLimits(const std::vector<double> &pos,
-                             const std::vector<double> &reference = {}) const;
+    bool checkPositionLimits(const std::vector<double> &pos) const;
     void publishStreamPoint(rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr &pub,
                             const std::vector<double> &pos,
                             const std::vector<double> &vel,

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
+import json
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, Optional, Dict, Any
 
 import numpy as np
 import yaml
@@ -18,6 +19,7 @@ from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
+from std_srvs.srv import Trigger
 
 class GantryControl:
     """Gantry controller helper: publish trajectory commands to gantry."""
@@ -169,6 +171,22 @@ class ObjectProcess:
         return pose_array
 
     @staticmethod
+    def _parse_tracking_status(status_json_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse the JSON tracking status string from /object/tracking_status.
+        
+        Args:
+            status_json_str: JSON string from the status message.
+            
+        Returns:
+            Dict with parsed status fields, or None if parse fails.
+        """
+        try:
+            return json.loads(status_json_str)
+        except (json.JSONDecodeError, ValueError) as e:
+            return None
+
+    @staticmethod
     def wait_for_tracking_status_change(node: Node, timeout_sec: float = 10.0) -> bool:
         """
         Listen for /object/tracking_status topic and wait for "tracking":"WAIT" to
@@ -182,12 +200,14 @@ class ObjectProcess:
             True if the transition occurs within the timeout, False otherwise.
         """
         status_lock = threading.Lock()
-        last_status = ""
+        last_status = {}
 
         def status_callback(msg):
             nonlocal last_status
-            with status_lock:
-                last_status = msg.data
+            parsed = ObjectProcess._parse_tracking_status(msg.data)
+            if parsed:
+                with status_lock:
+                    last_status = parsed
 
         sub = node.create_subscription(String, "/object/tracking_status", status_callback, 10)
 
@@ -196,17 +216,277 @@ class ObjectProcess:
 
         while rclpy.ok() and (time.time() - start_time < timeout_sec):
             with status_lock:
-                status = last_status
+                status = last_status.copy() if last_status else {}
 
-            if "\"tracking\":\"WAIT\"" in status:
+            tracking_state = status.get("tracking", "")
+            
+            if tracking_state == "WAIT":
                 saw_wait = True
-            elif saw_wait and "\"tracking\":\"ACTIVE\"" in status:
+            elif saw_wait and tracking_state == "ACTIVE":
                 node.get_logger().info("Transition detected: WAIT -> ACTIVE")
                 return True
 
             time.sleep(0.05)
 
         node.get_logger().error("Timeout waiting for tracking status transition")
+        return False
+
+    @staticmethod
+    def wait_for_tracking_active(node: Node, timeout_sec: float = 10.0) -> bool:
+        """
+        Wait for tracking state to become ACTIVE (without requiring WAIT first).
+        Useful for cases where the system is already in WAIT state.
+        
+        Args:
+            node: ROS2 node to use for subscription.
+            timeout_sec: Maximum time to wait for ACTIVE state.
+            
+        Returns:
+            True if tracking becomes ACTIVE within timeout, False otherwise.
+        """
+        status_lock = threading.Lock()
+        last_status = {}
+
+        def status_callback(msg):
+            nonlocal last_status
+            parsed = ObjectProcess._parse_tracking_status(msg.data)
+            if parsed:
+                with status_lock:
+                    last_status = parsed
+
+        sub = node.create_subscription(String, "/object/tracking_status", status_callback, 10)
+        start_time = time.time()
+
+        while rclpy.ok() and (time.time() - start_time < timeout_sec):
+            with status_lock:
+                status = last_status.copy() if last_status else {}
+
+            if status.get("tracking") == "ACTIVE":
+                node.get_logger().info("Tracking is now ACTIVE")
+                return True
+
+            time.sleep(0.05)
+
+        node.get_logger().error(f"Timeout waiting for tracking ACTIVE state")
+        return False
+
+    @staticmethod
+    def check_icp_fitness_ok(
+        node: Node,
+        min_fitness: float = 0.5,
+        timeout_sec: float = 5.0
+    ) -> bool:
+        """
+        Monitor /object/tracking_status and check if ICP fitness is above threshold.
+        
+        Args:
+            node: ROS2 node to use for subscription.
+            min_fitness: Minimum acceptable fitness threshold (0.0 - 1.0).
+            timeout_sec: Maximum time to wait for a good fitness reading.
+            
+        Returns:
+            True if ICP fitness exceeds threshold, False otherwise.
+        """
+        status_lock = threading.Lock()
+        last_status = {}
+
+        def status_callback(msg):
+            nonlocal last_status
+            parsed = ObjectProcess._parse_tracking_status(msg.data)
+            if parsed:
+                with status_lock:
+                    last_status = parsed
+
+        sub = node.create_subscription(String, "/object/tracking_status", status_callback, 10)
+        start_time = time.time()
+
+        while rclpy.ok() and (time.time() - start_time < timeout_sec):
+            with status_lock:
+                status = last_status.copy() if last_status else {}
+
+            fitness = status.get("icp_fitness", 0.0)
+            if fitness >= min_fitness:
+                node.get_logger().info(f"ICP fitness OK: {fitness:.4f} >= {min_fitness:.4f}")
+                return True
+
+            time.sleep(0.05)
+
+        node.get_logger().error(
+            f"ICP fitness failed to reach {min_fitness:.4f} within {timeout_sec}s"
+        )
+        return False
+
+    @staticmethod
+    def check_tracking_error_ok(
+        node: Node,
+        timeout_sec: float = 5.0
+    ) -> bool:
+        """
+        Check if tracking error is empty (no error state reported).
+        
+        Args:
+            node: ROS2 node to use for subscription.
+            timeout_sec: Maximum time to wait for a clean status.
+            
+        Returns:
+            True if error field is empty, False if an error persists.
+        """
+        status_lock = threading.Lock()
+        last_status = {}
+
+        def status_callback(msg):
+            nonlocal last_status
+            parsed = ObjectProcess._parse_tracking_status(msg.data)
+            if parsed:
+                with status_lock:
+                    last_status = parsed
+
+        sub = node.create_subscription(String, "/object/tracking_status", status_callback, 10)
+        start_time = time.time()
+
+        while rclpy.ok() and (time.time() - start_time < timeout_sec):
+            with status_lock:
+                status = last_status.copy() if last_status else {}
+
+            error = status.get("error", "")
+            if not error:  # Empty error string means no error
+                node.get_logger().info("Tracking error cleared")
+                return True
+
+            node.get_logger().warning(f"Tracking error: {error}")
+            time.sleep(0.05)
+
+        node.get_logger().error(
+            f"Tracking error persisted for {timeout_sec}s. "
+            f"Last error: {status.get('error', 'unknown')}"
+        )
+        return False
+
+    @staticmethod
+    def retrigger_icp(node: Node, timeout_sec: float = 35.0) -> bool:
+        """
+        Call the /object/retrigger_icp service to manually trigger ICP realignment.
+        
+        Args:
+            node: ROS2 node to use for service call.
+            timeout_sec: Maximum wait time for the service to respond.
+            
+        Returns:
+            True if ICP retrigger succeeded, False otherwise.
+        """
+        client = node.create_client(Trigger, "/object/retrigger_icp")
+        
+        if not client.wait_for_service(timeout_sec=5.0):
+            node.get_logger().error(
+                "Service /object/retrigger_icp is not available"
+            )
+            return False
+
+        request = Trigger.Request()
+        future = client.call_async(request)
+        
+        start_time = time.time()
+        while rclpy.ok() and (time.time() - start_time < timeout_sec):
+            if future.done():
+                try:
+                    response = future.result()
+                    if response.success:
+                        node.get_logger().info(
+                            f"ICP retrigger succeeded: {response.message}"
+                        )
+                        return True
+                    else:
+                        node.get_logger().error(
+                            f"ICP retrigger failed: {response.message}"
+                        )
+                        return False
+                except Exception as e:
+                    node.get_logger().error(f"ICP retrigger call failed: {e}")
+                    return False
+            time.sleep(0.1)
+
+        node.get_logger().error(
+            f"ICP retrigger timed out after {timeout_sec}s"
+        )
+        return False
+
+    @staticmethod
+    def get_tracking_status(node: Node, timeout_sec: float = 2.0) -> Optional[Dict[str, Any]]:
+        """
+        Get the current tracking status snapshot.
+        
+        Args:
+            node: ROS2 node to use for subscription.
+            timeout_sec: Maximum time to wait for first status message.
+            
+        Returns:
+            Dict with parsed status fields, or None if timed out.
+        """
+        status_lock = threading.Lock()
+        last_status = [None]  # Use list to allow modification in nested function
+
+        def status_callback(msg):
+            parsed = ObjectProcess._parse_tracking_status(msg.data)
+            if parsed:
+                with status_lock:
+                    last_status[0] = parsed
+
+        sub = node.create_subscription(String, "/object/tracking_status", status_callback, 10)
+        start_time = time.time()
+
+        while rclpy.ok() and (time.time() - start_time < timeout_sec):
+            with status_lock:
+                if last_status[0] is not None:
+                    return last_status[0]
+            time.sleep(0.02)
+
+        node.get_logger().warning("Timeout getting tracking status")
+        return None
+
+    @staticmethod
+    def wait_for_camera_fresh(
+        node: Node,
+        timeout_sec: float = 10.0,
+        max_age_ms: float = 250.0
+    ) -> bool:
+        """
+        Wait for camera measurements to be fresh (recently updated).
+        
+        Args:
+            node: ROS2 node to use for subscription.
+            timeout_sec: Maximum time to wait.
+            max_age_ms: Maximum acceptable camera age in milliseconds.
+            
+        Returns:
+            True if camera becomes fresh, False if timeout.
+        """
+        status_lock = threading.Lock()
+        last_status = {}
+
+        def status_callback(msg):
+            nonlocal last_status
+            parsed = ObjectProcess._parse_tracking_status(msg.data)
+            if parsed:
+                with status_lock:
+                    last_status = parsed
+
+        sub = node.create_subscription(String, "/object/tracking_status", status_callback, 10)
+        start_time = time.time()
+
+        while rclpy.ok() and (time.time() - start_time < timeout_sec):
+            with status_lock:
+                status = last_status.copy() if last_status else {}
+
+            if status.get("cam_fresh") is True:
+                cam_age = status.get("cam_age_ms", 0)
+                node.get_logger().info(
+                    f"Camera is fresh (age: {cam_age:.1f}ms <= {max_age_ms:.1f}ms)"
+                )
+                return True
+
+            time.sleep(0.05)
+
+        node.get_logger().error(f"Camera did not become fresh within {timeout_sec}s")
         return False
 
 class ObjectControl:
@@ -260,6 +540,7 @@ class MotoMiniMainLoop(Node):
 		self.pub_targets = self.create_publisher(PoseArray, "/target_poses", 10)
 		self.pub_start = self.create_publisher(Bool, "/start", 10)
 		self.pub_clear = self.create_publisher(Bool, "/clear_targets", 10)
+		self.pub_tracking_control = self.create_publisher(Bool, "/tracking_control", 10)
 		self.param_client = self.create_client(SetParameters, "/motomini_planning_node/set_parameters")
 
 		self.create_subscription(String, "/optimization_status", self._status_cb, 10)
@@ -489,6 +770,31 @@ class MotoMiniMainLoop(Node):
 			time.sleep(0.05)
 		return False
 
+	def enable_tracking(self) -> None:
+		"""Enable object tracking mode."""
+		msg = Bool()
+		msg.data = True
+		self.pub_tracking_control.publish(msg)
+		self.get_logger().info("Tracking mode ENABLED")
+
+	def disable_tracking(self) -> None:
+		"""Disable object tracking mode."""
+		msg = Bool()
+		msg.data = False
+		self.pub_tracking_control.publish(msg)
+		self.get_logger().info("Tracking mode DISABLED")
+
+	def set_tracking_mode(self, enabled: bool) -> None:
+		"""Set tracking mode on/off.
+		
+		Args:
+			enabled: True to enable tracking, False to disable.
+		"""
+		if enabled:
+			self.enable_tracking()
+		else:
+			self.disable_tracking()
+
 
 def main() -> None:
 	rclpy.init()
@@ -505,49 +811,96 @@ def main() -> None:
 		# Give discovery/subscriptions a short moment to connect.
 		time.sleep(0.5)
 		gantry_control.move_to(x_pos=-0.14, z_pos=-0.03, motion_time_sec=1.5)
-		# node._publish_clear()
+		node._publish_clear()
 
-		# node.set_planner_mode(2)
-		# object_control.set_current_target(-0.05, -0.25, 0.07)
-		# targets = node.make_targets([
-        #     (-0.03, -0.24, 0.2),
-        #     (-0.03, -0.24, 0.071)
-        # ])
-		# node.execute_target_pose(targets)
-		# object_control.attach()
-		# time.sleep(0.5)
-		# #Moving to hover ready to Grinding
-		# targets = node.make_targets([
-        #     (0.1, -0.25, 0.2)
-        # ])
-		# node.execute_target_pose(targets)
-		# node.set_planner_mode(3)
-		# circle_targets = ObjectProcess.generate_circle_poses(
-		# 	x=0.1, y=-0.25, z=0.2,
-		# 	number_of_points=10,
-		# 	radius=0.02,
-		# 	alpha_degrees=-45.0,
-		# )
-		# node.execute_target_pose(circle_targets)
-		# # moving hove ready for tracking
-		# targets = node.make_targets([
-        #     (0.18, 0.00, 0.245)
-        # ])
-		# node.execute_target_pose(targets)
-		# targets = node.make_targets([
-        #     (0.25, -0.2, 0.15)
-        # ])
-		# node.execute_target_pose(targets)
-		# sucess = ObjectProcess.wait_for_tracking_status_change(node, timeout_sec=15.0)
-		# if sucess:
-		# 	print("Tracking status transition detected successfully.")
-		# else:
-		# 	print("Failed to detect tracking status transition in time.")
-		# object_control.detach()
-		# targets = node.make_targets([
-        #     (0.18, 0.00, 0.245)
-        # ])
-		# node.execute_target_pose(targets)
+		node.set_planner_mode(2)
+		object_control.set_current_target(-0.05, -0.25, 0.07)
+		targets = node.make_targets([
+            (-0.03, -0.24, 0.2),
+            (-0.03, -0.24, 0.071)
+        ])
+		node.execute_target_pose(targets)
+		object_control.attach()
+		time.sleep(0.5)
+		#Moving to hover ready to Grinding
+		targets = node.make_targets([
+            (0.1, -0.25, 0.2)
+        ])
+		node.execute_target_pose(targets)
+		node.set_planner_mode(3)
+		circle_targets = ObjectProcess.generate_circle_poses(
+			x=0.1, y=-0.25, z=0.2,
+			number_of_points=10,
+			radius=0.02,
+			alpha_degrees=-45.0,
+		)
+		node.execute_target_pose(circle_targets)
+		# moving hove ready for tracking
+		targets = node.make_targets([
+            (0.18, 0.00, 0.245)
+        ])
+		node.execute_target_pose(targets)
+		targets = node.make_targets([
+            (0.13, -0.19, 0.1)
+        ])
+		node.execute_target_pose(targets)
+		sucess = ObjectProcess.wait_for_tracking_status_change(node, timeout_sec=15.0)
+		if sucess:
+			print("Tracking status transition detected successfully.")
+			
+			# === EXAMPLE 1: Enable/Disable tracking mode ===
+			node.enable_tracking()
+			time.sleep(2.0)
+			node.disable_tracking()
+			
+			# # === EXAMPLE 2: Check ICP fitness ===
+			# fitness_ok = ObjectProcess.check_icp_fitness_ok(
+			# 	node, 
+			# 	min_fitness=0.5,
+			# 	timeout_sec=5.0
+			# )
+			# if fitness_ok:
+			# 	print("ICP fitness is within acceptable range")
+			
+			# # === EXAMPLE 3: Check tracking error ===
+			error_ok = ObjectProcess.check_tracking_error_ok(
+				node,
+				timeout_sec=5.0
+			)
+			if error_ok:
+				print("Tracking error cleared")
+				object_control.detach()
+				node.disable_tracking()
+			
+			# # === EXAMPLE 4: Get current tracking status ===
+			# status = ObjectProcess.get_tracking_status(node, timeout_sec=2.0)
+			# if status:
+			# 	print(f"Current status: {status}")
+			# 	print(f"  - Tracking: {status.get('tracking')}")
+			# 	print(f"  - ICP fitness: {status.get('icp_fitness'):.4f}")
+			# 	print(f"  - Camera fresh: {status.get('cam_fresh')}")
+			
+			# # === EXAMPLE 5: Wait for camera to be fresh ===
+			# cam_fresh = ObjectProcess.wait_for_camera_fresh(
+			# 	node,
+			# 	timeout_sec=10.0,
+			# 	max_age_ms=250.0
+			# )
+			# if cam_fresh:
+			# 	print("Camera measurements are fresh")
+			
+			# === EXAMPLE 6: Retrigger ICP (if fitness degrades) ===
+			# Uncomment to use ICP retrigger:
+			# icp_success = ObjectProcess.retrigger_icp(node, timeout_sec=35.0)
+			# if icp_success:
+			#     print("ICP retrigger completed successfully")
+		else:
+			print("Failed to detect tracking status transition in time.")
+		
+		targets = node.make_targets([
+            (0.18, 0.00, 0.245)
+        ])
+		node.execute_target_pose(targets)
 	except Exception as exc:
 		node.get_logger().error(f"Main loop failed: {exc}")
 	finally:

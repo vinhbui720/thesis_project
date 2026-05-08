@@ -75,6 +75,14 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     this->declare_parameter<double>("adaptive_alpha_ori", 6.0);
     this->declare_parameter<double>("max_cart_linear_vel", 0.5);
     this->declare_parameter<double>("max_cart_angular_vel", 1.5);
+    this->declare_parameter<double>("i_gain_pos", 1200.0);
+    this->declare_parameter<double>("i_gain_ori", 350.0);
+    this->declare_parameter<double>("i_clamp_pos", 0.04);
+    this->declare_parameter<double>("i_clamp_ori", 0.40);
+    this->declare_parameter<double>("i_force_ref", 1.0);
+    this->declare_parameter<double>("i_force_shape", 2.0);
+    this->declare_parameter<double>("i_force_min_scale", 0.0);
+    this->declare_parameter<double>("i_collision_decay_rate", 6.0);
     this->declare_parameter<double>("max_cart_linear_acc", 0.8);
     this->declare_parameter<double>("max_cart_angular_acc", 2.5);
     this->declare_parameter<double>("velocity_filter_cutoff_hz", 15.0);
@@ -149,6 +157,14 @@ MotoMiniPlanningNode::MotoMiniPlanningNode() : Node("motomini_planning_node")
     adaptive_alpha_ori_ = this->get_parameter("adaptive_alpha_ori").as_double();
     max_cart_linear_vel_ = this->get_parameter("max_cart_linear_vel").as_double();
     max_cart_angular_vel_ = this->get_parameter("max_cart_angular_vel").as_double();
+    i_gain_pos_ = this->get_parameter("i_gain_pos").as_double();
+    i_gain_ori_ = this->get_parameter("i_gain_ori").as_double();
+    i_clamp_pos_ = this->get_parameter("i_clamp_pos").as_double();
+    i_clamp_ori_ = this->get_parameter("i_clamp_ori").as_double();
+    i_force_ref_ = this->get_parameter("i_force_ref").as_double();
+    i_force_shape_ = this->get_parameter("i_force_shape").as_double();
+    i_force_min_scale_ = this->get_parameter("i_force_min_scale").as_double();
+    i_collision_decay_rate_ = this->get_parameter("i_collision_decay_rate").as_double();
     max_cart_linear_acc_ = this->get_parameter("max_cart_linear_acc").as_double();
     max_cart_angular_acc_ = this->get_parameter("max_cart_angular_acc").as_double();
     velocity_filter_cutoff_hz_ =
@@ -588,6 +604,46 @@ MotoMiniPlanningNode::onParameterChange(const std::vector<rclcpp::Parameter> &pa
             else if (n == "velocity_filter_cutoff_hz")
             {
                 velocity_filter_cutoff_hz_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_gain_pos")
+            {
+                i_gain_pos_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_gain_ori")
+            {
+                i_gain_ori_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_clamp_pos")
+            {
+                i_clamp_pos_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_clamp_ori")
+            {
+                i_clamp_ori_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_force_ref")
+            {
+                i_force_ref_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_force_shape")
+            {
+                i_force_shape_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_force_min_scale")
+            {
+                i_force_min_scale_ = p.as_double();
+                sanitizeTrackingParameters();
+            }
+            else if (n == "i_collision_decay_rate")
+            {
+                i_collision_decay_rate_ = p.as_double();
                 sanitizeTrackingParameters();
             }
             else if (n == "max_cart_linear_acc")
