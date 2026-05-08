@@ -102,6 +102,28 @@ class ROS2Publisher(Node):
         self._prediction_max_time = ros_cfg.get("prediction_max_time_s", 0.75)
         self._prediction_max_distance = ros_cfg.get("prediction_max_distance_m", 0.25)
 
+        # Smooth published target.
+        self._target_smooth_tau = ros_cfg.get("target_smooth_tau_s", 0.12)
+        self._target_max_step = ros_cfg.get("target_max_step_m", 0.015)
+
+        # Future tracking using Kalman velocity.
+        self._lookahead_steps = ros_cfg.get("lookahead_steps", 3)
+        self._lookahead_dt = ros_cfg.get("lookahead_dt_s", 0.033)
+        self._lookahead_max_time = ros_cfg.get("lookahead_max_time_s", 0.20)
+
+        # Object disappearance / robot occlusion handling.
+        self._occlusion_expected_s = ros_cfg.get("occlusion_expected_s", 1.20)
+        self._occlusion_hold_after_s = ros_cfg.get("occlusion_hold_after_s", 1.80)
+        self._occlusion_max_predict_distance = ros_cfg.get(
+            "occlusion_max_predict_distance_m", 0.35
+        )
+        self._hold_target_on_occlusion_timeout = ros_cfg.get(
+            "hold_target_on_occlusion_timeout", True
+        )
+
+        self._occlusion_started_t = None
+        self._occlusion_start_pos = None
+
         self._est_state = "idle"
         self._publish_phase = "wait"
         self._publish_source = "none"
@@ -140,6 +162,12 @@ class ROS2Publisher(Node):
         self._sub_feedback = self.create_subscription(
             Twist, '/motomini/feedback', self._feedback_cb, 10)
 
+        # Gate: only send commands to the controller when explicitly triggered.
+        self._controller_ready = False
+        self._controller_ready_lock = threading.Lock()
+        self._sub_start_publish = self.create_subscription(
+            Bool, '/object/start_publish_tracking', self._start_publish_cb, 10)
+
         self._srv_icp = self.create_service(
             Trigger, '/object/retrigger_icp', self._handle_retrigger_icp)
 
@@ -155,13 +183,40 @@ class ROS2Publisher(Node):
         self._log_times = {}
         self._debug_tf_seen = False
 
+    def _start_publish_cb(self, msg):
+        """Receive trigger signal to enable/disable controller publishing."""
+        if msg.data:
+            with self._controller_ready_lock:
+                if not self._controller_ready:
+                    self.get_logger().info(
+                        "Received start_publish_tracking signal — controller publish enabled.")
+                    self._controller_ready = True
+        else:
+            with self._controller_ready_lock:
+                if self._controller_ready:
+                    self.get_logger().info(
+                        "Received stop_publish_tracking signal — controller publish disabled.")
+                    self._controller_ready = False
+
     def _log_throttled(self, key, level, interval_s, message):
         now = time.monotonic()
         last = self._log_times.get(key)
         if last is not None and (now - last) < interval_s:
             return
         self._log_times[key] = now
-        getattr(self.get_logger(), level)(message)
+        # Explicit branches so each severity has a unique call-site line number.
+        # rclpy raises ValueError if the same call-site is used with two different
+        # severity levels, so we must NOT use getattr(...level)(message) here.
+        if level == "debug":
+            self.get_logger().debug(message)
+        elif level == "info":
+            self.get_logger().info(message)
+        elif level in ("warning", "warn"):
+            self.get_logger().warning(message)
+        elif level == "error":
+            self.get_logger().error(message)
+        else:
+            self.get_logger().info(message)
 
     def _feedback_cb(self, msg):
         with self._ee_lock:
@@ -204,6 +259,8 @@ class ROS2Publisher(Node):
         self._cam_t_last = None
         self._predict_started_t = None
         self._predict_start_pos = None
+        self._occlusion_started_t = None
+        self._occlusion_start_pos = None
 
     def _reset_track_session(self):
         self._reset_estimator()
@@ -218,6 +275,8 @@ class ROS2Publisher(Node):
         self._track_started_t = None
         self._last_target_pos = None
         self._publish_t_last = None
+        self._occlusion_started_t = None
+        self._occlusion_start_pos = None
 
     def _finish_tracking(self, reason):
         self._est_state = "done"
@@ -346,43 +405,114 @@ class ROS2Publisher(Node):
             self._predict_start_pos = self._pos_est.copy()
         return True
 
+    def _desired_future_target(self, now):
+        """Predict a small future target using the current Kalman-based estimate."""
+        if self._pos_est is None:
+            return None
+
+        dt_from_est = 0.0 if self._t_est is None else max(0.0, now - self._t_est)
+        lookahead = self._lookahead_steps * self._lookahead_dt
+        lookahead = min(lookahead, self._lookahead_max_time)
+        horizon = dt_from_est + lookahead
+        return self._pos_est + self._vel_est * horizon
+
+    def _smooth_publish_target(self, desired_pos, now):
+        """Smoothly move the published robot target toward desired_pos."""
+        desired_pos = np.asarray(desired_pos, dtype=np.float64)
+
+        if self._publish_pos is None:
+            self._publish_pos = desired_pos.copy()
+            self._publish_t_last = now
+            return self._publish_pos
+
+        dt = 0.0 if self._publish_t_last is None else max(1e-3, now - self._publish_t_last)
+        alpha = 1.0 - math.exp(-dt / max(self._target_smooth_tau, 1e-3))
+        next_pos = self._publish_pos + alpha * (desired_pos - self._publish_pos)
+
+        step = next_pos - self._publish_pos
+        step_norm = np.linalg.norm(step)
+        if step_norm > self._target_max_step:
+            next_pos = self._publish_pos + step * (self._target_max_step / step_norm)
+
+        self._publish_pos = next_pos
+        self._publish_t_last = now
+        return self._publish_pos
+
+    def _update_occlusion_state(self, now, has_measurement):
+        """Track whether the object is currently hidden from the camera."""
+        if has_measurement:
+            self._occlusion_started_t = None
+            self._occlusion_start_pos = None
+            return 0.0
+
+        if self._occlusion_started_t is None:
+            self._occlusion_started_t = now
+            if self._pos_est is not None:
+                self._occlusion_start_pos = self._pos_est.copy()
+
+        return now - self._occlusion_started_t
+
     def _prediction_limits_reached(self, now):
+        """Prediction limit during object disappearance.
+
+        Short disappearance and robot-hover occlusion are expected.
+        We only stop or hold after the occlusion becomes too long or too far.
+        """
         if self._predict_started_t is None or self._predict_start_pos is None:
             return False
+
+        if self._pos_est is None:
+            return False
+
         age = now - self._predict_started_t
         dist = np.linalg.norm(self._pos_est - self._predict_start_pos)
-        return age > self._prediction_max_time or dist > self._prediction_max_distance
+
+        # Allow expected robot occlusion longer than normal camera timeout.
+        if age <= self._occlusion_expected_s and dist <= self._occlusion_max_predict_distance:
+            return False
+
+        # After hold time, prediction is no longer trusted.
+        if age > self._occlusion_hold_after_s:
+            return True
+
+        # Distance safety limit.
+        if dist > self._occlusion_max_predict_distance:
+            return True
+
+        return False
 
     def _update_publish_target(self, now):
-        if self._pos_est is None:
+        """Compute the desired future target and publish a smooth target.
+
+        Never directly copy _pos_est to _publish_pos.
+        Always smooth the published target. Orientation is not changed here.
+        """
+        desired_pos = self._desired_future_target(now)
+
+        if desired_pos is None:
             if self._publish_pos is not None:
                 self._publish_source = "magnetic_bootstrap"
             return self._publish_pos
 
-        target_pos = self._pos_est.copy()
         if self._publish_phase == "bootstrap":
-            if self._publish_pos is None:
-                self._publish_pos = target_pos.copy()
-            else:
-                dt = 0.0 if self._publish_t_last is None else max(0.0, now - self._publish_t_last)
-                blend = 1.0 - math.exp(-self._bootstrap_gain * max(dt, 1e-3))
-                self._publish_pos = self._publish_pos + blend * (target_pos - self._publish_pos)
+            self._smooth_publish_target(desired_pos, now)
 
             elapsed = 0.0 if self._track_started_t is None else (now - self._track_started_t)
-            err = np.linalg.norm(self._publish_pos - target_pos)
+            err = np.linalg.norm(self._publish_pos - desired_pos)
             if err <= self._bootstrap_tol or elapsed >= self._bootstrap_max_duration:
                 self._publish_phase = "follow"
             self._publish_source = "magnetic_bootstrap"
+
         elif self._publish_phase == "predict":
-            self._publish_pos = target_pos.copy()
-            self._publish_source = "predicted"
+            self._smooth_publish_target(desired_pos, now)
+            self._publish_source = "predicted_occlusion"
+
         else:
             self._publish_phase = "follow"
-            self._publish_pos = target_pos.copy()
+            self._smooth_publish_target(desired_pos, now)
             self._publish_source = "measured"
 
         self._last_target_pos = self._publish_pos.copy()
-        self._publish_t_last = now
         return self._publish_pos
 
     def process(self, data):
@@ -444,13 +574,17 @@ class ROS2Publisher(Node):
             self._publish_status(stamp, data)
             return data
 
-        if meas_pos is not None:
+        has_measurement = meas_pos is not None
+        occlusion_age = self._update_occlusion_state(now, has_measurement)  # noqa: F841
+
+        if has_measurement:
             self._fuse_measurement(meas_pos, meas_vel, now)
             self._predict_started_t = None
             self._predict_start_pos = None
             if self._publish_phase != "bootstrap":
                 self._publish_phase = "follow"
         else:
+            # Object not visible — expected when robot hovers over the object.
             if not self._propagate_prediction(now):
                 target = self._publish_pos if self._publish_pos is not None else self._bootstrap_pose
                 if target is not None:
@@ -459,10 +593,14 @@ class ROS2Publisher(Node):
                 return data
             self._publish_phase = "predict"
             if self._prediction_limits_reached(now):
-                self._finish_tracking("prediction_limit")
-                self._publish_active_flag(False)
-                self._publish_status(stamp, data)
-                return data
+                if self._hold_target_on_occlusion_timeout:
+                    # Hold last smooth target rather than stopping.
+                    self._publish_source = "occlusion_hold"
+                else:
+                    self._finish_tracking("prediction_limit")
+                    self._publish_active_flag(False)
+                    self._publish_status(stamp, data)
+                    return data
 
         publish_pos = self._update_publish_target(now)
         if publish_pos is not None:
@@ -470,10 +608,12 @@ class ROS2Publisher(Node):
         else:
             self._publish_active_flag(False)
 
+        with self._controller_ready_lock:
+            _ctrl_rdy = self._controller_ready
         self._log_throttled(
             "publisher_active", "info", 1.0,
             f'Publisher active: phase={self._publish_phase} source={self._publish_source} '
-            f'cam_fresh={meas_pos is not None} pos='
+            f'ctrl_ready={_ctrl_rdy} cam_fresh={meas_pos is not None} pos='
             f'[{self._publish_pos[0]:.3f}, {self._publish_pos[1]:.3f}, {self._publish_pos[2]:.3f}]')
         self._publish_status(stamp, data)
         return data
@@ -498,7 +638,12 @@ class ROS2Publisher(Node):
         ps.pose.orientation.w = float(quat[3])
         self._pub_pose.publish(ps)
 
-        self._publish_transform(stamp, pos_now, quat)
+        with self._controller_ready_lock:
+            controller_ready = self._controller_ready
+
+        # The debug TF (tracking_target) is only broadcast when the controller is
+        # actively receiving data, so RViz stays in sync with what the robot sees.
+        self._publish_transform(stamp, pos_now, quat, publish_debug=controller_ready)
 
         ts = TwistStamped()
         ts.header.stamp = stamp
@@ -510,44 +655,59 @@ class ROS2Publisher(Node):
 
         world_pos, world_quat = self._target_to_world(pos_now, quat, update_error=True)
         if world_pos is not None and world_quat is not None:
-            ctrl_pose = PoseStamped()
-            ctrl_pose.header.stamp = stamp
-            ctrl_pose.header.frame_id = self.world_frame
-            ctrl_pose.pose.position.x = float(world_pos[0])
-            ctrl_pose.pose.position.y = float(world_pos[1])
-            ctrl_pose.pose.position.z = float(world_pos[2])
-            ctrl_pose.pose.orientation.x = float(world_quat[0])
-            ctrl_pose.pose.orientation.y = float(world_quat[1])
-            ctrl_pose.pose.orientation.z = float(world_quat[2])
-            ctrl_pose.pose.orientation.w = float(world_quat[3])
-            self._pub_ctrl_pose.publish(ctrl_pose)
+            if controller_ready:
+                ctrl_pose = PoseStamped()
+                ctrl_pose.header.stamp = stamp
+                ctrl_pose.header.frame_id = self.world_frame
+                ctrl_pose.pose.position.x = float(world_pos[0])
+                ctrl_pose.pose.position.y = float(world_pos[1])
+                ctrl_pose.pose.position.z = float(world_pos[2])
+                ctrl_pose.pose.orientation.x = float(world_quat[0])
+                ctrl_pose.pose.orientation.y = float(world_quat[1])
+                ctrl_pose.pose.orientation.z = float(world_quat[2])
+                ctrl_pose.pose.orientation.w = float(world_quat[3])
+                self._pub_ctrl_pose.publish(ctrl_pose)
 
-            world_vel = self._vector_to_world(vel_now)
-            if world_vel is not None:
-                ctrl_vel = TwistStamped()
-                ctrl_vel.header.stamp = stamp
-                ctrl_vel.header.frame_id = self.world_frame
-                ctrl_vel.twist.linear.x = float(world_vel[0])
-                ctrl_vel.twist.linear.y = float(world_vel[1])
-                ctrl_vel.twist.linear.z = float(world_vel[2])
-                self._pub_ctrl_vel.publish(ctrl_vel)
+                world_vel = self._vector_to_world(vel_now)
+                if world_vel is not None:
+                    ctrl_vel = TwistStamped()
+                    ctrl_vel.header.stamp = stamp
+                    ctrl_vel.header.frame_id = self.world_frame
+                    ctrl_vel.twist.linear.x = float(world_vel[0])
+                    ctrl_vel.twist.linear.y = float(world_vel[1])
+                    ctrl_vel.twist.linear.z = float(world_vel[2])
+                    self._pub_ctrl_vel.publish(ctrl_vel)
+            else:
+                self._log_throttled(
+                    "ctrl_publish_gated", "info", 2.0,
+                    "Controller not in STATE_POSE_FOLLOW — skipping controller pose/vel publish.")
 
         self._publish_active_flag(True)
 
     def _publish_transform(self, stamp, translation, quaternion, publish_debug=True):
+        # tracking_task = raw Kalman + lookahead estimate (what the sensor/filter computes).
+        # This is independent of the smoothing applied to the robot command.
+        # Falls back to `translation` only when there is no active state estimate (e.g. idle).
+        raw_pos = self._desired_future_target(time.monotonic())
+        if raw_pos is None:
+            raw_pos = translation
+
         t = TransformStamped()
         t.header.stamp = stamp
         t.header.frame_id = self.frame_id
         t.child_frame_id = self.tracking_frame_id
-        t.transform.translation.x = float(translation[0])
-        t.transform.translation.y = float(translation[1])
-        t.transform.translation.z = float(translation[2])
+        t.transform.translation.x = float(raw_pos[0])
+        t.transform.translation.y = float(raw_pos[1])
+        t.transform.translation.z = float(raw_pos[2])
         t.transform.rotation.x = float(quaternion[0])
         t.transform.rotation.y = float(quaternion[1])
         t.transform.rotation.z = float(quaternion[2])
         t.transform.rotation.w = float(quaternion[3])
         self._tf_broadcaster.sendTransform(t)
+
         if publish_debug:
+            # tracking_target = smoothed commanded pose that the robot controller receives.
+            # `translation` here is always _publish_pos (the smoothed target).
             self._publish_world_debug_transform(stamp, translation, quaternion)
 
     def _frame_to_world_transform(self, update_error=False, context_key="frame_to_world"):
@@ -630,6 +790,9 @@ class ROS2Publisher(Node):
         pred_age_ms = 0.0
         if self._predict_started_t is not None:
             pred_age_ms = (now - self._predict_started_t) * 1000.0
+        occlusion_age_ms = 0.0
+        if self._occlusion_started_t is not None:
+            occlusion_age_ms = (now - self._occlusion_started_t) * 1000.0
         status = json.dumps({
             "tracking": tracking,
             "est_state": self._est_state,
@@ -642,6 +805,7 @@ class ROS2Publisher(Node):
             "cam_fresh": cam_ok,
             "cam_age_ms": round(dt_cam * 1000.0),
             "prediction_age_ms": round(pred_age_ms),
+            "occlusion_age_ms": round(occlusion_age_ms),
             "error": self._status_error,
         })
         msg = String()

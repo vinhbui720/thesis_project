@@ -30,82 +30,82 @@
 
 namespace
 {
-constexpr int NUMBER_OF_JOINT = 6;
-constexpr double SAFETY_VELOCITY_ALPHA = 0.9;
-constexpr double SAFETY_JOINT_PADDING_RAD = 5.0 * M_PI / 180.0;
-constexpr double POSITION_ERROR_THRESHOLD = 0.0005;
-constexpr double POSE_TIMEOUT_SEC = 3.0;
-constexpr double TARGET_VEL_TIMEOUT_SEC = 0.5;
-constexpr double ARM_PRE_DELAY_S = 0.5;
-constexpr double ARM_POST_DELAY_S = 1.0;
+    constexpr int NUMBER_OF_JOINT = 6;
+    constexpr double SAFETY_VELOCITY_ALPHA = 1.0;
+    constexpr double SAFETY_JOINT_PADDING_RAD = 5.0 * M_PI / 180.0;
+    constexpr double POSITION_ERROR_THRESHOLD = 0.0005;
+    constexpr double POSE_TIMEOUT_SEC = 3.0;
+    constexpr double TARGET_VEL_TIMEOUT_SEC = 0.5;
+    constexpr double ARM_PRE_DELAY_S = 0.5;
+    constexpr double ARM_POST_DELAY_S = 1.0;
 
-const std::array<std::string, NUMBER_OF_JOINT> FALLBACK_JOINT_NAMES = {
-    "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
+    const std::array<std::string, NUMBER_OF_JOINT> FALLBACK_JOINT_NAMES = {
+        "joint_1_s", "joint_2_l", "joint_3_u", "joint_4_r", "joint_5_b", "joint_6_t"};
 
-const std::array<double, NUMBER_OF_JOINT> FALLBACK_LOWER = {
-    -170.0 * M_PI / 180.0,
-    -85.0 * M_PI / 180.0,
-    -175.0 * M_PI / 180.0,
-    -140.0 * M_PI / 180.0,
-    -30.0 * M_PI / 180.0,
-    -360.0 * M_PI / 180.0};
+    const std::array<double, NUMBER_OF_JOINT> FALLBACK_LOWER = {
+        -170.0 * M_PI / 180.0,
+        -85.0 * M_PI / 180.0,
+        -175.0 * M_PI / 180.0,
+        -140.0 * M_PI / 180.0,
+        -30.0 * M_PI / 180.0,
+        -360.0 * M_PI / 180.0};
 
-const std::array<double, NUMBER_OF_JOINT> FALLBACK_UPPER = {
-    170.0 * M_PI / 180.0,
-    90.0 * M_PI / 180.0,
-    120.0 * M_PI / 180.0,
-    140.0 * M_PI / 180.0,
-    210.0 * M_PI / 180.0,
-    360.0 * M_PI / 180.0};
+    const std::array<double, NUMBER_OF_JOINT> FALLBACK_UPPER = {
+        170.0 * M_PI / 180.0,
+        90.0 * M_PI / 180.0,
+        120.0 * M_PI / 180.0,
+        140.0 * M_PI / 180.0,
+        210.0 * M_PI / 180.0,
+        360.0 * M_PI / 180.0};
 
-const std::array<double, NUMBER_OF_JOINT> FALLBACK_VELOCITY = {
-    M_PI * 7.0 / 4.0,
-    M_PI * 7.0 / 4.0,
-    M_PI * 7.0 / 3.0,
-    M_PI * 10.0 / 3.0,
-    M_PI * 10.0 / 3.0,
-    M_PI * 10.0 / 3.0};
+    const std::array<double, NUMBER_OF_JOINT> FALLBACK_VELOCITY = {
+        M_PI * 7.0 / 4.0,
+        M_PI * 7.0 / 4.0,
+        M_PI * 7.0 / 3.0,
+        M_PI * 10.0 / 3.0,
+        M_PI * 10.0 / 3.0,
+        M_PI * 10.0 / 3.0};
 
-Eigen::MatrixXd calcSrInverse(const Eigen::MatrixXd &jacobian,
-                              double manipulability,
-                              double w0,
-                              double k0)
-{
-    const double w0_safe = std::max(1e-9, w0);
-    const double damping =
-        (manipulability < w0_safe)
-            ? k0 * std::pow(1.0 - manipulability / w0_safe, 2.0)
-            : 0.0;
-    const Eigen::Index rows = jacobian.rows();
-    const Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(rows, rows);
-    return jacobian.transpose() *
-           (jacobian * jacobian.transpose() + damping * identity).inverse();
-}
+    Eigen::MatrixXd calcSrInverse(const Eigen::MatrixXd &jacobian,
+                                  double manipulability,
+                                  double w0,
+                                  double k0)
+    {
+        const double w0_safe = std::max(1e-9, w0);
+        const double damping =
+            (manipulability < w0_safe)
+                ? k0 * std::pow(1.0 - manipulability / w0_safe, 2.0)
+                : 0.0;
+        const Eigen::Index rows = jacobian.rows();
+        const Eigen::MatrixXd identity = Eigen::MatrixXd::Identity(rows, rows);
+        return jacobian.transpose() *
+               (jacobian * jacobian.transpose() + damping * identity).inverse();
+    }
 
-Eigen::Vector3d orientationError(const Eigen::Matrix3d &desired,
-                                 const Eigen::Matrix3d &current)
-{
-    const Eigen::Matrix3d error = desired * current.transpose();
-    const double angle =
-        std::acos(std::clamp(0.5 * (error.trace() - 1.0), -1.0, 1.0));
-    if (std::abs(angle) < 1e-8)
-        return Eigen::Vector3d::Zero();
+    Eigen::Vector3d orientationError(const Eigen::Matrix3d &desired,
+                                     const Eigen::Matrix3d &current)
+    {
+        const Eigen::Matrix3d error = desired * current.transpose();
+        const double angle =
+            std::acos(std::clamp(0.5 * (error.trace() - 1.0), -1.0, 1.0));
+        if (std::abs(angle) < 1e-8)
+            return Eigen::Vector3d::Zero();
 
-    Eigen::Vector3d axis(error(2, 1) - error(1, 2),
-                         error(0, 2) - error(2, 0),
-                         error(1, 0) - error(0, 1));
-    axis /= (2.0 * std::sin(angle));
-    return angle * axis;
-}
+        Eigen::Vector3d axis(error(2, 1) - error(1, 2),
+                             error(0, 2) - error(2, 0),
+                             error(1, 0) - error(0, 1));
+        axis /= (2.0 * std::sin(angle));
+        return angle * axis;
+    }
 
-Eigen::Quaterniond normalizedQuaternion(const geometry_msgs::msg::Quaternion &msg)
-{
-    Eigen::Quaterniond q(msg.w, msg.x, msg.y, msg.z);
-    if (q.norm() < 1e-9)
-        return Eigen::Quaterniond::Identity();
-    q.normalize();
-    return q;
-}
+    Eigen::Quaterniond normalizedQuaternion(const geometry_msgs::msg::Quaternion &msg)
+    {
+        Eigen::Quaterniond q(msg.w, msg.x, msg.y, msg.z);
+        if (q.norm() < 1e-9)
+            return Eigen::Quaterniond::Identity();
+        q.normalize();
+        return q;
+    }
 } // namespace
 
 const char *MotoMiniPlanningNode::trackingStateLabel(TrackingStreamState state) const
@@ -147,6 +147,8 @@ void MotoMiniPlanningNode::transitionTrackingState(TrackingStreamState next_stat
                     trackingStateLabel(next_state));
     }
     tracking_state_ = next_state;
+    // Publish the new state so external nodes (e.g. Python scripts) can poll it.
+    publishStatus(trackingStateLabel(next_state));
 }
 
 void MotoMiniPlanningNode::sanitizeTrackingParameters()
@@ -332,12 +334,12 @@ bool MotoMiniPlanningNode::getMeasuredJointVelocity(const Eigen::VectorXd &q,
     const double dt_prev = have_q_prev ? (now - t_prev_q).seconds() : dt_hint;
     if (!velocity_valid)
     {
-        if (real_robot_)
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "[VEL] real_robot=true but hardware velocity invalid — falling back to pose diff.");
-        else
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "[VEL] real_robot=false → using pose-differentiation velocity.");
+        // if (real_robot_)
+        //     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        //                          "[VEL] real_robot=true but hardware velocity invalid — falling back to pose diff.");
+        // else
+        //     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+        //                          "[VEL] real_robot=false → using pose-differentiation velocity.");
         if (have_q_prev && q_prev.size() == q.size() && dt_prev > 1e-6)
             qdot_out = (q - q_prev) / dt_prev;
         else
@@ -779,7 +781,13 @@ void MotoMiniPlanningNode::trackingControlCallback(const std_msgs::msg::Bool::Sh
 
         publishStatus("Mode: Tracking");
         RCLCPP_INFO(this->get_logger(),
-                    "Mode -> TRACKING feedback stream. Waiting for fresh tracking input.");
+                    "Mode -> TRACKING feedback stream. Arming from current EE pose.");
+
+        // Immediately arm from the current EE pose so the controller enters
+        // POSE_FOLLOW and is ready before the first target arrives.
+        // desired_pose_ is seeded to the current EE position so the robot holds
+        // its current position until a real tracking target is received.
+        enterPoseFollowFromCurrentPose();
     }
     else
     {

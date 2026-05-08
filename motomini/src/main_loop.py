@@ -12,8 +12,11 @@ from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration as ROSDuration
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
@@ -29,20 +32,39 @@ class GantryControl:
         self._pub_gantry_traj = node.create_publisher(
             JointTrajectory, "/gantry_controller/joint_trajectory", 10
         )
+        
+        # Joint state feedback
+        self._joint_state_lock = threading.Lock()
+        self._joint_state = None
+        self._sub_joint_state = node.create_subscription(
+            JointState, "/gantry_joint_states", self._joint_state_cb, 10
+        )
+    
+    def _joint_state_cb(self, msg: JointState) -> None:
+        """Callback for joint state feedback."""
+        with self._joint_state_lock:
+            self._joint_state = msg
 
     def move_to(
         self,
         x_pos: float,
         z_pos: float,
         motion_time_sec: float = 1.0,
-    ) -> None:
+        wait_timeout_sec: float = 10.0,
+        position_tolerance_m: float = 0.001,
+    ) -> bool:
         """
-        Publish a trajectory command to move the gantry to (x, z).
+        Publish a trajectory command to move the gantry to (x, z) and wait for feedback.
 
         Args:
             x_pos: X-axis position in meters (-0.28 to 0.0).
             z_pos: Z-axis position in meters (-0.06 to 0.0).
             motion_time_sec: Time for the motion to complete.
+            wait_timeout_sec: Maximum time to wait for target position feedback (seconds).
+            position_tolerance_m: Position tolerance for considering target reached (meters).
+            
+        Returns:
+            True if target position was reached within timeout, False otherwise.
         """
         msg = JointTrajectory()
         msg.header.frame_id = "world"
@@ -57,10 +79,46 @@ class GantryControl:
         msg.points.append(point)
         self._pub_gantry_traj.publish(msg)
         self._node.get_logger().info(f"Gantry move published: x={x_pos:.3f}, z={z_pos:.3f}")
+        
+        # Wait for feedback to reach target position
+        start_time = time.time()
+        while rclpy.ok() and (time.time() - start_time < wait_timeout_sec):
+            with self._joint_state_lock:
+                joint_state = self._joint_state
+            
+            if joint_state is not None and len(joint_state.position) >= 2:
+                # Assuming first position is joint_x, second is joint_z
+                current_x = joint_state.position[0]
+                current_z = joint_state.position[1]
+                
+                error_x = abs(current_x - x_pos)
+                error_z = abs(current_z - z_pos)
+                
+                if error_x <= position_tolerance_m and error_z <= position_tolerance_m:
+                    self._node.get_logger().info(
+                        f"Gantry reached target: x={current_x:.6f}, z={current_z:.6f} "
+                        f"(errors: dx={error_x:.6f}, dz={error_z:.6f})"
+                    )
+                    return True
+            
+            time.sleep(0.05)
+        
+        self._node.get_logger().error(
+            f"Gantry failed to reach target x={x_pos:.3f}, z={z_pos:.3f} "
+            f"within timeout {wait_timeout_sec}s"
+        )
+        return False
 
-    def move_to_origin(self) -> None:
-        """Move gantry back to origin (0.0, 0.0)."""
-        self.move_to(0.0, 0.0, motion_time_sec=2.0)
+    def move_to_origin(self, wait_timeout_sec: float = 10.0) -> bool:
+        """Move gantry back to origin (0.0, 0.0).
+        
+        Args:
+            wait_timeout_sec: Maximum time to wait for target position feedback (seconds).
+            
+        Returns:
+            True if target position was reached, False otherwise.
+        """
+        return self.move_to(0.0, 0.0, motion_time_sec=2.0, wait_timeout_sec=wait_timeout_sec)
 
     def loop_motion(
         self,
@@ -489,6 +547,34 @@ class ObjectProcess:
         node.get_logger().error(f"Camera did not become fresh within {timeout_sec}s")
         return False
 
+    @staticmethod
+    def start_tracking_publish(node: Node) -> None:
+        """Signal the tracking publisher to start publishing to the robot controller.
+
+        This should be called after the controller has confirmed STATE_POSE_FOLLOW.
+        
+        Args:
+            node: ROS2 node to use for publisher.
+        """
+        msg = Bool()
+        msg.data = True
+        pub = node.create_publisher(Bool, "/object/start_publish_tracking", 10)
+        pub.publish(msg)
+        node.get_logger().info("Published /object/start_publish_tracking=True")
+
+    @staticmethod
+    def stop_tracking_publish(node: Node) -> None:
+        """Signal the tracking publisher to stop publishing to the robot controller.
+
+        Args:
+            node: ROS2 node to use for publisher.
+        """
+        msg = Bool()
+        msg.data = False
+        pub = node.create_publisher(Bool, "/object/start_publish_tracking", 10)
+        pub.publish(msg)
+        node.get_logger().info("Published /object/start_publish_tracking=False")
+
 class ObjectControl:
 	"""Object TF tester helper: publish target pose and attach/detach signal."""
 
@@ -496,6 +582,10 @@ class ObjectControl:
 		self._node = node
 		self._pub_object_pose = node.create_publisher(PoseStamped, "/target_object_pose", 10)
 		self._pub_attach = node.create_publisher(Bool, "/object_attach_signal", 10)
+		
+		# TF buffer for frame transformations
+		self._tf_buffer = Buffer(cache_time=ROSDuration(seconds=5))
+		self._tf_listener = TransformListener(self._tf_buffer, node)
 
 	def set_current_target(
 		self,
@@ -532,6 +622,42 @@ class ObjectControl:
 		msg.data = False
 		self._pub_attach.publish(msg)
 		self._node.get_logger().info("Published /object_attach_signal=false")
+
+	def get_tracking_error(self, timeout_sec: float = 1.0) -> Optional[float]:
+		"""
+		Calculate the Euclidean distance between magnetic_link origin and tracking_task origin.
+		
+		Args:
+			timeout_sec: Timeout for TF lookup in seconds.
+			
+		Returns:
+			Float number representing Euclidean distance (m) between the two frame origins.
+			Returns None if TF lookup fails.
+		"""
+		try:
+			# Lookup transform from magnetic_link to tracking_task
+			transform = self._tf_buffer.lookup_transform(
+				"magnetic_link", "tracking_task", rclpy.time.Time(), timeout=ROSDuration(seconds=timeout_sec)
+			)
+			
+			# Extract translation components
+			x = transform.transform.translation.x
+			y = transform.transform.translation.y
+			z = transform.transform.translation.z
+			
+			# Calculate Euclidean distance
+			distance = float(np.sqrt(x**2 + y**2 + z**2))
+			self._node.get_logger().info(
+				f"Tracking error (distance): {distance:.6f} m "
+				f"(dx={x:.6f}, dy={y:.6f}, dz={z:.6f})"
+			)
+			return distance
+			
+		except TransformException as exc:
+			self._node.get_logger().error(
+				f"Cannot lookup transform magnetic_link -> tracking_task: {exc}"
+			)
+			return None
 
 class MotoMiniMainLoop(Node):
 	def __init__(self):
@@ -710,17 +836,68 @@ class MotoMiniMainLoop(Node):
 				)
 		return targets
 
-	def _publish_start(self) -> None:
-		msg = Bool()
-		msg.data = True
-		self.pub_start.publish(msg)
-		self.get_logger().info("Published /start true")
+	def _publish_start(self, timeout_sec: float = 10.0) -> bool:
+		"""Spam /start until the planning node confirms 'Planning Started' on /optimization_status.
 
-	def _publish_clear(self) -> None:
-		msg = Bool()
-		msg.data = True
-		self.pub_clear.publish(msg)
-		self.get_logger().info("Published /clear_targets true")
+		Returns:
+			True if planning started successfully, False if it failed or timed out.
+		"""
+		# Clear stale status so we don't match a value from a previous operation.
+		with self._status_lock:
+			self._last_status = ""
+
+		deadline = time.time() + timeout_sec
+		while rclpy.ok() and time.time() < deadline:
+			msg = Bool()
+			msg.data = True
+			self.pub_start.publish(msg)
+			self.get_logger().info("Published /start — waiting for 'Planning Started'...")
+
+			# Wait up to 500 ms for a response before re-publishing.
+			check_until = min(time.time() + 0.5, deadline)
+			while rclpy.ok() and time.time() < check_until:
+				with self._status_lock:
+					s = self._last_status
+				if "Planning Started" in s:
+					self.get_logger().info(f"Start confirmed: {s}")
+					return True
+				if s.startswith("Failed:"):
+					self.get_logger().error(f"Planning node rejected start: {s}")
+					return False
+				time.sleep(0.05)
+
+		self.get_logger().error(f"Timed out ({timeout_sec}s) waiting for 'Planning Started'")
+		return False
+
+	def _publish_clear(self, timeout_sec: float = 5.0) -> bool:
+		"""Spam /clear_targets until the planning node confirms 'Buffer Cleared' on /optimization_status.
+
+		Returns:
+			True if the buffer was cleared, False if timed out.
+		"""
+		# Clear stale status so we don't match a value from a previous operation.
+		with self._status_lock:
+			self._last_status = ""
+
+		deadline = time.time() + timeout_sec
+		while rclpy.ok() and time.time() < deadline:
+			msg = Bool()
+			msg.data = True
+			self.pub_clear.publish(msg)
+			self.get_logger().info("Published /clear_targets — waiting for 'Buffer Cleared'...")
+
+			# Wait up to 500 ms for a response before re-publishing.
+			check_until = min(time.time() + 0.5, deadline)
+			while rclpy.ok() and time.time() < check_until:
+				with self._status_lock:
+					s = self._last_status
+				if "Buffer Cleared" in s:
+					self.get_logger().info(f"Clear confirmed: {s}")
+					return True
+				time.sleep(0.05)
+
+		self.get_logger().error(f"Timed out ({timeout_sec}s) waiting for 'Buffer Cleared'")
+		return False
 
 	def execute_target_pose(self, targets: PoseArray) -> None:
 		"""Execute target poses: publish PoseArray -> wait -> start -> wait done -> clear."""
@@ -737,12 +914,14 @@ class MotoMiniMainLoop(Node):
 		if not self.wait_for_status_contains(expected_status, timeout_sec=10.0):
 			raise RuntimeError(f"Did not receive status '{expected_status}' in time")
 
-		self._publish_start()
+		if not self._publish_start(timeout_sec=10.0):
+			raise RuntimeError("Planning node did not confirm 'Planning Started' in time")
 
 		if not self.wait_for_exec_true_then_false(timeout_sec=120.0):
 			raise RuntimeError("Did not observe /trajectory_executing transition true -> false in time")
 
-		self._publish_clear()
+		if not self._publish_clear(timeout_sec=5.0):
+			self.get_logger().warning("Clear not confirmed — proceeding anyway")
 		self.get_logger().info("Main loop complete")
 
 	def wait_for_status_contains(self, text: str, timeout_sec: float) -> bool:
@@ -770,13 +949,6 @@ class MotoMiniMainLoop(Node):
 			time.sleep(0.05)
 		return False
 
-	def enable_tracking(self) -> None:
-		"""Enable object tracking mode."""
-		msg = Bool()
-		msg.data = True
-		self.pub_tracking_control.publish(msg)
-		self.get_logger().info("Tracking mode ENABLED")
-
 	def disable_tracking(self) -> None:
 		"""Disable object tracking mode."""
 		msg = Bool()
@@ -784,130 +956,165 @@ class MotoMiniMainLoop(Node):
 		self.pub_tracking_control.publish(msg)
 		self.get_logger().info("Tracking mode DISABLED")
 
-	def set_tracking_mode(self, enabled: bool) -> None:
-		"""Set tracking mode on/off.
-		
-		Args:
-			enabled: True to enable tracking, False to disable.
+	def enable_tracking(self, timeout_sec: float = 5.0) -> bool:
+		"""Enable object tracking mode and wait until the controller enters POSE_FOLLOW.
+
+		Returns:
+			True if the controller reached POSE_FOLLOW within timeout_sec, False otherwise.
 		"""
-		if enabled:
-			self.enable_tracking()
-		else:
-			self.disable_tracking()
+		msg = Bool()
+		msg.data = True
+		self.pub_tracking_control.publish(msg)
+		self.get_logger().info("Tracking mode ENABLED — waiting for STATE_POSE_FOLLOW...")
+
+		# Wait for transitionTrackingState to publish "STATE_POSE_FOLLOW" on /optimization_status.
+		if self.wait_for_status_contains("STATE_POSE_FOLLOW", timeout_sec=timeout_sec):
+			self.get_logger().info("Tracking controller is now in STATE_POSE_FOLLOW — ready.")
+			return True
+
+		self.get_logger().error(
+			f"Tracking controller did NOT reach STATE_POSE_FOLLOW within {timeout_sec} s."
+		)
+		return False
 
 
 def main() -> None:
-	rclpy.init()
-	node = MotoMiniMainLoop()
-	object_control = ObjectControl(node)
-	gantry_control = GantryControl(node)
-	executor = rclpy.executors.SingleThreadedExecutor()
-	executor.add_node(node)
+    rclpy.init()
+    node = MotoMiniMainLoop()
+    object_control = ObjectControl(node)
+    gantry_control = GantryControl(node)
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
 
-	spin_thread = threading.Thread(target=executor.spin, daemon=True)
-	spin_thread.start()
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
 
-	try:
-		# Give discovery/subscriptions a short moment to connect.
-		time.sleep(0.5)
-		gantry_control.move_to(x_pos=-0.14, z_pos=-0.03, motion_time_sec=1.5)
-		node._publish_clear()
+    try:
+        # Give discovery/subscriptions a short moment to connect.
+        time.sleep(0.5)
+        # gantry_control.move_to(x_pos=-0.0, z_pos=-0.00, motion_time_sec=1.5)
+        # gantry_control.move_to(x_pos=-0.05, z_pos=-0.03, motion_time_sec=1.5)
+        node._publish_clear()
 
-		node.set_planner_mode(2)
-		object_control.set_current_target(-0.05, -0.25, 0.07)
-		targets = node.make_targets([
+        node.set_planner_mode(2)
+        object_control.set_current_target(-0.05, -0.25, 0.07)
+        targets = node.make_targets([
             (-0.03, -0.24, 0.2),
             (-0.03, -0.24, 0.071)
         ])
-		node.execute_target_pose(targets)
-		object_control.attach()
-		time.sleep(0.5)
-		#Moving to hover ready to Grinding
-		targets = node.make_targets([
-            (0.1, -0.25, 0.2)
+        node.execute_target_pose(targets)
+        object_control.attach()
+
+        # time.sleep(1.0) 
+        node._publish_clear()
+        # # Moving to hover ready to Grinding
+        node.set_planner_mode(2)
+        # time.sleep(1.0) 
+        # node._publish_clear()
+        targets = node.make_targets([
+            (0.0530, -0.2709, 0.17)
         ])
-		node.execute_target_pose(targets)
-		node.set_planner_mode(3)
-		circle_targets = ObjectProcess.generate_circle_poses(
-			x=0.1, y=-0.25, z=0.2,
-			number_of_points=10,
-			radius=0.02,
-			alpha_degrees=-45.0,
-		)
-		node.execute_target_pose(circle_targets)
-		# moving hove ready for tracking
-		targets = node.make_targets([
+        node.execute_target_pose(targets)
+        node.set_planner_mode(3)
+        time.sleep(0.5)
+        node.set_planner_mode(3)
+        circle_targets = ObjectProcess.generate_circle_poses(
+            x=0.0530, y=-0.2709, z=0.17,
+            number_of_points=10,
+            radius=0.04,
+            alpha_degrees=-20.0,
+        )
+        node.execute_target_pose(circle_targets)
+        
+        # moving hove ready for tracking
+        targets = node.make_targets([
             (0.18, 0.00, 0.245)
         ])
-		node.execute_target_pose(targets)
-		targets = node.make_targets([
+        node.execute_target_pose(targets)
+        targets = node.make_targets([
             (0.13, -0.19, 0.1)
         ])
-		node.execute_target_pose(targets)
-		sucess = ObjectProcess.wait_for_tracking_status_change(node, timeout_sec=15.0)
-		if sucess:
-			print("Tracking status transition detected successfully.")
-			
-			# === EXAMPLE 1: Enable/Disable tracking mode ===
-			node.enable_tracking()
-			time.sleep(2.0)
-			node.disable_tracking()
-			
-			# # === EXAMPLE 2: Check ICP fitness ===
-			# fitness_ok = ObjectProcess.check_icp_fitness_ok(
-			# 	node, 
-			# 	min_fitness=0.5,
-			# 	timeout_sec=5.0
-			# )
-			# if fitness_ok:
-			# 	print("ICP fitness is within acceptable range")
-			
-			# # === EXAMPLE 3: Check tracking error ===
-			error_ok = ObjectProcess.check_tracking_error_ok(
-				node,
-				timeout_sec=5.0
-			)
-			if error_ok:
-				print("Tracking error cleared")
-				object_control.detach()
-				node.disable_tracking()
-			
-			# # === EXAMPLE 4: Get current tracking status ===
-			# status = ObjectProcess.get_tracking_status(node, timeout_sec=2.0)
-			# if status:
-			# 	print(f"Current status: {status}")
-			# 	print(f"  - Tracking: {status.get('tracking')}")
-			# 	print(f"  - ICP fitness: {status.get('icp_fitness'):.4f}")
-			# 	print(f"  - Camera fresh: {status.get('cam_fresh')}")
-			
-			# # === EXAMPLE 5: Wait for camera to be fresh ===
-			# cam_fresh = ObjectProcess.wait_for_camera_fresh(
-			# 	node,
-			# 	timeout_sec=10.0,
-			# 	max_age_ms=250.0
-			# )
-			# if cam_fresh:
-			# 	print("Camera measurements are fresh")
-			
-			# === EXAMPLE 6: Retrigger ICP (if fitness degrades) ===
-			# Uncomment to use ICP retrigger:
-			# icp_success = ObjectProcess.retrigger_icp(node, timeout_sec=35.0)
-			# if icp_success:
-			#     print("ICP retrigger completed successfully")
-		else:
-			print("Failed to detect tracking status transition in time.")
-		
-		targets = node.make_targets([
+        node.execute_target_pose(targets)
+        controller_ready = node.enable_tracking(timeout_sec=5.0)
+        if not controller_ready:
+            print("Warning: tracking controller did not reach POSE_FOLLOW — proceeding anyway.")
+        
+        # Signal the tracking publisher to start sending commands to the robot.
+        time.sleep(1.0)  # Short delay to ensure controller is ready to receive tracking commands
+        sucess = ObjectProcess.wait_for_tracking_status_change(node, timeout_sec=15.0)
+        if sucess:
+            ObjectProcess.start_tracking_publish(node)
+            # Poll get_tracking_error() until EE is close enough to the belt object.
+            # Error must stay below threshold for a sustained duration before settling.
+            error_threshold_m = 0.009   # metres — tune as needed
+            settle_duration_s = 1.0     # must stay below threshold for this long
+            tracking_timeout_sec = 10.0
+            start_t = time.time()
+            tracking_settled = False
+            settle_start_t = None
+            
+            while rclpy.ok() and (time.time() - start_t) < tracking_timeout_sec:
+                dist = object_control.get_tracking_error(timeout_sec=0.5)
+                
+                if dist is not None:
+                    # Always log the current error
+                    status = "OK" if dist < error_threshold_m else "HIGH"
+                    elapsed = time.time() - start_t
+                    print(f"[{elapsed:.1f}s] Tracking error: {dist:.6f} m "
+                          f"(threshold: {error_threshold_m} m) [{status}]")
+                    
+                    if dist < error_threshold_m:
+                        # Error is below threshold; start/continue settlement timer
+                        if settle_start_t is None:
+                            settle_start_t = time.time()
+                            print(f"  → Error below threshold, settlement timer started")
+                        
+                        # Check if error stayed good long enough
+                        settle_elapsed = time.time() - settle_start_t
+                        if settle_elapsed >= settle_duration_s:
+                            print(f"Tracking settled: error stayed < {error_threshold_m} m for {settle_duration_s}s")
+                            tracking_settled = True
+                            break
+                    else:
+                        # Error exceeded threshold; reset settlement timer
+                        if settle_start_t is not None:
+                            print(f"  → Error exceeded threshold, settlement timer reset")
+                            settle_start_t = None
+                
+                time.sleep(0.05)
+            
+            if tracking_settled:
+                object_control.detach()
+                ObjectProcess.stop_tracking_publish(node)
+                node.disable_tracking()
+            else:
+                print(f"Tracking did not settle within {tracking_timeout_sec} s.")
+                node.set_planner_mode(2)
+                node.disable_tracking()
+                object_control.set_current_target(-0.05, -0.25, 0.07)
+                targets = node.make_targets([
+                    (-0.03, -0.24, 0.2),
+                    (-0.03, -0.24, 0.071)
+                ])
+                node.execute_target_pose(targets)
+                object_control.detach()
+        else:
+            print("Failed to detect tracking status transition in time.")
+        
+        node._publish_clear()
+        node.set_planner_mode(2)
+        # time.sleep(0.5) 
+        targets = node.make_targets([
             (0.18, 0.00, 0.245)
         ])
-		node.execute_target_pose(targets)
-	except Exception as exc:
-		node.get_logger().error(f"Main loop failed: {exc}")
-	finally:
-		executor.shutdown()
-		node.destroy_node()
-		rclpy.shutdown()
+        node.execute_target_pose(targets)
 
+    except Exception as exc:
+        node.get_logger().error(f"Main loop failed: {exc}")
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == "__main__":
-	main()
+    main()

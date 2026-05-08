@@ -118,7 +118,7 @@
   <joint name="working_tip_tool" type="fixed">
     <parent link="gantry_tool_link" />
     <child link="working_tip" />
-    <origin xyz="0.0 -0.1451 0.05" rpy="0.0 0.0 3.14" />
+    <origin xyz="0.0 -0.1451 0.045" rpy="0.0 0.0 3.14" />
     <!-- <origin xyz="0.0 -0.1451 0.133" rpy="0.0 0.0 3.14" /> -->
 
   </joint>

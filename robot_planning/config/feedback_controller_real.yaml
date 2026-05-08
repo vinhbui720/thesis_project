@@ -1,0 +1,308 @@
+###############################################################################
+# feedback_controller.yaml
+# Runtime-tunable parameters for motomini_feedback_stream.
+#
+# Controller:
+#   Adaptive Cartesian admittance-inspired impedance velocity control.
+#
+#   This is not a torque-level impedance controller. The robot interface still
+#   receives joint position + joint velocity commands. The impedance/admittance
+#   law runs only in Cartesian space to generate a smooth Cartesian velocity
+#   command, then the existing Singularity-Robust Jacobian inverse maps it to
+#   joint velocity.
+#
+# Total controller equation:
+#
+#   e =
+#   [ p_des - p_ee
+#     axisAngle(R_des * R_ee^T) ]
+#
+#   xdot_ee = J(q) * qdot
+#
+#   edot = xdot_des - xdot_ee
+#
+#   s_t = 1 - exp(-adaptive_lambda * active_time)
+#
+#   s_e_pos = tanh(adaptive_alpha_pos * ||e_pos||)
+#   s_e_ori = tanh(adaptive_alpha_ori * ||e_ori||)
+#
+#   w = sqrt(det(J(q) * J(q)^T))
+#
+#   s_w = clamp(w / w0, 0.2, 1.0)
+#
+# Translational adaptive parameters:
+#
+#   K_pos = s_w * (k_pos_min + s_t * s_e_pos * (k_pos_max - k_pos_min))
+#
+#   M_pos = m_pos_max - s_t * s_e_pos * (m_pos_max - m_pos_min)
+#
+#   D_pos = 2 * zeta_pos * sqrt(M_pos * K_pos)
+#
+# Rotational adaptive parameters:
+#
+#   K_ori = s_w * (k_ori_min + s_t * s_e_ori * (k_ori_max - k_ori_min))
+#
+#   M_ori = m_ori_max - s_t * s_e_ori * (m_ori_max - m_ori_min)
+#
+#   D_ori = 2 * zeta_ori * sqrt(M_ori * K_ori)
+#
+# Cartesian virtual dynamics:
+#
+#   F_collision = 0 for now
+#
+#   xddot_ref =
+#   M_adapt^-1 *
+#   (
+#       K_adapt * e
+#     + D_error * edot
+#     + F_collision
+#     - D_adapt * xdot_ref
+#   )
+#
+#   xdot_ref_next = xdot_ref + xddot_ref * dt
+#
+#   xdot_cmd = saturate(
+#       xdot_ref_next,
+#       max_cart_linear_vel,
+#       max_cart_angular_vel
+#   )
+#
+# Singularity-Robust inverse:
+#
+#   k_sr =
+#   {
+#       k0 * (1 - w / w0)^2,   if w < w0
+#       0,                    if w >= w0
+#   }
+#
+#   J_sr# = J(q)^T * (J(q) * J(q)^T + k_sr * I)^-1
+#
+# Final joint command:
+#
+#   qdot_cmd = J_sr# * xdot_cmd
+#
+#   q_cmd_next = q_cmd + qdot_cmd * dt
+#
+#   publish(q_cmd_next, qdot_cmd)
+#
+# Parameter idea:
+#
+#   m_pos_min / m_ori_min:
+#     Lower virtual inertia used when the controller should react faster.
+#
+#   m_pos_max / m_ori_max:
+#     Higher virtual inertia used during startup or small-error motion for
+#     smoother, slower response.
+#
+#   k_pos_min / k_ori_min:
+#     Baseline stiffness near the target. Increase these if steady tracking
+#     error remains. Decrease if the robot feels too stiff near the goal.
+#
+#   k_pos_max / k_ori_max:
+#     Maximum stiffness for larger errors. Increase for faster convergence.
+#     Decrease if joint velocity limits trip or motion becomes aggressive.
+#
+#   zeta_pos / zeta_ori:
+#     Damping ratio. Around 1.0 gives near-critical damping. Lower is faster
+#     but can overshoot. Higher is smoother but slower.
+#
+#   adaptive_lambda:
+#     Startup adaptation speed. Higher reaches full authority faster. Lower
+#     makes mode transitions softer.
+#
+#   adaptive_alpha_pos / adaptive_alpha_ori:
+#     Error sensitivity. Higher values make the controller become stiff at
+#     smaller errors. Lower values keep it soft until error is larger.
+#
+#   max_cart_linear_vel / max_cart_angular_vel:
+#     Safety clamps on Cartesian velocity before Jacobian mapping.
+#
+#   w0:
+#     Manipulability threshold. If w < w0, SR damping activates and adaptive
+#     stiffness is softened by s_w.
+#
+#   k0:
+#     Maximum SR damping coefficient near singularity.
+#
+#   F_collision:
+#     Placeholder Cartesian wrench. Keep zero for now. Later, obstacle avoidance
+#     or force feedback can be inserted here as an additional Cartesian force
+#     without changing publishers, subscribers, or trajectory output logic.
+###############################################################################
+
+# Shared by the standalone motomini_feedback_stream node and the embedded
+# tracking mode inside motomini_planning_node.
+/**:
+  ros__parameters:
+
+    # ===========================================================================
+    # CONTROL LOOP
+    # ===========================================================================
+    # Loop frequency [Hz].
+    # Tuning:
+    #   Higher rate gives smoother velocity integration but requires the robot
+    #   driver and machine to keep up. Re-check max_cart_* limits if changed.
+    rate_hz: 50.0
+
+    # ===========================================================================
+    # ADAPTIVE TRANSLATIONAL VIRTUAL DYNAMICS
+    # ===========================================================================
+    # m_pos_max is used at startup and near small errors for smoother motion.
+    # m_pos_min is approached as the adaptive factor rises for larger errors.
+    # Tuning:
+    #   Increase mass for slower, smoother motion.
+    #   Decrease mass for faster response, but watch joint velocity trips.
+    m_pos_min: 0.03766503218451453
+    m_pos_max: 0.4674217026153977
+
+    # Translational virtual stiffness.
+    # k_pos_min is the soft baseline; k_pos_max is the fastest tracking value.
+    # Both are softened near singularities by s_w = clamp(w / w0, 0.2, 1.0).
+    # Tuning:
+    #   Raise k_pos_max for faster position convergence.
+    #   Lower k_pos_min if the robot feels too aggressive near the target.
+    #   Lower k_pos_max if startup or large-error moves hit velocity limits.
+    k_pos_min: 468.2271248656993
+    k_pos_max: 2791.6506112458965
+
+    # Translational damping ratio used by D = 2*zeta*sqrt(M*K).
+    # Tuning:
+    #   1.0 is near critical damping.
+    #   < 1.0 is faster but can overshoot.
+    #   > 1.0 is more damped but slower.
+    zeta_pos: 0.975577085853248
+
+    # ===========================================================================
+    # ADAPTIVE ORIENTATION VIRTUAL DYNAMICS
+    # ===========================================================================
+    # Orientation virtual inertia.
+    # Tuning is the same idea as m_pos_* but for angular motion.
+    m_ori_min: 0.02
+    m_ori_max: 0.15
+
+    # Orientation virtual stiffness.
+    # Tuning:
+    #   Raise k_ori_max if orientation lags.
+    #   Lower k_ori_max if wrist joints hit velocity limits or oscillate.
+    #   Lower k_ori_min for a softer settle near the target orientation.
+    k_ori_min: 4.0
+    k_ori_max: 35.0
+
+    # Orientation damping ratio.
+    # Tuning:
+    #   Increase if orientation overshoots.
+    #   Decrease slightly if orientation feels overdamped.
+    zeta_ori: 1.3
+
+    # ===========================================================================
+    # ADAPTATION PROFILE
+    # ===========================================================================
+    # Time warm-up: s_t = 1 - exp(-adaptive_lambda * active_time).
+    # Tuning:
+    #   Higher value reaches full adaptive strength sooner.
+    #   Lower value makes mode starts softer.
+    adaptive_lambda: 16.679788870486597
+
+    # Error scaling: s_e = tanh(alpha * |error|).
+    # Tuning:
+    #   Higher alpha reaches k_max / m_min at smaller errors.
+    #   Lower alpha keeps the controller softer until the error is larger.
+    # Examples:
+    #   alpha_pos=30 reaches strong adaptation around 3-5 cm.
+    #   alpha_ori=6 reaches strong adaptation around 0.2-0.4 rad.
+    adaptive_alpha_pos: 26.046477948105387
+    adaptive_alpha_ori: 5.0
+
+    # ===========================================================================
+    # INTEGRAL ACTION (CONTINUOUS FORCE-ADAPTIVE)
+    # ===========================================================================
+    # Baseline I gains used when collision force is small.
+    i_gain_pos: 385.5804858047386
+    i_gain_ori: 10.063104468968582
+
+    # Integral state clamp (simple anti-windup for each axis).
+    i_clamp_pos: 0.0023149208741592
+    i_clamp_ori: 0.0096448944222224
+    # Continuous attenuation by collision force magnitude ||F||:
+    #   i_scale = i_force_min_scale + (1-i_force_min_scale) * exp(-(||F||/i_force_ref)^i_force_shape)
+    #   I_eff   = I_base * i_scale
+    #
+    # i_force_ref   [N]: force level where I starts dropping significantly.
+    # i_force_shape [-]: curve steepness (higher = steeper drop).
+    # i_force_min_scale in [0,1]: minimum retained I scale at very high force.
+    i_force_ref: 1.0
+    i_force_shape: 10.0
+    i_force_min_scale: 0.0
+
+    # Extra integral bleed-off [1/s] as I attenuation increases.
+    i_collision_decay_rate: 14.0
+
+    # ===========================================================================
+    # CARTESIAN VELOCITY SAFETY LIMITS
+    # ===========================================================================
+    # Clamp the integrated virtual Cartesian velocity before converting to joints.
+    # Tuning:
+    #   Lower these first if the robot feels abrupt.
+    #   Raise only after confirming joint velocity safety does not trip.
+    max_cart_linear_vel: 5.0    # [m/s]
+    max_cart_angular_vel: 1.2   # [rad/s]
+    max_cart_linear_acc: 3.0
+    max_cart_angular_acc: 1.0
+    # ===========================================================================
+    # SINGULARITY HANDLING (SR-INVERSE JACOBIAN)
+    # ===========================================================================
+    # Manipulability threshold below which SR damping engages and adaptive
+    # stiffness is softened by s_w.
+    # Tuning:
+    #   Raise w0 to become more conservative near singularities.
+    #   Lower w0 if the controller becomes too soft in normal poses.
+    w0: 0.001
+
+    # Max SR damping coefficient at full singularity.
+    # Tuning:
+    #   Raise for smoother behavior near singularities, with more tracking lag.
+    #   Lower for tighter tracking, with less singularity protection.
+    k0: 0.01
+
+    # ===========================================================================
+    # STREAMING / COMPATIBILITY
+    # ===========================================================================
+    # Emit one zero-velocity seed pose at the start of each streaming session.
+    # Set true for stateful controllers that reject mid-stream first messages
+    # with INVALID_DATA_START_POS.
+    enable_seed: false
+
+    # Mode selector for target_vel usage (see motomini_optimal_controller_fix.md §7-8):
+    #   true  = Mode B: velocity-only joystick. target_vel is integrated into desired_pose_
+    #           each tick AND used as xdot_des feedforward. Use when no external pose source.
+    #   false = Mode A: external pose generator streams /motomini/target_pose.
+    #           target_vel is feedforward only. Do NOT integrate to avoid double-application.
+    integrate_target_vel_to_pose: false
+
+    # Legacy Cartesian PD parameters.
+    # Compatibility behavior:
+    #   kp_max and ko_max are accepted for old YAML files. If k_pos_max or
+    #   k_ori_max is missing, the code maps the legacy value proportionally into
+    #   the new max stiffness. Because this YAML defines k_pos_max/k_ori_max,
+    #   these values do not affect the new controller here.
+    #   kdp/kdo are accepted but not used by the adaptive controller.
+    kp_max: 3.5
+    ko_max: 2.5
+    kdp: 0.25
+    kdo: 0.25
+
+    # Legacy joint-velocity reject threshold parameter. The runtime safety check
+    # still uses per-joint hardware limits times SAFETY_VELOCITY_ALPHA from
+    # motomini_feedback_stream.cpp.
+    theta_d_lim: 3.14
+
+
+    enable_collision_projection: true
+    collision_goal_suppression: true
+    collision_guard_distance: 0.03
+    collision_task_distance: 0.015
+    collision_stop_distance: 0.001
+    collision_projection_max_gamma: 1.0
+    collision_constraint_timeout_sec: 0.2
+    collision_force_scale: 1.0
+    collision_force_max: 5.0

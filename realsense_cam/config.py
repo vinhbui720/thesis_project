@@ -199,6 +199,21 @@ CONFIG = {
         "prediction_max_time_s":      0.75,
         "prediction_max_distance_m":  0.25,
 
+        # ── Smooth published target ───────────────────────────────────────
+        "target_smooth_tau_s":        0.10,
+        "target_max_step_m":          0.010,
+
+        # ── Future tracking from Kalman velocity ──────────────────────────
+        "lookahead_steps":            3,
+        "lookahead_dt_s":             0.033,
+        "lookahead_max_time_s":       0.20,
+
+        # ── Camera occlusion when robot hovers above object ───────────────
+        "occlusion_expected_s":              1.20,
+        "occlusion_hold_after_s":            1.80,
+        "occlusion_max_predict_distance_m":  0.35,
+        "hold_target_on_occlusion_timeout":  True,
+
         # ── Publisher timer rate ───────────────────────────────────────────
         "pub_rate_hz":        50.0,
     },

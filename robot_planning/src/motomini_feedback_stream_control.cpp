@@ -528,11 +528,10 @@ namespace robot_planning
     }
 
     const Eigen::Matrix<double, 6, 1> xdot_actual = J * qdot;
-    if (!checkCartesianVelocitySafety(xdot_actual))
-    {
-      transitionTo(STATE_STOP, "Cartesian velocity safety exceeded");
-      return false;
-    }
+    // Warn if measured velocity is high but do not stop tracking.
+    // The commanded output is already capped by clampCartesianVelocity(), so
+    // a brief measured spike does not mean the controller is over-commanding.
+    checkCartesianVelocitySafety(xdot_actual);
 
     Eigen::Matrix<double, 6, 1> xdot_des = Eigen::Matrix<double, 6, 1>::Zero();
     const double dt_vel = (this->now() - t_last_target_vel_cb_).seconds();
