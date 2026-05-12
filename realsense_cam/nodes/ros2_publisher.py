@@ -106,6 +106,21 @@ class ROS2Publisher(Node):
         self._target_smooth_tau = ros_cfg.get("target_smooth_tau_s", 0.12)
         self._target_max_step = ros_cfg.get("target_max_step_m", 0.015)
 
+        # Wait for stable velocity after start-line crossing.
+        self._vel_stability_window = int(ros_cfg.get("velocity_stability_window", 8))
+        self._vel_stability_std_thresh = float(
+            ros_cfg.get("velocity_stability_std_thresh_mps", 0.015)
+        )
+        self._vel_stability_min_speed = float(
+            ros_cfg.get("velocity_stability_min_speed_mps", 0.02)
+        )
+        self._vel_stability_timeout = float(
+            ros_cfg.get("velocity_stability_timeout_s", 1.0)
+        )
+        self._use_locked_velocity_after_stable = bool(
+            ros_cfg.get("use_locked_velocity_after_stable", True)
+        )
+
         # Future tracking using Kalman velocity.
         self._lookahead_steps = ros_cfg.get("lookahead_steps", 3)
         self._lookahead_dt = ros_cfg.get("lookahead_dt_s", 0.033)
@@ -147,6 +162,13 @@ class ROS2Publisher(Node):
 
         self._ee_pos = None
         self._ee_lock = threading.Lock()
+        self._vel_samples = []
+        self._wait_stable_started_t = None
+        self._stable_velocity = None
+        self._stable_direction = None
+        self._stable_start_pos = None
+        self._stable_start_t = None
+        self._tracking_publish_active = False
 
         self._pub_pose = self.create_publisher(PoseStamped, '/tracking_target_pose', 10)
         self._pub_vel = self.create_publisher(TwistStamped, '/object/velocity', 10)
@@ -261,6 +283,13 @@ class ROS2Publisher(Node):
         self._predict_start_pos = None
         self._occlusion_started_t = None
         self._occlusion_start_pos = None
+        self._vel_samples = []
+        self._wait_stable_started_t = None
+        self._stable_velocity = None
+        self._stable_direction = None
+        self._stable_start_pos = None
+        self._stable_start_t = None
+        self._tracking_publish_active = False
 
     def _reset_track_session(self):
         self._reset_estimator()
@@ -268,6 +297,7 @@ class ROS2Publisher(Node):
         self._publish_phase = "wait"
         self._publish_source = "none"
         self._status_error = ""
+        self._pending_start = False
         self._bootstrap_pose = None
         self._bootstrap_quat = _IDENTITY_QUAT.copy()
         self._publish_pos = None
@@ -277,6 +307,7 @@ class ROS2Publisher(Node):
         self._publish_t_last = None
         self._occlusion_started_t = None
         self._occlusion_start_pos = None
+        self._tracking_publish_active = False
 
     def _finish_tracking(self, reason):
         self._est_state = "done"
@@ -341,18 +372,22 @@ class ROS2Publisher(Node):
             return False
 
         self._reset_estimator()
-        self._est_state = "tracking"
-        self._publish_phase = "bootstrap"
-        self._publish_source = "magnetic_bootstrap"
+        self._est_state = "wait_vel_stable"
+        self._publish_phase = "wait_vel_stable"
+        self._publish_source = "waiting_for_stable_velocity"
         self._status_error = ""
         self._bootstrap_pose = bootstrap_pos
         self._bootstrap_quat = bootstrap_quat
         self._publish_pos = bootstrap_pos.copy()
         self._publish_quat = bootstrap_quat.copy()
         self._track_started_t = time.monotonic()
+        self._wait_stable_started_t = self._track_started_t
         self._last_target_pos = bootstrap_pos.copy()
         self._publish_t_last = self._track_started_t
-        self.get_logger().info('Start-line crossed — bootstrap from magnetic_link.')
+        self._tracking_publish_active = False
+        self.get_logger().info(
+            'Start-line crossed — waiting for stable velocity before publishing tracking.'
+        )
         return True
 
     def _extract_measurement(self, data):
@@ -405,8 +440,119 @@ class ROS2Publisher(Node):
             self._predict_start_pos = self._pos_est.copy()
         return True
 
+    def _record_velocity_sample(self, vel):
+        vel = np.asarray(vel, dtype=np.float64).copy()
+        if not np.all(np.isfinite(vel)):
+            return
+        speed = np.linalg.norm(vel[:2])
+        if speed < self._vel_stability_min_speed:
+            return
+        self._vel_samples.append(vel)
+        if len(self._vel_samples) > self._vel_stability_window:
+            self._vel_samples.pop(0)
+
+    def _velocity_is_stable(self):
+        if len(self._vel_samples) < self._vel_stability_window:
+            return False, None, None
+
+        samples = np.asarray(self._vel_samples, dtype=np.float64)
+        mean_vel = np.mean(samples, axis=0)
+        std_vel = np.std(samples[:, :2], axis=0)
+        std_norm = np.linalg.norm(std_vel)
+
+        speed = np.linalg.norm(mean_vel[:2])
+        if speed < self._vel_stability_min_speed or std_norm > self._vel_stability_std_thresh:
+            return False, None, None
+
+        direction = mean_vel.copy()
+        direction_norm = np.linalg.norm(direction[:2])
+        if direction_norm < 1e-9:
+            return False, None, None
+
+        direction[:2] = direction[:2] / direction_norm
+        direction[2] = 0.0
+        return True, mean_vel, direction
+
+    def _lock_stable_velocity(self, now):
+        stable, mean_vel, direction = self._velocity_is_stable()
+
+        timed_out = False
+        if self._wait_stable_started_t is not None:
+            timed_out = (now - self._wait_stable_started_t) >= self._vel_stability_timeout
+
+        if not stable and not timed_out:
+            return False
+
+        if stable:
+            self._stable_velocity = mean_vel.copy()
+            self._stable_direction = direction.copy()
+        else:
+            self._stable_velocity = self._vel_est.copy()
+            speed = np.linalg.norm(self._stable_velocity[:2])
+            if speed < self._vel_stability_min_speed:
+                self._status_error = "stable_velocity_timeout_but_speed_too_low"
+                return False
+
+            self._stable_direction = self._stable_velocity.copy()
+            self._stable_direction[:2] /= max(np.linalg.norm(self._stable_direction[:2]), 1e-9)
+            self._stable_direction[2] = 0.0
+
+        if self._pos_est is not None:
+            self._stable_start_pos = self._pos_est.copy()
+        elif self._publish_pos is not None:
+            self._stable_start_pos = self._publish_pos.copy()
+        elif self._bootstrap_pose is not None:
+            self._stable_start_pos = self._bootstrap_pose.copy()
+        else:
+            self._status_error = "stable_velocity_locked_but_no_start_position"
+            return False
+
+        self._stable_start_t = now
+        self._vel_est = 0.05
+        self._t_est = now
+        self._est_state = "tracking"
+        self._publish_phase = "follow"
+        self._publish_source = "stable_velocity_locked"
+        self._tracking_publish_active = True
+
+        self.get_logger().info(
+            "Stable velocity locked: "
+            f"vel=[{self._stable_velocity[0]:.4f}, "
+            f"{self._stable_velocity[1]:.4f}, "
+            f"{self._stable_velocity[2]:.4f}], "
+            f"direction=[{self._stable_direction[0]:.4f}, "
+            f"{self._stable_direction[1]:.4f}, "
+            f"{self._stable_direction[2]:.4f}]"
+        )
+        return True
+
+    def _stable_trajectory_position(self, now):
+        if (
+            self._stable_start_pos is None
+            or self._stable_velocity is None
+            or self._stable_start_t is None
+        ):
+            return None
+
+        dt = max(0.0, now - self._stable_start_t)
+        return self._stable_start_pos + self._stable_velocity * dt
+
     def _desired_future_target(self, now):
-        """Predict a small future target using the current Kalman-based estimate."""
+        """Predict future target."""
+        if (
+            self._use_locked_velocity_after_stable
+            and self._tracking_publish_active
+            and self._stable_velocity is not None
+            and self._stable_start_pos is not None
+        ):
+            base_pos = self._stable_trajectory_position(now)
+            if base_pos is None:
+                return None
+
+            lookahead = self._lookahead_steps * self._lookahead_dt
+            lookahead = min(lookahead, self._lookahead_max_time)
+            return base_pos + self._stable_velocity * lookahead
+
         if self._pos_est is None:
             return None
 
@@ -562,7 +708,29 @@ class ROS2Publisher(Node):
         meas_pos, meas_vel = self._extract_measurement(data)
         now = time.monotonic()
 
-        if self._est_state != "tracking":
+        if self._est_state == "wait_vel_stable":
+            has_measurement = meas_pos is not None
+            if has_measurement:
+                self._fuse_measurement(meas_pos, meas_vel, now)
+                self._record_velocity_sample(self._vel_est)
+
+            locked = self._lock_stable_velocity(now)
+            if not locked:
+                if self._publish_pos is not None:
+                    self._publish_transform(
+                        stamp, self._publish_pos, self._publish_quat, publish_debug=False
+                    )
+                self._publish_active_flag(False)
+                self._publish_status(stamp, data)
+                self._log_throttled(
+                    "wait_vel_stable", "info", 0.5,
+                    f"Waiting for stable velocity: "
+                    f"samples={len(self._vel_samples)}/{self._vel_stability_window} "
+                    f"vel=[{self._vel_est[0]:.4f}, {self._vel_est[1]:.4f}, {self._vel_est[2]:.4f}]"
+                )
+                return data
+
+        if self._est_state not in ("tracking",):
             passive_pos = meas_pos
             if passive_pos is not None:
                 self._publish_transform(stamp, passive_pos, _IDENTITY_QUAT, publish_debug=False)
@@ -578,7 +746,15 @@ class ROS2Publisher(Node):
         occlusion_age = self._update_occlusion_state(now, has_measurement)  # noqa: F841
 
         if has_measurement:
-            self._fuse_measurement(meas_pos, meas_vel, now)
+            if self._use_locked_velocity_after_stable and self._stable_velocity is not None:
+                traj_pos = self._stable_trajectory_position(now)
+                if traj_pos is not None:
+                    self._pos_est = traj_pos.copy()
+                    self._vel_est = self._stable_velocity.copy()
+                    self._t_est = now
+                    self._cam_t_last = now
+            else:
+                self._fuse_measurement(meas_pos, meas_vel, now)
             self._predict_started_t = None
             self._predict_start_pos = None
             if self._publish_phase != "bootstrap":
@@ -682,7 +858,7 @@ class ROS2Publisher(Node):
                     "ctrl_publish_gated", "info", 2.0,
                     "Controller not in STATE_POSE_FOLLOW — skipping controller pose/vel publish.")
 
-        self._publish_active_flag(True)
+        self._publish_active_flag(self._tracking_publish_active)
 
     def _publish_transform(self, stamp, translation, quaternion, publish_debug=True):
         # tracking_task = raw Kalman + lookahead estimate (what the sensor/filter computes).
@@ -793,11 +969,25 @@ class ROS2Publisher(Node):
         occlusion_age_ms = 0.0
         if self._occlusion_started_t is not None:
             occlusion_age_ms = (now - self._occlusion_started_t) * 1000.0
+        stable_speed = 0.0
+        if self._stable_velocity is not None:
+            stable_speed = float(np.linalg.norm(self._stable_velocity[:2]))
         status = json.dumps({
             "tracking": tracking,
             "est_state": self._est_state,
             "publish_phase": self._publish_phase,
             "publish_source": self._publish_source,
+            "tracking_publish_active": self._tracking_publish_active,
+            "stable_velocity_locked": self._stable_velocity is not None,
+            "stable_speed_mps": round(stable_speed, 4),
+            "stable_direction": (
+                None if self._stable_direction is None else [
+                    round(float(self._stable_direction[0]), 4),
+                    round(float(self._stable_direction[1]), 4),
+                    round(float(self._stable_direction[2]), 4),
+                ]
+            ),
+            "velocity_samples": len(self._vel_samples),
             "icp": icp_state,
             "has_pose": has_pose,
             "icp_fitness": round(float(fitness), 4),
