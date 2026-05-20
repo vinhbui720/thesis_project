@@ -992,12 +992,16 @@ def main() -> None:
     try:
         # Give discovery/subscriptions a short moment to connect.
         time.sleep(0.5)
-        # gantry_control.move_to(x_pos=-0.0, z_pos=-0.00, motion_time_sec=1.5)
-        # gantry_control.move_to(x_pos=-0.05, z_pos=-0.03, motion_time_sec=1.5)
+        gantry_control.move_to(x_pos=-0.0, z_pos=-0.00, motion_time_sec=1.5)
+        gantry_control.move_to(x_pos=-0.04, z_pos=-0.035, motion_time_sec=1.5)
+      
+      
+      
+      
         node._publish_clear()
 
         node.set_planner_mode(2)
-        object_control.set_current_target(-0.05, -0.25, 0.07)
+        object_control.set_current_target(-0.04, -0.25, 0.07)
         targets = node.make_targets([
             (-0.03, -0.24, 0.2),
             (-0.03, -0.24, 0.071)
@@ -1012,17 +1016,18 @@ def main() -> None:
         # time.sleep(1.0) 
         # node._publish_clear()
         targets = node.make_targets([
-            (0.0530, -0.2709, 0.17)
+            (-0.03, -0.24, 0.2),
+            (0.0530, -0.2709, 0.175)
         ])
         node.execute_target_pose(targets)
         node.set_planner_mode(3)
         time.sleep(0.5)
         node.set_planner_mode(3)
         circle_targets = ObjectProcess.generate_circle_poses(
-            x=0.0530, y=-0.2709, z=0.17,
+            x=0.0530, y=-0.275, z=0.175,
             number_of_points=10,
             radius=0.04,
-            alpha_degrees=-20.0,
+            alpha_degrees=-30.0,
         )
         node.execute_target_pose(circle_targets)
         
@@ -1031,6 +1036,10 @@ def main() -> None:
             (0.18, 0.00, 0.245)
         ])
         node.execute_target_pose(targets)
+
+
+
+
         targets = node.make_targets([
             (0.13, -0.19, 0.1)
         ])
@@ -1054,32 +1063,37 @@ def main() -> None:
             settle_start_t = None
             
             while rclpy.ok() and (time.time() - start_t) < tracking_timeout_sec:
-                dist = object_control.get_tracking_error(timeout_sec=0.5)
+                # dist = object_control.get_tracking_error(timeout_sec=0.5)
                 
-                if dist is not None:
-                    # Always log the current error
-                    status = "OK" if dist < error_threshold_m else "HIGH"
-                    elapsed = time.time() - start_t
-                    print(f"[{elapsed:.1f}s] Tracking error: {dist:.6f} m "
-                          f"(threshold: {error_threshold_m} m) [{status}]")
+                # if dist is not None:
+                #     # Always log the current error
+                #     status = "OK" if dist < error_threshold_m else "HIGH"
+                #     elapsed = time.time() - start_t
+                #     print(f"[{elapsed:.1f}s] Tracking error: {dist:.6f} m "
+                #           f"(threshold: {error_threshold_m} m) [{status}]")
                     
-                    if dist < error_threshold_m:
-                        # Error is below threshold; start/continue settlement timer
-                        if settle_start_t is None:
-                            settle_start_t = time.time()
-                            print(f"  → Error below threshold, settlement timer started")
+                #     if dist < error_threshold_m:
+                #         # Error is below threshold; start/continue settlement timer
+                #         if settle_start_t is None:
+                #             settle_start_t = time.time()
+                #             print(f"  → Error below threshold, settlement timer started")
                         
-                        # Check if error stayed good long enough
-                        settle_elapsed = time.time() - settle_start_t
-                        if settle_elapsed >= settle_duration_s:
-                            print(f"Tracking settled: error stayed < {error_threshold_m} m for {settle_duration_s}s")
-                            tracking_settled = True
-                            break
-                    else:
-                        # Error exceeded threshold; reset settlement timer
-                        if settle_start_t is not None:
-                            print(f"  → Error exceeded threshold, settlement timer reset")
-                            settle_start_t = None
+                #         # Check if error stayed good long enough
+                #         settle_elapsed = time.time() - settle_start_t
+                #         if settle_elapsed >= settle_duration_s:
+                #             print(f"Tracking settled: error stayed < {error_threshold_m} m for {settle_duration_s}s")
+                #             tracking_settled = True
+                #             break
+                #     else:
+                #         # Error exceeded threshold; reset settlement timer
+                #         if settle_start_t is not None:
+                #             print(f"  → Error exceeded threshold, settlement timer reset")
+                #             settle_start_t = None
+                time.sleep(3.0)
+                object_control.detach()
+                object_control.detach()
+                object_control.detach()
+                tracking_settled = True
                 
                 time.sleep(0.05)
             
@@ -1102,7 +1116,7 @@ def main() -> None:
             print("Failed to detect tracking status transition in time.")
         
         node._publish_clear()
-        node.set_planner_mode(2)
+        node.set_planner_mode(3)
         # time.sleep(0.5) 
         targets = node.make_targets([
             (0.18, 0.00, 0.245)

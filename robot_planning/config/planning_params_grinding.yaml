@@ -46,15 +46,15 @@ motomini_planning_node:
     ifopt_cart_coeff_z:  10.0
     ifopt_cart_coeff_rx: 10.0
     ifopt_cart_coeff_ry: 10.0
-    ifopt_cart_coeff_rz: 2.0            # free tool rotation around approach axis
+    ifopt_cart_coeff_rz: 1.0            # free tool rotation around approach axis
 
     ifopt_joint_cost_coeff: 5.0         # (unused since joint_cost disabled)
 
     # ===========================================================================
     #  TRAJOPT-IFOPT — Collision Avoidance
     # ===========================================================================
-    ifopt_coll_cost_margin: 0.00025       # 25 mm clearance
-    ifopt_coll_cost_coeff: 1.0         # light penalty — grinding is close to surface
+    ifopt_coll_cost_margin: 0.000025       # 25 mm clearance
+    ifopt_coll_cost_coeff: 0.001         # light penalty — grinding is close to surface
     ifopt_coll_margin_buffer: 0.0002
     ifopt_coll_eval_type: 0             # DISCRETE
     ifopt_coll_lvs_length: 0.05
@@ -70,7 +70,7 @@ motomini_planning_node:
     #  TRAJOPT-IFOPT — SQP Solver
     #  Tighter trust box for precision surface moves.
     # ===========================================================================
-    ifopt_max_iter: 100
-    ifopt_min_approx_improve: 1.0e-4
-    ifopt_min_trust_box_size: 1.0e-5    # tighter than default for grinding precision
-    ifopt_initial_trust_box_size: 0.01
+    ifopt_max_iter: 300
+    ifopt_min_approx_improve: 1.0e-5
+    ifopt_min_trust_box_size: 1.0e-7    # tighter than default for grinding precision
+    ifopt_initial_trust_box_size: 0.05

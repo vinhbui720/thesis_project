@@ -18,11 +18,11 @@ motomini_planning_node:
     # ===========================================================================
     use_ompl: true
 
-    ompl_planning_time: 15.0            # more time for complex long-range moves
+    ompl_planning_time: 5.0            # more time for complex long-range moves
     ompl_max_solutions: 5
     ompl_simplify: true
-    ompl_longest_valid_segment: 0.005
-    ompl_rrt_range_1: 0.05
+    ompl_longest_valid_segment: 0.05
+    ompl_rrt_range_1: 0.5
     ompl_rrt_range_2: 0.10
 
     # ===========================================================================
@@ -70,6 +70,6 @@ motomini_planning_node:
     #  TRAJOPT-IFOPT — SQP Solver
     # ===========================================================================
     ifopt_max_iter: 200
-    ifopt_min_approx_improve: 1.0e-3
-    ifopt_min_trust_box_size: 1.0e-5
+    ifopt_min_approx_improve: 1.0e-7
+    ifopt_min_trust_box_size: 1.0e-9
     ifopt_initial_trust_box_size: 0.5
